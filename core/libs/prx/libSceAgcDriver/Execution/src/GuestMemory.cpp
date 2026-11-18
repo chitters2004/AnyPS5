@@ -3302,15 +3302,22 @@ const char* RangeVersionDeclineName(RangeVersionDecline decline) {
     return "?";
 }
 
-RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const RangeVersionBaseline& baseline) {
+RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const RangeVersionBaseline& baseline, RangeValidation* validation) {
+    const auto declineOver = [&](RangeVersionDecline decline, std::uint64_t begin, std::uint64_t end) {
+        if (validation != nullptr) validation->declined = {begin, end};
+        return decline;
+    };
     if (ranges.empty() || baseline.generation == 0 || baseline.proof == 0) return RangeVersionDecline::Baseline;
     if (baseline.proof >= RangeVersionSerialLimit || baseline.pending >= RangeVersionSerialLimit || baseline.unrangedProof >= RangeVersionSerialLimit || baseline.unrangedPending >= RangeVersionSerialLimit) return RangeVersionDecline::Wrapped;
     for (const auto& [begin, end] : ranges) {
-        if (end <= begin || end > TickSpanBytes) return RangeVersionDecline::Uncovered;
+        if (end <= begin || end > TickSpanBytes) return declineOver(RangeVersionDecline::Uncovered, begin, end);
         const auto observed = Observe(begin, static_cast<std::size_t>(end - begin));
-        if (observed.status == Observation::Status::Uncovered) return RangeVersionDecline::CollectUnwatched;
-        if (observed.status != Observation::Status::Complete || observed.generation == 0) return RangeVersionDecline::Collect;
+        if (observed.status == Observation::Status::Uncovered) return declineOver(RangeVersionDecline::CollectUnwatched, begin, end);
+        if (observed.status != Observation::Status::Complete || observed.generation == 0) return declineOver(RangeVersionDecline::Collect, begin, end);
     }
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    written.clear();
+    const bool byBytes = validation != nullptr && validation->bytesUnchanged;
     {
         auto& tracker = Tracker();
         const auto lock = lockTracker(tracker);
@@ -3318,9 +3325,20 @@ RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t,
         if (!tracker.watched) return RangeVersionDecline::Uncovered;
         for (const auto& [begin, end] : ranges) {
             const auto bytes = static_cast<std::size_t>(end - begin);
-            if (!tracker.covers(begin, bytes)) return RangeVersionDecline::Uncovered;
-            if (!tracker.rangeUnchanged(begin, bytes, baseline.generation)) return tracker.changeEvidence(begin, end, baseline.generation);
+            if (!tracker.covers(begin, bytes)) return declineOver(RangeVersionDecline::Uncovered, begin, end);
+            if (tracker.rangeUnchanged(begin, bytes, baseline.generation)) continue;
+            if (!byBytes) return declineOver(tracker.changeEvidence(begin, end, baseline.generation), begin, end);
+            written.emplace_back(begin, end);
         }
+    }
+    for (const auto& [begin, end] : written) {
+        if (validation->bytesUnchanged(begin, end)) {
+            ++validation->passedOnBytes;
+            continue;
+        }
+        auto& tracker = Tracker();
+        const auto lock = lockTracker(tracker);
+        return declineOver(tracker.changeEvidence(begin, end, baseline.generation), begin, end);
     }
     for (std::uint32_t spins = 0; rangeStampsInFlight.load(std::memory_order_acquire) != 0; ++spins) {
         if (spins >= 256) return RangeVersionDecline::InFlight;
@@ -3330,8 +3348,8 @@ RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t,
     if (unrangedPendingSerial.load(std::memory_order_acquire) != baseline.unrangedPending) return RangeVersionDecline::UnrangedPending;
     for (const auto& [begin, end] : ranges) {
         for (auto block = begin / WriteBlockBytes; block <= (end - 1) / WriteBlockBytes; ++block) {
-            if (tickOf(false, block) > baseline.proof) return RangeVersionDecline::Effect;
-            if (tickOf(true, block) > baseline.pending) return RangeVersionDecline::Pending;
+            if (tickOf(false, block) > baseline.proof) return declineOver(RangeVersionDecline::Effect, begin, end);
+            if (tickOf(true, block) > baseline.pending) return declineOver(RangeVersionDecline::Pending, begin, end);
         }
     }
     return RangeVersionDecline::None;

@@ -1196,17 +1196,18 @@ void rangeVersionTests(Context context) {
     std::fprintf(stderr, "range versions: a break over the set between the range check and the stamp save: the next exit %s\n", afterBreak ? "was taken" : "was refused");
     Require(!afterBreak, "a break between the range check and the stamp save was hidden by the saved stamp");
     settle("the template did not take the exit again after the injected break");
-    const auto last = [&](const char* label, auto&& move) {
+    const auto expectLast = [&](const char* label, bool expected, auto&& move) {
         move();
         const bool taken = exitTaken();
         std::fprintf(stderr, "range versions: %s: the exit %s\n", label, taken ? "was taken" : "was refused");
-        Require(!taken, std::string("range versions: ") + label + ": the exit was taken");
+        Require(taken == expected, std::string("range versions: ") + label + (expected ? ": the exit was refused" : ": the exit was taken"));
         resources.reset();
         ClearCachedTextures(context.device);
         AgcDriver::GuestMemory::BumpCollectEpoch();
         resources = std::make_shared<ShaderResources>(context, shader);
         settle("a rebuilt template did not take the epoch exit");
     };
+    const auto last = [&](const char* label, auto&& move) { expectLast(label, false, move); };
     last("a driver store into the set", [&] {
         const std::array<std::byte, 64> stored{};
         static_cast<void>(AgcDriver::GuestMemory::StoreOwnBytes(address + 256u, stored));
@@ -1222,7 +1223,14 @@ void rangeVersionTests(Context context) {
     struct Snapshots {
         ~Snapshots() { ShaderResources::SetRangeWriteSnapshotBytesForTest(0); }
     } snapshots;
-    last("a CPU write of the bytes already in the set and a new collect epoch", [&] {
+    last("a write landing after the full proof's walk with byte snapshots on, then a new collect epoch", [&] {
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+        arm(ShaderResources::RangeVersionPoint::AfterFullProof);
+        Require(!exitTaken() && hookFired, "the injected write did not run after a full proof");
+        ShaderResources::SetRangeVersionHookForTest(nullptr);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    });
+    expectLast("a CPU write of the bytes already in the set and a new collect epoch", true, [&] {
         AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
         Require(!exitTaken(), "an unranged break did not force the full proof that takes the byte snapshots");
         auto* bytes = reinterpret_cast<volatile std::uint8_t*>(address + 8192u);

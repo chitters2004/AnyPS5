@@ -278,7 +278,12 @@ struct RangeVersionBaseline {
 };
 enum class RangeVersionDecline : std::uint8_t { None, Baseline, Wrapped, Uncovered, CollectUnwatched, Collect, Changed, ChangedPossibly, ChangedBlock, ChangedRefused, InFlight, UnrangedProof, UnrangedPending, Effect, Pending, Count };
 const char* RangeVersionDeclineName(RangeVersionDecline decline);
-RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const RangeVersionBaseline& baseline);
+struct RangeValidation {
+    std::function<bool(std::uint64_t begin, std::uint64_t end)> bytesUnchanged;
+    std::size_t passedOnBytes = 0;
+    std::pair<std::uint64_t, std::uint64_t> declined{0, 0};
+};
+RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const RangeVersionBaseline& baseline, RangeValidation* validation = nullptr);
 enum class RangeWriteSource : std::uint8_t { CpuPage, WalkPage, DriverBlock, DriverPiece, Count };
 struct RangeWriteShape {
     std::uint64_t rangeBegin = 0;
