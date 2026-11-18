@@ -2,6 +2,7 @@
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <atomic>
@@ -47,6 +48,7 @@ struct DeviceLibraries {
     std::map<Key, VkPipelineLayout> layouts;
     std::array<std::map<Key, VkPipeline>, 4> parts;
     std::array<std::map<Key, bool>, 4> prebuilt;
+    std::array<std::map<Key, bool>, 4> prebuiltModules;
     PipelineLibraryCounters counters;
 };
 
@@ -63,6 +65,36 @@ struct LibraryStore {
 };
 
 std::atomic<unsigned> runningWorkers{0};
+std::atomic<std::uint64_t> buildsInFlight{0};
+
+struct ModuleSizes {
+    std::mutex mutex;
+    std::map<VkShaderModule, std::size_t> bytes;
+};
+
+ModuleSizes& Sizes() {
+    static auto* sizes = new ModuleSizes();
+    return *sizes;
+}
+
+std::size_t ModuleBytes(VkShaderModule module) {
+    auto& sizes = Sizes();
+    std::lock_guard lock(sizes.mutex);
+    const auto found = sizes.bytes.find(module);
+    return found == sizes.bytes.end() ? 0u : found->second;
+}
+
+LibraryStore& Libraries();
+
+}
+
+void NoteShaderModuleBytes(VkShaderModule module, std::size_t bytes) {
+    auto& sizes = Sizes();
+    std::lock_guard lock(sizes.mutex);
+    sizes.bytes[module] = bytes;
+}
+
+namespace {
 
 LibraryStore& Libraries() {
     static auto* store = new LibraryStore();
@@ -171,6 +203,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT,
     };
     const std::array<const Key*, 4> partKeys{&keys.vertexInput, &keys.preRasterization, &keys.fragmentShader, &keys.fragmentOutput};
+    const std::array<const Key*, 4> moduleKeys{nullptr, &keys.preRasterizationModules, &keys.fragmentModule, nullptr};
     const Key none;
     VkPipelineRenderingCreateInfoKHR shaderRendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
     shaderRendering.viewMask = rendering.viewMask;
@@ -242,14 +275,27 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         lock.unlock();
         VkResult created;
         std::chrono::steady_clock::duration elapsed{};
+        std::chrono::steady_clock::duration waited{};
+        std::uint64_t concurrent = 0;
+        std::uint64_t specialization = 0;
+        std::uint64_t spirv = 0;
+        for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {
+            if (create.pStages[stage].pSpecializationInfo != nullptr) specialization += create.pStages[stage].pSpecializationInfo->mapEntryCount;
+            spirv += ModuleBytes(create.pStages[stage].module);
+        }
         {
+            const auto asked = std::chrono::steady_clock::now();
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
             const auto started = std::chrono::steady_clock::now();
+            waited = started - asked;
+            concurrent = ++buildsInFlight;
             created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
+            --buildsInFlight;
             elapsed = std::chrono::steady_clock::now() - started;
         }
         lock.lock();
-        device.counters.builtNanoseconds[part] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+        const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+        device.counters.builtNanoseconds[part] += nanoseconds;
         Check(created, "vkCreateGraphicsPipelines library");
         if (const auto raced = cache.find(key); raced != cache.end()) {
             device.destroyPipeline(context.device, handle, nullptr);
@@ -259,7 +305,17 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         }
         cache.emplace(key, handle);
         if (partsOnly) device.prebuilt[part].emplace(key, false);
+        if (moduleKeys[part] != nullptr && !moduleKeys[part]->empty()) {
+            if (partsOnly) device.prebuiltModules[part].emplace(*moduleKeys[part], true);
+            else if (device.prebuiltModules[part].contains(*moduleKeys[part])) ++device.counters.drawBuiltWithPrebuiltModules[part];
+        }
         ++(partsOnly ? device.counters.builtByPrebuild : device.counters.builtByDraw)[part];
+        if (!partsOnly) device.counters.drawNanoseconds[part] += nanoseconds;
+        device.counters.maxNanoseconds[part] = std::max(device.counters.maxNanoseconds[part], nanoseconds);
+        device.counters.waitNanoseconds[part] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count());
+        device.counters.concurrentBuilds[part] += concurrent;
+        device.counters.specializationEntries[part] += specialization;
+        device.counters.spirvBytes[part] += spirv;
         if (optimize) {
             for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {
                 for (auto& module : modules) {
