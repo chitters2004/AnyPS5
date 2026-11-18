@@ -634,13 +634,20 @@ void CheckObserveAndArm() {
 void CheckHistoryOutlivesTheArmedBit() {
     const auto subscription = Subscribe(Base, 3);
     const auto since = SubscriptionGeneration(*subscription);
+    std::uint32_t sources = 1;
+    Require(SubscriptionSourcesSince(*subscription, since, sources) && sources == 0, "a subscription without bumps reported bump sources");
     NoteTextureReleased(Base);
+    const auto released = SubscriptionGeneration(*subscription);
     Pending(Base + Block);
     std::vector<std::uint64_t> plain;
     std::vector<std::uint64_t> lookup;
     Require(SubscriptionBumpsSince(*subscription, since, plain, lookup), "the history reported an overflow after two bumps");
     Require(lookup == std::vector<std::uint64_t>{WriteBlockOf(Base)}, "the history lost the bump that moved the version");
     Require(plain == std::vector<std::uint64_t>{WriteBlockOf(Base + Block)}, "the history lost a bump made while the queried bit was clear");
+    const auto bit = [](WriteBumpSource source) { return std::uint32_t{1} << static_cast<unsigned>(source); };
+    Require(SubscriptionSourcesSince(*subscription, since, sources) && sources == (bit(WriteBumpSource::Release) | bit(WriteBumpSource::Pending)), "the bump sources since the subscription are not a release and a pending write: " + std::to_string(sources));
+    Require(SubscriptionSourcesSince(*subscription, released, sources) && sources == bit(WriteBumpSource::Pending), "the bump sources since the release are not only the pending write: " + std::to_string(sources));
+    Require(SubscriptionSourcesSince(*subscription, SubscriptionGeneration(*subscription), sources) && sources == 0, "bumps before the current generation were reported as sources");
 }
 
 void CheckTypeMask() {

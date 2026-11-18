@@ -35,6 +35,9 @@ class ProofBreakTrace;
 namespace AgcDriver::Graphics {
 class ProofWorkTrace;
 
+enum class ExitScope : std::uint8_t { Unscoped, NotWatched, HistoryLost, Clean, BumpOnly, ReleaseOnly, BumpAndRelease, Count };
+ExitScope ClassifyExitScope(bool scoped, bool watched, bool history, std::uint32_t sources);
+
 class Recorder;
 
 void FlushCachedTextures(VkDevice device);
@@ -860,6 +863,12 @@ private:
     std::uint64_t planesClean = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> proofRanges;
     bool provedRanges = false;
+    std::shared_ptr<GuestMemory::WriteSubscription> scopeSubscription;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> scopeRanges;
+    std::uint64_t scopeGeneration = 0;
+    bool scopeWatched = false;
+    void storeExitScope(std::uint64_t generationAtStamp);
+    void noteExitScope();
     void recordFlushRanges();
     void recordProofRanges();
     bool stalePlanesRead();

@@ -2145,6 +2145,21 @@ int main(int argc, char** argv) {
             std::puts("resource cache epoch reuse tests passed");
             return 0;
         }
+        if (mode == "exit-scope-classes") {
+            using AgcDriver::Graphics::ClassifyExitScope;
+            using AgcDriver::Graphics::ExitScope;
+            using AgcDriver::GuestMemory::WriteBumpSource;
+            const auto bit = [](WriteBumpSource source) { return std::uint32_t{1} << static_cast<unsigned>(source); };
+            Require(ClassifyExitScope(false, true, true, 0) == ExitScope::Unscoped, "a proof without ranges was not unscoped");
+            Require(ClassifyExitScope(true, false, true, 0) == ExitScope::NotWatched, "a proof over unwatched ranges was not named");
+            Require(ClassifyExitScope(true, true, false, bit(WriteBumpSource::Cpu)) == ExitScope::HistoryLost, "a lost history was read as bumps");
+            Require(ClassifyExitScope(true, true, true, 0) == ExitScope::Clean, "a miss without bumps was not clean");
+            Require(ClassifyExitScope(true, true, true, bit(WriteBumpSource::Release)) == ExitScope::ReleaseOnly, "a release alone was not release only");
+            Require(ClassifyExitScope(true, true, true, bit(WriteBumpSource::Cpu) | bit(WriteBumpSource::Pending)) == ExitScope::BumpOnly, "writes without a release were not bump only");
+            Require(ClassifyExitScope(true, true, true, bit(WriteBumpSource::Driver) | bit(WriteBumpSource::Release)) == ExitScope::BumpAndRelease, "a write and a release were not both");
+            std::puts("exit scope classes tests passed");
+            return 0;
+        }
         if (mode == "resource-epoch-proof-log") {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             epochProofLogTests(context);

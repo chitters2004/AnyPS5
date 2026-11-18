@@ -852,6 +852,18 @@ bool SubscriptionBumpsSince(const WriteSubscription& subscription, std::uint64_t
     return true;
 }
 
+bool SubscriptionSourcesSince(const WriteSubscription& subscription, std::uint64_t generation, std::uint32_t& sources) {
+    sources = 0;
+    auto& history = const_cast<WriteSubscription&>(subscription);
+    if (!subscription.history.load(std::memory_order_relaxed)) return false;
+    std::lock_guard lock(history.historyMutex);
+    if (subscription.overflowedAt != 0) return false;
+    for (const auto& bump : subscription.bumps) {
+        if (bump.sequence > generation) sources |= std::uint32_t{1} << static_cast<unsigned>(bump.source);
+    }
+    return true;
+}
+
 void TrimSubscriptionBumps(WriteSubscription& subscription, std::uint64_t generation) {
     std::lock_guard lock(subscription.historyMutex);
     if (subscription.overflowedAt != 0 && subscription.head.load(std::memory_order_acquire) == generation) {

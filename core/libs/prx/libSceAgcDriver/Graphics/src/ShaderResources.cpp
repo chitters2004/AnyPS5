@@ -4631,6 +4631,42 @@ void noteProofLog(const std::array<bool, ExitInputs.size()>& moved, const ProofL
     } else (log.window.unranged ? misses.unrangedBlocks : misses.overlapBlocks)[static_cast<std::size_t>(log.window.blocker)].Add();
 }
 
+bool exitScopeProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_EXIT_SCOPE") != nullptr;
+    return profiled;
+}
+
+constexpr std::array<const char*, static_cast<std::size_t>(ExitScope::Count)> ExitScopeNames{"unscoped", "not all watched", "history lost", "clean", "bump only", "release only", "bump and release"};
+constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::WriteBumpSource::Count)> WriteBumpSourceNames{"cpu", "driver", "pending", "unwatch", "forget", "release", "import", "mirror", "depth"};
+
+struct ExitScopeCounts {
+    ProfileCounter checked;
+    ProfileCounter subscribed;
+    std::array<ProfileCounter, static_cast<std::size_t>(ExitScope::Count)> outcomes;
+    std::array<ProfileCounter, static_cast<std::size_t>(GuestMemory::WriteBumpSource::Count)> sources;
+    std::atomic<std::int64_t> reportedAt{0};
+};
+
+ExitScopeCounts& exitScopeCounts() {
+    static ExitScopeCounts counts;
+    return counts;
+}
+
+void reportExitScope() {
+    auto& counts = exitScopeCounts();
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    const auto last = counts.reportedAt.exchange(tenSeconds, std::memory_order_relaxed);
+    if (last == tenSeconds) return;
+    std::string outcomes;
+    for (std::size_t outcome = 0; outcome < counts.outcomes.size(); ++outcome) outcomes += (outcome == 0 ? "" : ", ") + std::string(ExitScopeNames[outcome]) + " " + std::to_string(counts.outcomes[outcome].Take());
+    std::string sources;
+    for (std::size_t source = 0; source < counts.sources.size(); ++source) {
+        const auto count = counts.sources[source].Take();
+        if (count != 0) sources += (sources.empty() ? "" : ", ") + std::string(WriteBumpSourceNames[source]) + " " + std::to_string(count);
+    }
+    std::fprintf(stderr, "[exit-scope] (10 s) %llu missed exits with epoch, proof, pending and releases all moved checked against a write subscription over the proof's ranges (%llu proofs subscribed): %s; bumped misses by source: %s\n", static_cast<unsigned long long>(counts.checked.Take()), static_cast<unsigned long long>(counts.subscribed.Take()), outcomes.c_str(), sources.empty() ? "none" : sources.c_str());
+}
+
 void noteExitMiss(const ShaderResources::ExitStamp& proved, const ShaderResources::ExitStamp& current, bool stalePlanes, bool copies, ShaderResources::StampAge age, const ProofLogCheck& log) {
     const std::array<bool, ExitInputs.size()> moved{proved.epoch != current.epoch, proved.proof != current.proof, proved.pending != current.pending, proved.releases != current.releases, proved.unwatch != current.unwatch, proved.importSet != current.importSet, proved.allocations != current.allocations, proved.retired != current.retired, proved.surfaces != current.surfaces, stalePlanes, copies};
     const bool alone = std::ranges::count(moved, true) == 1;
@@ -5168,6 +5204,58 @@ void ShaderResources::recordFlushRanges() {
     for (const auto& span : GuestMemory::SubscriptionSpans(*writeSubscription)) flushRanges.push_back(span);
 }
 
+ExitScope ClassifyExitScope(bool scoped, bool watched, bool history, std::uint32_t sources) {
+    if (!scoped) return ExitScope::Unscoped;
+    if (!watched) return ExitScope::NotWatched;
+    if (!history) return ExitScope::HistoryLost;
+    const auto release = std::uint32_t{1} << static_cast<unsigned>(GuestMemory::WriteBumpSource::Release);
+    const bool released = (sources & release) != 0;
+    const bool bumped = (sources & ~release) != 0;
+    return bumped ? (released ? ExitScope::BumpAndRelease : ExitScope::BumpOnly) : released ? ExitScope::ReleaseOnly : ExitScope::Clean;
+}
+
+void ShaderResources::storeExitScope(std::uint64_t generationAtStamp) {
+    if (!provedRanges || proofRanges.empty()) {
+        scopeSubscription.reset();
+        scopeRanges.clear();
+        scopeGeneration = 0;
+        reportExitScope();
+        return;
+    }
+    if (scopeSubscription != nullptr && scopeRanges == proofRanges) {
+        GuestMemory::TrimSubscriptionBumps(*scopeSubscription, generationAtStamp);
+        std::uint32_t sources = 0;
+        if (GuestMemory::SubscriptionSourcesSince(*scopeSubscription, generationAtStamp, sources)) {
+            scopeGeneration = generationAtStamp;
+            reportExitScope();
+            return;
+        }
+    }
+    scopeSubscription = GuestMemory::SubscribeWrites(proofRanges, GuestMemory::WriteChangeAll, true, false);
+    scopeRanges = proofRanges;
+    scopeWatched = std::ranges::all_of(proofRanges, [](const auto& range) { return GuestMemory::Watched(range.first, static_cast<std::size_t>(range.second - range.first)); });
+    scopeGeneration = GuestMemory::SubscriptionGeneration(*scopeSubscription);
+    exitScopeCounts().subscribed.Add();
+    reportExitScope();
+}
+
+void ShaderResources::noteExitScope() {
+    auto& counts = exitScopeCounts();
+    counts.checked.Add();
+    std::uint32_t sources = 0;
+    const bool scoped = provedRanges && scopeSubscription != nullptr;
+    const bool watched = scoped && scopeWatched;
+    const bool history = watched && GuestMemory::SweepSubscription(*scopeSubscription) && GuestMemory::SubscriptionSourcesSince(*scopeSubscription, scopeGeneration, sources);
+    const auto outcome = ClassifyExitScope(scoped, watched, history, sources);
+    counts.outcomes[static_cast<std::size_t>(outcome)].Add();
+    if (history) {
+        for (std::size_t source = 0; source < counts.sources.size(); ++source) {
+            if ((sources >> source) & 1u) counts.sources[source].Add();
+        }
+    }
+    reportExitScope();
+}
+
 void ShaderResources::recordProofRanges() {
     proofRanges = flushRanges;
     for (const auto& range : describedRanges) {
@@ -5292,6 +5380,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     }
     if (EpochProofs()) {
         const auto stamp = currentExitStamp();
+        const auto scopeAtStamp = exitScopeProfiled() && scopeSubscription != nullptr ? GuestMemory::SubscriptionGeneration(*scopeSubscription) : 0;
         if (exitMissesCounted() && stamp.epoch != epochSeen) {
             epochSeen = stamp.epoch;
             scopeLevels().setEpochs.Add();
@@ -5334,6 +5423,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return true;
         }
         const bool counted = exitMissesCounted();
+        if (exitScopeProfiled() && proved.epoch != 0 && proved.epoch != stamp.epoch && proved.proof != stamp.proof && proved.pending != stamp.pending && proved.releases != stamp.releases) noteExitScope();
         ProofLogCheck log;
         if (proved.epoch != 0 && (verifyingExits() || counted)) {
             if (counted && proved.proof != stamp.proof) {
@@ -5401,6 +5491,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         recordFlushRanges();
         provedRanges = !flushUnscoped;
         if (provedRanges) recordProofRanges();
+        if (exitScopeProfiled()) storeExitScope(scopeAtStamp);
         if (!ok || std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->HasReuseLookup(); })) proved.epoch = 0;
         if (counted) {
             provedAge = stampAge(stamp, currentExitStamp(), flushBreaks, trace->Count());
