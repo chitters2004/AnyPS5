@@ -369,7 +369,7 @@ std::uint32_t ResultVector(SpirvValueEmitContext& ctx, const ImageEmitAccess& ac
     }
     std::uint32_t constantComponents = 0u;
     if (mem.dataBits == 32u && !dref && !gather && access.inst.Opcode() == IrOpcode::ImageSampleRaw && access.image.table == NoTable) {
-        constantComponents = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageComponentBase + mem.resource, 0u);
+        constantComponents = DescriptorSpecialization(state, PipelineSpecialization::ImageComponentBase + mem.resource);
     }
     std::uint32_t component[4] = {};
     for (std::uint32_t index = 0; index < 4u; index++) {
@@ -1333,7 +1333,7 @@ std::uint32_t QuantizeStoreTexel(SpirvEmitterState& state, std::uint32_t resourc
         state.module.AddFunction(spv::OpCompositeConstruct, type, result, scalar, scalar, scalar, scalar);
         return result;
     };
-    const auto word = [&](std::uint32_t index) { return state.module.SpecializationConstant(TypeU32(state), first + index, 0u); };
+    const auto word = [&](std::uint32_t index) { return DescriptorSpecialization(state, first + index); };
     const auto enabled = Binary(state, spv::OpINotEqual, TypeBool(state), word(0u), ConstantU32(state, 0u));
     const auto scale = splat(vec4, Unary(state, spv::OpBitcast, f32, word(1u)));
     const auto reciprocal = splat(vec4, Unary(state, spv::OpBitcast, f32, word(2u)));
@@ -2007,7 +2007,7 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     const bool mirrors = MirrorsSampleIfUnnormalized(ctx, access, setup);
     const auto emitSample = [&](std::uint32_t coord, std::uint32_t mask, const std::vector<std::uint32_t>& arguments, std::uint32_t sampleOpcode) {
         if (!mirrors) return emitDirectSample(coord, mask, arguments, sampleOpcode);
-        const auto axes = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::MirrorUnnormalizedBase + mem.sampler, 0u);
+        const auto axes = DescriptorSpecialization(state, PipelineSpecialization::MirrorUnnormalizedBase + mem.sampler);
         const auto mirrored = Binary(state, spv::OpINotEqual, TypeBool(state), axes, ConstantU32(state, 0u));
         return EmitValueIfElse(state, mirrored, resultType, [&] {
             return emitDirectSample(MirroredUnnormalizedCoord(ctx, setup, coord, axes), mask, arguments, sampleOpcode);
@@ -2018,7 +2018,7 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     const auto emitBiasedSample = [&](std::uint32_t coord, std::uint32_t mask, const std::vector<std::uint32_t>& arguments, std::uint32_t sampleOpcode) {
         if (!AppliesLodBiasInShader(state.program.Info().samplers.at(mem.sampler))) return emitSample(coord, mask, arguments, sampleOpcode);
         const auto f32 = TypeF32(state);
-        const auto selector = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::SamplerLodBiasBase + mem.sampler, 0u);
+        const auto selector = DescriptorSpecialization(state, PipelineSpecialization::SamplerLodBiasBase + mem.sampler);
         const auto beyondLimit = Binary(state, spv::OpINotEqual, TypeBool(state), selector, ConstantU32(state, 0u));
         return EmitValueIfElse(state, beyondLimit, resultType, [&] {
             const auto bias = Unary(state, spv::OpBitcast, f32, selector);
@@ -2055,7 +2055,7 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     const bool alreadyBaseLevel = !hasOffset && opcode == spv::OpImageSampleExplicitLod && operandMask == spv::ImageOperandsLodMask && !HasFlag(mem, RdnaImageSampleFlagLod) && setup.layout.clamp == NoImageComponent;
     const bool baseLevelIfUnnormalized = !setup.dref && !alreadyBaseLevel && SamplesBaseLevelIfUnnormalized(state.program.Info().samplers.at(mem.sampler));
     if (baseLevelIfUnnormalized) {
-        const auto selector = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::UnnormalizedBaseLevelBase + mem.sampler, 0u);
+        const auto selector = DescriptorSpecialization(state, PipelineSpecialization::UnnormalizedBaseLevelBase + mem.sampler);
         const auto unnormalized = Binary(state, spv::OpINotEqual, TypeBool(state), selector, ConstantU32(state, 0u));
         sample = EmitValueIfElse(state, unnormalized, resultType, [&] {
             return emitSample(hasOffset ? FoldedOffsetCoord(ctx, access, setup) : setup.coord, spv::ImageOperandsLodMask, {ZeroF32(state)}, spv::OpImageSampleExplicitLod);
@@ -2067,7 +2067,7 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     } else if (!offsetOperand) {
         sample = emitBiasedSample(FoldedOffsetCoord(ctx, access, setup), foldedMask, foldedOperands, opcode);
     } else {
-        const auto selector = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::FoldOffsetBase + mem.sampler, 0u);
+        const auto selector = DescriptorSpecialization(state, PipelineSpecialization::FoldOffsetBase + mem.sampler);
         const auto folded = Binary(state, spv::OpINotEqual, TypeBool(state), selector, ConstantU32(state, 0u));
         const auto foldLabel = state.module.AllocateId();
         const auto operandLabel = state.module.AllocateId();
@@ -2516,7 +2516,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
             const auto mode = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.flags, ConstantU32(state, ImageTableAbi::ModeShift)), ConstantU32(state, ImageTableAbi::ModeMask));
             tableSelector = Select(state, TypeU32(state), access.valid, mode, ConstantU32(state, InvalidTableSelector));
         } else {
-            tableSelector = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords, 0u);
+            tableSelector = DescriptorSpecialization(state, PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords);
             samplerGuard = access.valid;
         }
     }
@@ -2533,7 +2533,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         state.runtimeImage = nullptr;
         return;
     }
-    const auto selector = tables ? tableSelector : state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords, 0u);
+    const auto selector = tables ? tableSelector : DescriptorSpecialization(state, PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords);
     const bool returnsValue = inst.Opcode() != IrOpcode::ImageWrite;
     const auto guardedId = returnsValue ? ctx.Result(inst) : 0u;
     ctx.definitions.Erase(&inst);

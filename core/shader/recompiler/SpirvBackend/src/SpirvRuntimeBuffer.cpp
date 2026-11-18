@@ -4,6 +4,7 @@
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvInputOutput.hpp"
+#include "SpirvBackend/SpirvMemory/SpirvDescriptors.hpp"
 #include "PipelineSpecialization.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
@@ -162,7 +163,7 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
     auto word1 = runtime ? context.Arg(*handle, 1u) : state.module.SpecializationConstant(TypeU32(state), first, 0u);
     if (runtime && GcnGuestShaders()) word1 = Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, ConstantU32(state, GcnBufferWord1Mask));
     const bool runtimeFormat = memory.gpuDescriptor || (state.registrationModules && !state.program.Info().buffers.at(memory.resource).descriptorFormatted);
-    auto word3 = runtimeFormat ? context.Arg(*handle, 3u) : state.module.SpecializationConstant(TypeU32(state), first + 1u, 0u);
+    auto word3 = runtimeFormat ? context.Arg(*handle, 3u) : DescriptorSpecialization(state, first + 1u);
     if (runtimeFormat && GcnGuestShaders()) word3 = gcnWord3(state, word1, word3);
     const auto u32 = TypeU32(state);
     auto base = ConstantU32(state, 0u);
@@ -267,7 +268,7 @@ std::uint32_t baseMisalignment(SpirvValueEmitContext& context, const IrValue& in
     const auto& memory = context.Memory(instruction);
     if (memory.kind == ResourceKind::ScalarBuffer) return ConstantU32(context.state, 0u);
     auto& state = context.state;
-    return state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords + 3u, 0u);
+    return DescriptorSpecialization(state, PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords + 3u);
 }
 
 std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t address) {
@@ -873,7 +874,7 @@ std::uint32_t formattedCall(SpirvValueEmitContext& context, const IrValue& instr
         const auto first = PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords;
         RuntimeDescriptor shared{};
         if (state.registrationModules) {
-            const auto word3 = state.program.Info().buffers.at(memory.resource).descriptorFormatted ? state.module.SpecializationConstant(u32, first + 1u, 0u) : parameters[6];
+            const auto word3 = state.program.Info().buffers.at(memory.resource).descriptorFormatted ? DescriptorSpecialization(state, first + 1u) : parameters[6];
             shared = {ConstantU32(state, 0u), parameters[3], parameters[5], word3, nonzero(state, parameters[7]), parameters[0], nonzero(state, parameters[8]), parameters[1], parameters[2]};
         } else {
             const auto word1 = state.module.SpecializationConstant(u32, first, 0u);
@@ -1141,8 +1142,8 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
     const auto inBounds = both(state, noCarry, both(state, resource.valid, Binary(state, spv::OpULessThan, TypeBool(state), word, limit)));
     if (!context.Memory(instruction).gpuDescriptor) {
         const auto first = PipelineSpecialization::BufferBase + context.Memory(instruction).resource * PipelineSpecialization::BufferWords;
-        const auto misalignment = state.module.SpecializationConstant(TypeU32(state), first + 3u, 0u);
-        const auto tail = state.module.SpecializationConstant(TypeU32(state), first + 2u, 0u);
+        const auto misalignment = DescriptorSpecialization(state, first + 3u);
+        const auto tail = DescriptorSpecialization(state, first + 2u);
         const auto whole = both(state, equal(state, misalignment, ConstantU32(state, 0u)), equal(state, tail, ConstantU32(state, 0u)));
         return readBuffer(context, instruction, byte, 32u, inBounds, Select(state, TypeBool(state), whole, noCarry, inBounds));
     }

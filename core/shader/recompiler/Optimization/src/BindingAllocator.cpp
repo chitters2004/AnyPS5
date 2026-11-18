@@ -1,5 +1,6 @@
 #include "Optimization/BindingAllocator.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
+#include "PipelineSpecialization.hpp"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -66,6 +67,34 @@ bool usesGds(const IrProgram& program) {
     return result;
 }
 
+std::vector<std::uint32_t> RuntimeSpecializationIds(const ShaderInfo& info) {
+    std::vector<std::uint32_t> ids;
+    for (std::uint32_t index = 0; index < info.samplers.size(); ++index) {
+        const auto& sampler = info.samplers[index];
+        if (FoldsTexelOffsets(sampler)) ids.push_back(PipelineSpecialization::FoldOffsetBase + index);
+        if (SamplesBaseLevelIfUnnormalized(sampler)) ids.push_back(PipelineSpecialization::UnnormalizedBaseLevelBase + index);
+        if (MirrorsIfUnnormalized(sampler)) ids.push_back(PipelineSpecialization::MirrorUnnormalizedBase + index);
+        if (AppliesLodBiasInShader(sampler)) ids.push_back(PipelineSpecialization::SamplerLodBiasBase + index);
+    }
+    for (std::uint32_t index = 0; index < info.images.size(); ++index) {
+        const auto& image = info.images[index];
+        if (image.resourceClass == ImageResourceClass::Storage && image.written && !image.atomic) {
+            for (std::uint32_t word = 0; word < PipelineSpecialization::StoreQuantizeWords; ++word) ids.push_back(PipelineSpecialization::StoreQuantizeBase + index * PipelineSpecialization::StoreQuantizeWords + word);
+        }
+        if (image.table != NoTable) continue;
+        if (info.runtimeImageModes.at(index).size() > 1u) ids.push_back(PipelineSpecialization::ImageBase + index * PipelineSpecialization::ImageWords);
+        ids.push_back(PipelineSpecialization::ImageComponentBase + index);
+        ids.push_back(PipelineSpecialization::NormalizedImageBase + index);
+    }
+    for (std::uint32_t index = 0; index < info.buffers.size(); ++index) {
+        const auto first = PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords;
+        if (info.buffers[index].descriptorFormatted) ids.push_back(first + 1u);
+        ids.push_back(first + 2u);
+        ids.push_back(first + 3u);
+    }
+    return ids;
+}
+
 }
 
 BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const BindingLayout& layout, bool registrationModules, bool stencilReplay) const {
@@ -104,6 +133,7 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     if (std::ranges::any_of(next.userDataRegisters, [](auto reg) { return reg >= RuntimeAbi::UserDataCapacity; })) fail("shader user data exceeds runtime ABI capacity");
     if (registrationModules) next.runtimeImageCount = static_cast<std::uint32_t>(info.images.size());
     if (registrationModules && program.Resources().stage == IrShaderStage::Pixel) next.runtimeStateDwords = RuntimeAbi::StateDwords;
+    if (registrationModules) next.runtimeSpecializationIds = RuntimeSpecializationIds(info);
     if (registrationModules && program.Resources().stage != IrShaderStage::Pixel) {
         std::uint32_t attributes = 0u;
         for (const auto& block : program.Blocks()) {

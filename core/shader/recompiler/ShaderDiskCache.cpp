@@ -96,7 +96,7 @@ static_assert(sizeof(DescriptorBinding) == 920, "DescriptorBinding changed: upda
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
-static_assert(sizeof(CompiledShaderInfo) == 352, "CompiledShaderInfo changed: update the info encoder");
+static_assert(sizeof(CompiledShaderInfo) == 376, "CompiledShaderInfo changed: update the info encoder");
 static_assert(sizeof(ShaderInfo) == 232, "ShaderInfo changed: update the info encoder");
 static_assert(sizeof(BufferResource) == 32, "BufferResource changed: update the info encoder");
 static_assert(sizeof(ImageResource) == 108, "ImageResource changed: update the info encoder");
@@ -104,10 +104,10 @@ static_assert(sizeof(SamplerResource) == 24, "SamplerResource changed: update th
 static_assert(sizeof(SampledResourcePair) == 16, "SampledResourcePair changed: update the info encoder");
 static_assert(sizeof(StageInput) == 56, "StageInput changed: update the info encoder");
 static_assert(sizeof(StageOutput) == 48, "StageOutput changed: update the info encoder");
-static_assert(sizeof(IrBindingLayout) == 80, "IrBindingLayout changed: update the layout encoder");
+static_assert(sizeof(IrBindingLayout) == 104, "IrBindingLayout changed: update the layout encoder");
 static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: update the layout encoder");
-static_assert(sizeof(BindingAllocationResult) == 184, "BindingAllocationResult changed: update the allocation encoder");
-static_assert(sizeof(CompiledBindingLayout) == 88, "CompiledBindingLayout changed: update the allocation encoder");
+static_assert(sizeof(BindingAllocationResult) == 208, "BindingAllocationResult changed: update the allocation encoder");
+static_assert(sizeof(CompiledBindingLayout) == 112, "CompiledBindingLayout changed: update the allocation encoder");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
 static_assert(sizeof(IrResourcePlan) == 728, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(sizeof(IrValue) == 144, "IrValue changed: update the plan value encoder");
@@ -747,6 +747,7 @@ void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
         out.Value(descriptor.kind);
         out.Values(std::span<const std::uint32_t>(descriptor.resources));
     });
+    writer.Values(std::span<const std::uint32_t>(layout.runtimeSpecializationIds));
 }
 
 void decodeLayout(Reader& reader, IrBindingLayout& layout) {
@@ -762,6 +763,7 @@ void decodeLayout(Reader& reader, IrBindingLayout& layout) {
         in.Value(descriptor.kind);
         in.Values(descriptor.resources);
     });
+    reader.Values(layout.runtimeSpecializationIds);
 }
 
 void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {

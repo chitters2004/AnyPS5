@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
@@ -80,7 +81,7 @@ void FillTexture() {
     }
 }
 
-void Draw(AgcDriver::VulkanDevice& device, std::array<std::uint32_t, 8> texture, std::array<std::uint32_t, 4> sampler, float bias) {
+std::vector<std::uint32_t> Draw(AgcDriver::VulkanDevice& device, std::array<std::uint32_t, 8> texture, std::array<std::uint32_t, 4> sampler, float bias) {
     const auto& target = device.Target();
     alignas(256) std::array<std::uint32_t, 10> code{};
     std::copy_n(BiasPixelCode.begin(), 3u, code.begin());
@@ -148,6 +149,7 @@ void Draw(AgcDriver::VulkanDevice& device, std::array<std::uint32_t, 8> texture,
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
     device.Draw(state, draw, shaders);
     device.WaitIdle();
+    return pixelResult.spirv.Copy();
 }
 
 struct Case {
@@ -189,12 +191,20 @@ int main() {
             {0x1facu, 0.0f, 6u},
             {0x2000u, 0.0f, 0u},
         }};
+        const bool registration = device->Target().registrationModules;
+        const bool libraries = registration && device->GraphicsPipelineLibraries();
+        const auto fragmentParts = [&] { return AgcDriver::Graphics::PipelineLibraryCountersOf(device->Device()).built[2]; };
+        const auto partsBefore = libraries ? fragmentParts() : 0u;
+        std::vector<std::uint32_t> firstModule;
         for (const auto& sample : cases) {
             auto sampler = SamplerDescriptor();
             sampler[2] |= sample.field;
-            Draw(*device, TextureDescriptor(), sampler, sample.shaderBias);
+            const auto module = Draw(*device, TextureDescriptor(), sampler, sample.shaderBias);
             Check(sample, llvmpipe);
+            if (firstModule.empty()) firstModule = module;
+            Require(!registration || module == firstModule, "image sample LOD bias sum: a registration module changed with the S# LOD bias field " + std::to_string(sample.field));
         }
+        Require(!libraries || fragmentParts() == partsBefore + 1u, "image sample LOD bias sum: draws that differ only in S# fields built " + std::to_string(fragmentParts() - partsBefore) + " fragment library parts instead of one");
         std::puts("image sample LOD bias sum tests passed");
         return 0;
     } catch (const std::exception& error) {

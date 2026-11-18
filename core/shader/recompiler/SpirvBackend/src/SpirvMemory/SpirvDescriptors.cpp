@@ -54,6 +54,14 @@ std::uint32_t DescriptorElementPointer(SpirvEmitterState& state, std::uint32_t r
     return pointer;
 }
 
+std::uint32_t DescriptorSpecialization(SpirvEmitterState& state, std::uint32_t id) {
+    if (!state.registrationModules) return state.module.SpecializationConstant(TypeU32(state), id, 0u);
+    const auto& layout = state.program.Metadata().bindings;
+    const auto found = std::ranges::find(layout.runtimeSpecializationIds, id);
+    if (found == layout.runtimeSpecializationIds.end()) FailEmit("a registration module reads descriptor-derived value " + std::to_string(id) + ", which its runtime specialization table does not hold");
+    return EmitShaderDataDwordLoad(state, layout.RuntimeSpecializationDword() + static_cast<std::uint32_t>(found - layout.runtimeSpecializationIds.begin()));
+}
+
 std::uint32_t RuntimeImageDword(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t member) {
     const auto index = ConstantU32(state, resource);
     const auto dword = Binary(state, spv::OpIAdd, TypeU32(state), ConstantU32(state, state.program.Metadata().bindings.ImageMetadataDword() + member), Binary(state, spv::OpIMul, TypeU32(state), index, ConstantU32(state, sizeof(RuntimeAbi::ResourceMetadata) / sizeof(std::uint32_t))));
