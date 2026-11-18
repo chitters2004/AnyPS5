@@ -1353,6 +1353,14 @@ int run(const Options& options) {
     std::array<std::uint64_t, 4> nanoseconds{};
     AgcDriverBuiltLibraryParts_nid_postfix(parts.data(), nanoseconds.data());
     const auto ms = [&](std::size_t part) { return static_cast<double>(nanoseconds[part]) / 1.0e6; };
+    std::array<std::uint64_t, 4> prebuilt{};
+    std::array<std::uint64_t, 4> drawBuilt{};
+    std::array<std::uint64_t, 4> prebuiltUsed{};
+    AgcDriverLibraryPartOrigins_nid_postfix(prebuilt.data(), drawBuilt.data(), prebuiltUsed.data());
+    const auto partCounts = [](const std::array<std::uint64_t, 4>& counts) {
+        return "{\"vertex_input\":" + std::to_string(counts[0]) + ",\"pre_rasterization\":" + std::to_string(counts[1]) + ",\"fragment\":" + std::to_string(counts[2]) + ",\"fragment_output\":" + std::to_string(counts[3]) + "}";
+    };
+    std::printf("{\"library_parts_built_by_prebuild\":%s,\"library_parts_built_by_draws\":%s,\"library_parts_prebuilt_then_used_by_draws\":%s}\n", partCounts(prebuilt).c_str(), partCounts(drawBuilt).c_str(), partCounts(prebuiltUsed).c_str());
     std::printf("{\"library_parts_built\":{\"vertex_input\":%llu,\"pre_rasterization\":%llu,\"fragment\":%llu,\"fragment_output\":%llu},\"library_part_compile_ms\":{\"vertex_input\":%.3f,\"pre_rasterization\":%.3f,\"fragment\":%.3f,\"fragment_output\":%.3f}}\n", static_cast<unsigned long long>(parts[0]), static_cast<unsigned long long>(parts[1]), static_cast<unsigned long long>(parts[2]), static_cast<unsigned long long>(parts[3]), ms(0), ms(1), ms(2), ms(3));
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;

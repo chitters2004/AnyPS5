@@ -54,6 +54,9 @@ unsigned PipelineLibraryWorkers();
 struct PipelineLibraryCounters {
     std::array<std::uint64_t, 4> built{};
     std::array<std::uint64_t, 4> builtNanoseconds{};
+    std::array<std::uint64_t, 4> builtByPrebuild{};
+    std::array<std::uint64_t, 4> builtByDraw{};
+    std::array<std::uint64_t, 4> prebuiltUsedByDraw{};
     std::uint64_t linked = 0;
     std::uint64_t optimized = 0;
 };
