@@ -5,6 +5,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "CompiledVariant.hpp"
 #include "Optimization/RequestMemoryView.hpp"
@@ -887,6 +889,26 @@ void TexelOffsetPrebuildReuse(AgcDriver::VulkanDevice& device) {
     PrebuiltPixelReuse(device, pixelCode, std::move(users), "texel offset prebuild");
 }
 
+void StorageWritePrebuildReuse(AgcDriver::VulkanDevice& device) {
+    constexpr std::uint32_t size = 4u;
+    constexpr std::uint32_t format8888UNorm = 56u;
+    constexpr std::uint32_t type2D = 9u;
+    alignas(256) static std::array<std::uint32_t, 16384> texels{};
+    texels.fill(0u);
+    GuestAllocations::Mutation().Add(texels.data(), sizeof(texels), true, true, true);
+    alignas(256) static constexpr std::array<std::uint32_t, 12> pixelCode{0x7e100280u, 0x7e120280u, 0x7e0402f2u, 0x7e0602f2u, 0x7e0802f2u, 0x7e0a02f2u, 0xf0201f08u, 0x00010208u, 0xbf8c3f70u, 0xf800180fu, 0x05040302u, 0xbf810000u};
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels.data()));
+    std::vector<std::uint32_t> users(12u, 0u);
+    const std::array<std::uint32_t, 8> texture{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format8888UNorm << 20u) | (((size - 1u) & 3u) << 30u), ((size - 1u) >> 2u) | ((size - 1u) << 14u), 0xfacu | (type2D << 28u), 0u, 0u, 0u, 0u};
+    std::copy(texture.begin(), texture.end(), users.begin() + 4);
+    PrebuiltPixelReuse(device, pixelCode, std::move(users), "storage write prebuild");
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(texels.data()), sizeof(texels), nullptr, "storage write prebuild");
+    device.WaitIdle();
+    const auto stored = texels[0];
+    GuestAllocations::Mutation().Remove(texels.data());
+    Require(stored == 0xffffffffu, "storage write prebuild: the fragment store did not reach the storage image");
+}
+
 int main(int argc, char** argv) {
     try {
         auto device = OpenVulkanTestDevice();
@@ -901,6 +923,7 @@ int main(int argc, char** argv) {
             if (mode != "1") {
                 FormattedBufferPrebuildReuse(*device);
                 TexelOffsetPrebuildReuse(*device);
+                StorageWritePrebuildReuse(*device);
             }
             std::cout << "prebuild policy native readback passed\n";
             return 0;
