@@ -183,17 +183,20 @@ void ProofLeadKeepsTokensOnlyWithinTheCollectEpoch() {
     CommitShape shape;
     using Lead = AgcDriver::ProofLeadNote;
     const auto note = [&](const Lead& lead) { shape.Note(1, NoPhases, 0, {}, 0, AgcDriver::BuildReasonCount, lead); };
-    note({.looked = true, .stamped = true, .survived = true, .walked = true, .ending = AgcDriver::EndingFull, .revalidateUs = 50.0});
-    note({.looked = true, .stamped = true, .survived = true, .walked = true, .ending = AgcDriver::EndingFast, .revalidateUs = 4.0, .collectAdvanced = true});
+    note({.looked = true, .stamped = true, .survived = true, .walked = true, .ending = AgcDriver::EndingFull, .revalidateUs = 50.0, .collectSource = AgcDriver::CollectUnwatched});
+    note({.looked = true, .stamped = true, .survived = true, .walked = true, .ending = AgcDriver::EndingFast, .revalidateUs = 4.0, .collectAdvanced = true, .collectSource = AgcDriver::CollectOther});
+    note({.looked = true, .stamped = true, .survived = false, .walked = true, .ending = AgcDriver::EndingFull, .revalidateUs = 0.0, .collectSource = AgcDriver::CollectUnwatched});
+    note({.looked = true, .stamped = false, .walked = true, .ending = AgcDriver::EndingFull, .revalidateUs = 0.0, .collectSource = AgcDriver::CollectUnwatched});
     note({.looked = true, .stamped = true, .survived = false, .walked = true, .ending = AgcDriver::EndingFast, .revalidateUs = 6.0});
     note({.looked = true, .stamped = true, .survived = true, .walked = false, .ending = AgcDriver::EndingEpoch, .revalidateUs = 1.0, .collectAdvanced = true});
     note({.looked = true, .stamped = false, .walked = true, .ending = AgcDriver::EndingFull, .revalidateUs = 40.0, .collectAdvanced = true});
     const auto report = shape.Take();
     Require(report.leadCollectAdvanced == 2, "stamped draws whose collect epoch advanced were miscounted");
-    Require(report.walkedStamped == 3 && report.walkedCollectAdvanced == 1 && report.walkedKept == 1, "the stamped walks and their kept tokens were miscounted");
+    Require(report.walkedStamped == 4 && report.walkedCollectAdvanced == 1 && report.walkedKept == 1, "the stamped walks and their kept tokens were miscounted");
+    Require(report.walkedUnchanged == 2 && report.walkedUnchangedUs == 54.0 && report.walkedUnchangedUnwatched == 1 && report.walkedUnchangedUnwatchedUs == 50.0, "the unchanged stamped walks over unwatched ranges were miscounted");
     Require(report.walkedStampedUs == 60.0 && report.walkedKeptUs == 50.0, "the stamped and kept walk time was miscounted");
     const auto line = CommitShape::ProofLeadLine(report);
-    Require(line.find("; stamped draws whose collect epoch advanced since prepare 50.0%; walked and stamped 3: collect epoch advanced 33.3%, token kept (serials unchanged and collect epoch not advanced) 33.3%, walk time 0.1 ms, kept 0.1 ms (83.3%)") != std::string::npos, "the collect epoch clause is wrong: " + line);
+    Require(line.find("; stamped draws whose collect epoch advanced since prepare 40.0%; walked and stamped 4: collect epoch advanced 25.0%, token kept (serials unchanged and collect epoch not advanced) 25.0%, walk time 0.1 ms, kept 0.1 ms (83.3%); walked, stamped and serials unchanged 2 (0.1 ms): 1 over unwatched ranges (0.1 ms, 92.6% of their walk time)") != std::string::npos, "the collect epoch clause is wrong: " + line);
 }
 
 int main() {

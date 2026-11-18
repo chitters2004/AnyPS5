@@ -80,6 +80,8 @@ public:
         std::uint64_t leadLooked = 0, leadStamped = 0, leadSurvived = 0, leadEpochAdvanced = 0, walked = 0, walkedLookups = 0, walkedServed = 0, servedStamped = 0, servedSurvived = 0, servedPure = 0, servedPureSurvived = 0;
         std::uint64_t leadCollectAdvanced = 0, walkedStamped = 0, walkedCollectAdvanced = 0, walkedKept = 0;
         double walkedStampedUs = 0, walkedKeptUs = 0;
+        std::uint64_t walkedUnchanged = 0, walkedUnchangedUnwatched = 0;
+        double walkedUnchangedUs = 0, walkedUnchangedUnwatchedUs = 0;
         std::array<std::uint64_t, LeadBounds.size() + 1> leadBuckets{};
         std::array<std::uint64_t, WalkEffectCount> servedEffects{};
         std::array<std::uint64_t, ProofEndingCount> endings{};

@@ -51,6 +51,14 @@ void CommitShape::Note(std::size_t kind, std::span<const double, Phases> phaseUs
                 ++counts.walkedStamped;
                 counts.walkedStampedUs += lead.revalidateUs;
                 if (lead.collectAdvanced) ++counts.walkedCollectAdvanced;
+                if (lead.survived) {
+                    ++counts.walkedUnchanged;
+                    counts.walkedUnchangedUs += lead.revalidateUs;
+                    if (lead.collectSource == CollectUnwatched) {
+                        ++counts.walkedUnchangedUnwatched;
+                        counts.walkedUnchangedUnwatchedUs += lead.revalidateUs;
+                    }
+                }
                 if (lead.survived && !lead.collectAdvanced) {
                     ++counts.walkedKept;
                     counts.walkedKeptUs += lead.revalidateUs;
@@ -214,6 +222,8 @@ std::string CommitShape::ProofLeadLine(const Report& report) {
     std::snprintf(item, sizeof(item), "; stamped draws whose collect epoch advanced since prepare %.1f%%; walked and stamped %llu: collect epoch advanced %.1f%%,", share(report.leadCollectAdvanced, report.leadStamped), static_cast<unsigned long long>(report.walkedStamped), share(report.walkedCollectAdvanced, report.walkedStamped));
     text += item;
     std::snprintf(item, sizeof(item), " token kept (serials unchanged and collect epoch not advanced) %.1f%%, walk time %.1f ms, kept %.1f ms (%.1f%%)", share(report.walkedKept, report.walkedStamped), report.walkedStampedUs / 1000.0, report.walkedKeptUs / 1000.0, report.walkedStampedUs > 0 ? 100.0 * report.walkedKeptUs / report.walkedStampedUs : 0.0);
+    text += item;
+    std::snprintf(item, sizeof(item), "; walked, stamped and serials unchanged %llu (%.1f ms): %llu over unwatched ranges (%.1f ms, %.1f%% of their walk time)", static_cast<unsigned long long>(report.walkedUnchanged), report.walkedUnchangedUs / 1000.0, static_cast<unsigned long long>(report.walkedUnchangedUnwatched), report.walkedUnchangedUnwatchedUs / 1000.0, report.walkedUnchangedUs > 0 ? 100.0 * report.walkedUnchangedUnwatchedUs / report.walkedUnchangedUs : 0.0);
     text += item;
     return text;
 }
