@@ -430,6 +430,8 @@ struct ResultMemoEntry {
     std::uint64_t used = 0;
     std::shared_ptr<const MemoPatch> patch;
     std::uint64_t bytes = 0;
+    std::shared_ptr<RecompileResult> spare;
+    std::uint64_t spareBytes = 0;
 };
 
 struct EmissionFailure {
@@ -438,9 +440,8 @@ struct EmissionFailure {
     std::exception_ptr failure;
 };
 
-constexpr std::size_t ResultMemoSets = 64;
 constexpr std::size_t ResultMemoWays = 4;
-using ResultMemoTable = std::array<ResultMemoEntry, ResultMemoSets * ResultMemoWays>;
+using ResultMemoTable = std::vector<ResultMemoEntry>;
 
 struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::mutex mutex;
@@ -1833,9 +1834,29 @@ bool VerifyMaskedResultMemo() {
     return verify;
 }
 
+std::size_t resultMemoSets() {
+    static const std::size_t sets = [] {
+        const char* value = std::getenv("APS5_RESULT_MEMO_SETS");
+        const auto parsed = value == nullptr || *value == '\0' ? 0u : std::strtoull(value, nullptr, 10);
+        return parsed == 0u || parsed > 65536u ? std::size_t{64} : static_cast<std::size_t>(parsed);
+    }();
+    return sets;
+}
+
 ResultMemoEntry* memoSet(const std::unique_ptr<ResultMemoTable>& table, std::uint64_t index) {
     if (table == nullptr) return nullptr;
-    return table->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSets) * ResultMemoWays;
+    return table->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % (table->size() / ResultMemoWays)) * ResultMemoWays;
+}
+
+std::atomic<bool (*)()>& resultMemoRecycleGate() {
+    static std::atomic<bool (*)()> gate{nullptr};
+    return gate;
+}
+
+bool resultMemoRecycle() {
+    if (const auto gate = resultMemoRecycleGate().load(std::memory_order_relaxed)) return gate();
+    static const bool recycle = std::getenv("APS5_NO_RESULT_MEMO_RECYCLE") == nullptr;
+    return recycle;
 }
 
 class MemoKeyGhosts {
@@ -1868,6 +1889,7 @@ struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, patched{0}, misses{0}, evictions{0}, trimmed{0}, populateNanoseconds{0}, patchNanoseconds{0}, mismatches{0};
     std::atomic<std::uint64_t> evictedReseenPatched{0}, evictedReseenMissed{0}, patchedReseen{0}, patchCopyNanoseconds{0};
     std::atomic<std::uint64_t> totalEvictedReseenPatched{0}, totalEvictedReseenMissed{0}, totalPatchedReseen{0};
+    std::atomic<std::uint64_t> recycled{0}, spareHeld{0}, totalRecycled{0}, totalSpareHeld{0}, spares{0};
     MemoKeyGhosts evictedKeys, patchedKeys;
     std::atomic<std::int64_t> lastReport{0};
     std::atomic<std::uint64_t> clock{0}, heldBytes{0}, heldEntries{0};
@@ -2029,6 +2051,7 @@ void trimResultMemo(std::uint64_t budget) {
                     counters.heldBytes.fetch_sub(entry.bytes, std::memory_order_relaxed);
                     counters.heldEntries.fetch_sub(1, std::memory_order_relaxed);
                     counters.trimmed.fetch_add(1, std::memory_order_relaxed);
+                    if (entry.spare != nullptr) counters.spares.fetch_sub(1, std::memory_order_relaxed);
                     entry = {};
                     ++dropped;
                 }
@@ -2069,8 +2092,10 @@ void reportResultMemo() {
     const auto evictedMissed = counters.evictedReseenMissed.exchange(0, std::memory_order_relaxed);
     const auto patchedReseen = counters.patchedReseen.exchange(0, std::memory_order_relaxed);
     const auto patchCopy = counters.patchCopyNanoseconds.exchange(0, std::memory_order_relaxed);
+    const auto recycledCount = counters.recycled.exchange(0, std::memory_order_relaxed);
+    const auto spareHeld = counters.spareHeld.exchange(0, std::memory_order_relaxed);
     const auto total = static_cast<double>(hits + patched + misses);
-    std::fprintf(stderr, "[recompile] result memo keys (10 s): %llu exact misses were for keys evicted earlier (%llu then patched, %llu populated, of %llu evictions); %llu of %llu patches were for keys patched before (patched results are not kept); patch copy %.2f us, rest %.2f us each\n", static_cast<unsigned long long>(evictedPatched + evictedMissed), static_cast<unsigned long long>(evictedPatched), static_cast<unsigned long long>(evictedMissed), static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patchedReseen), static_cast<unsigned long long>(patched), patched != 0 ? static_cast<double>(patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, patched != 0 && patching >= patchCopy ? static_cast<double>(patching - patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0);
+    std::fprintf(stderr, "[recompile] result memo keys (10 s): %llu exact misses were for keys evicted earlier (%llu then patched, %llu populated, of %llu evictions); %llu of %llu patches were for keys patched before (patched results are not kept); patch copy %.2f us, rest %.2f us each; %llu patches reused a spare result in place, %llu copied because the spare was still held, %llu spares held; %zu sets of %zu ways per source\n", static_cast<unsigned long long>(evictedPatched + evictedMissed), static_cast<unsigned long long>(evictedPatched), static_cast<unsigned long long>(evictedMissed), static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patchedReseen), static_cast<unsigned long long>(patched), patched != 0 ? static_cast<double>(patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, patched != 0 && patching >= patchCopy ? static_cast<double>(patching - patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<unsigned long long>(recycledCount), static_cast<unsigned long long>(spareHeld), static_cast<unsigned long long>(counters.spares.load(std::memory_order_relaxed)), resultMemoSets(), ResultMemoWays);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu patched, %llu misses (%.1f%% hits, %.1f%% patched), Populate %.1f us per miss / %.1f ms in total, patch %.1f us each / %.1f ms in total, %llu evictions, %llu patch mismatches, %llu trimmed; %llu results held, %.1f MiB\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(misses), total != 0.0 ? 100.0 * static_cast<double>(hits) / total : 0.0, total != 0.0 ? 100.0 * static_cast<double>(patched) / total : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, patched != 0 ? static_cast<double>(patching) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<double>(patching) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(trimmed), static_cast<unsigned long long>(counters.heldEntries.load(std::memory_order_relaxed)), static_cast<double>(counters.heldBytes.load(std::memory_order_relaxed)) / 1048576.0);
     auto& plans = resourcePlans();
     const auto interval = TakeResourcePlanInterval();
@@ -2260,17 +2285,36 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     const auto maskedIndex = (variantId * 0x9e3779b97f4a7c15ull) ^ maskedHash;
     std::shared_ptr<const RecompileResult> donor;
     std::shared_ptr<const MemoPatch> donorPatch;
+    std::shared_ptr<RecompileResult> recycled;
+    std::uint64_t recycledBytes = 0;
+    const bool recycle = masking && resultMemoRecycle();
+    const auto findMasked = [&]() -> ResultMemoEntry* {
+        auto* set = memoSet(source.maskedMemo, maskedIndex);
+        if (set == nullptr) return nullptr;
+        for (std::size_t way = 0; way < ResultMemoWays; ++way) {
+            if (set[way].result != nullptr && set[way].variantId == variantId && set[way].hash == maskedHash) return &set[way];
+        }
+        return nullptr;
+    };
     if (masking) {
         std::unique_lock lock(source.mutex, std::defer_lock);
         if (!acquire(lock)) return nullptr;
-        if (auto* set = memoSet(source.maskedMemo, maskedIndex)) {
-            for (std::size_t way = 0; way < ResultMemoWays; ++way) {
-                auto& entry = set[way];
-                if (entry.result == nullptr || entry.variantId != variantId || entry.hash != maskedHash) continue;
-                entry.used = nextMemoUse();
-                donor = entry.result;
-                donorPatch = entry.patch;
-                break;
+        if (auto* entry = findMasked()) {
+            entry->used = nextMemoUse();
+            donor = entry->result;
+            donorPatch = entry->patch;
+            if (recycle && entry->spare != nullptr) {
+                if (entry->spare.use_count() == 1) {
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    recycled = std::move(entry->spare);
+                    recycledBytes = std::exchange(entry->spareBytes, 0u);
+                    entry->bytes -= recycledBytes;
+                    counters.heldBytes.fetch_sub(recycledBytes, std::memory_order_relaxed);
+                    counters.spares.fetch_sub(1, std::memory_order_relaxed);
+                } else {
+                    counters.spareHeld.fetch_add(1, std::memory_order_relaxed);
+                    counters.totalSpareHeld.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
     }
@@ -2293,7 +2337,14 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     std::shared_ptr<RecompileResult> result;
     std::shared_ptr<MemoPatch> patch;
     if (donor != nullptr) {
-        result = std::make_shared<RecompileResult>(*donor);
+        if (recycled != nullptr) {
+            result = std::move(recycled);
+            result->drawKeyMemo = ResultKeyMemo{};
+            counters.recycled.fetch_add(1, std::memory_order_relaxed);
+            counters.totalRecycled.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            result = std::make_shared<RecompileResult>(*donor);
+        }
         if (profile) counters.patchCopyNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         applyMemoPatch(*result, *donorPatch, snapshot);
         if (VerifyMaskedResultMemo()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot, false, nullptr, &substitutes), variantId);
@@ -2306,15 +2357,29 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         counters.misses.fetch_add(1, std::memory_order_relaxed);
     }
     result->cacheHit = cacheHit;
-    std::shared_ptr<const RecompileResult> shared = std::move(result);
     if (donor != nullptr) {
+        if (recycle) {
+            if (recycledBytes == 0u) recycledBytes = resultBytes(*result);
+            std::unique_lock lock(source.mutex, std::defer_lock);
+            if (memoOnly ? lock.try_lock() : (lock.lock(), true)) {
+                auto* entry = findMasked();
+                if (entry != nullptr && entry->result == donor && entry->spare == nullptr) {
+                    entry->spare = result;
+                    entry->spareBytes = recycledBytes;
+                    entry->bytes += recycledBytes;
+                    counters.heldBytes.fetch_add(recycledBytes, std::memory_order_relaxed);
+                    counters.spares.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
         reportResultMemo();
-        return shared;
+        return result;
     }
+    std::shared_ptr<const RecompileResult> shared = std::move(result);
     const auto bytes = resultBytes(*shared);
     const auto insert = [&](std::unique_ptr<ResultMemoTable>& table, std::uint64_t at, std::uint64_t key, std::shared_ptr<const MemoPatch> recipe, bool count) {
         if (table == nullptr) {
-            table = std::make_unique<ResultMemoTable>();
+            table = std::make_unique<ResultMemoTable>(resultMemoSets() * ResultMemoWays);
             if (source.memo == nullptr || source.maskedMemo == nullptr) {
                 auto& registry = resultMemoRegistry();
                 std::lock_guard registryLock(registry.mutex);
@@ -2338,6 +2403,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             }
             counters.heldBytes.fetch_sub(victim->bytes, std::memory_order_relaxed);
             counters.heldEntries.fetch_sub(1, std::memory_order_relaxed);
+            if (victim->spare != nullptr) counters.spares.fetch_sub(1, std::memory_order_relaxed);
         }
         const auto held = bytes + (recipe != nullptr ? patchBytes(*recipe) : 0u);
         *victim = {variantId, key, shared, nextMemoUse(), std::move(recipe), held};
@@ -2635,7 +2701,11 @@ std::uint64_t ResultMemoBytes() {
 
 ResultMemoReseen ResultMemoReseenCounts() {
     auto& counters = resultMemoCounters();
-    return {counters.totalEvictedReseenPatched.load(std::memory_order_relaxed), counters.totalEvictedReseenMissed.load(std::memory_order_relaxed), counters.totalPatchedReseen.load(std::memory_order_relaxed)};
+    return {counters.totalEvictedReseenPatched.load(std::memory_order_relaxed), counters.totalEvictedReseenMissed.load(std::memory_order_relaxed), counters.totalPatchedReseen.load(std::memory_order_relaxed), counters.totalRecycled.load(std::memory_order_relaxed), counters.totalSpareHeld.load(std::memory_order_relaxed), counters.spares.load(std::memory_order_relaxed)};
+}
+
+void SetResultMemoRecycleGate(bool (*gate)()) {
+    resultMemoRecycleGate().store(gate, std::memory_order_relaxed);
 }
 
 void SetResourcePlanBudget(std::uint64_t bytes) {

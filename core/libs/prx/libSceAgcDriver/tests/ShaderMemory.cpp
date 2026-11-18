@@ -498,7 +498,7 @@ const std::vector<std::uint32_t>& resultMemoPixelCode() {
     return code;
 }
 
-bool compileResultMemoPixel(std::uint32_t value) {
+std::shared_ptr<const ShaderRecompiler::RecompileResult> resultMemoPixel(std::uint32_t value, bool* memoHit = nullptr) {
     using namespace ShaderRecompiler;
     std::array<std::uint32_t, 1> color{value};
     auto request = FrontendRequest(resultMemoPixelCode(), color);
@@ -513,9 +513,70 @@ bool compileResultMemoPixel(std::uint32_t value) {
     const auto capture = memory.Capture(request);
     const auto regions = memory.Regions();
     request.context.memory = regions;
+    return Recompile(request, *capture, memoHit);
+}
+
+bool compileResultMemoPixel(std::uint32_t value) {
     bool hit = false;
-    static_cast<void>(Recompile(request, *capture, &hit));
+    static_cast<void>(resultMemoPixel(value, &hit));
     return hit;
+}
+
+bool resultHoldsWord(const ShaderRecompiler::RecompileResult& result, std::uint32_t value) {
+    for (std::size_t offset = 0; offset + sizeof(value) <= result.pushConstants.size(); offset += sizeof(value)) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, result.pushConstants.data() + offset, sizeof(word));
+        if (word == value) return true;
+    }
+    return std::ranges::any_of(result.bindings, [&](const auto& binding) { return std::ranges::find(binding.guestDescriptor, value) != binding.guestDescriptor.end(); });
+}
+
+bool recycleOff() {
+    return false;
+}
+
+void verifyResultMemoRecycle() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t base = 0x51a7e000u;
+    bool hit = true;
+    require(resultMemoPixel(base + 1u, &hit) != nullptr && !hit, "result memo recycle: the first compile hit the memo");
+    const auto populated = ResultMemoBytes();
+    const ShaderRecompiler::RecompileResult* dropped = nullptr;
+    {
+        const auto first = resultMemoPixel(base + 2u, &hit);
+        require(!hit && resultHoldsWord(*first, base + 2u) && !resultHoldsWord(*first, base + 1u), "result memo recycle: the first patch does not hold its own user word");
+        dropped = first.get();
+        first->drawKeyMemo.words.store(std::make_shared<const std::vector<std::uint32_t>>(1u, base + 2u));
+    }
+    const auto spareBytes = ResultMemoBytes() - populated;
+    require(spareBytes != 0u && ResultMemoReseenCounts().spares == 1u, "result memo recycle: a dropped patched result was not kept as the spare");
+    const auto before = ResultMemoReseenCounts();
+    auto reused = resultMemoPixel(base + 3u, &hit);
+    const auto afterReuse = ResultMemoReseenCounts();
+    require(reused.get() == dropped && afterReuse.recycled == before.recycled + 1u, "result memo recycle: a patch with the spare free did not reuse it");
+    require(resultHoldsWord(*reused, base + 3u) && !resultHoldsWord(*reused, base + 2u), "result memo recycle: the reused spare kept the words of its last patch");
+    require(reused->drawKeyMemo.words.load() == nullptr, "result memo recycle: the reused spare kept the draw key of its last patch");
+    auto held = resultMemoPixel(base + 4u, &hit);
+    const auto afterHeld = ResultMemoReseenCounts();
+    require(held.get() != reused.get() && afterHeld.recycled == afterReuse.recycled && afterHeld.spareHeld == afterReuse.spareHeld + 1u, "result memo recycle: a patch reused a spare still held by its caller");
+    require(resultHoldsWord(*reused, base + 3u) && !resultHoldsWord(*reused, base + 4u), "result memo recycle: a patch changed a result its caller still holds");
+    require(resultHoldsWord(*held, base + 4u), "result memo recycle: the copied patch does not hold its own user word");
+    require(ResultMemoBytes() == populated + spareBytes, "result memo recycle: the spare was counted more than once");
+    const auto* spare = reused.get();
+    reused.reset();
+    held.reset();
+    SetResultMemoRecycleGate(&recycleOff);
+    const auto off = ResultMemoReseenCounts();
+    {
+        const auto again = resultMemoPixel(base + 5u, &hit);
+        require(again.get() != spare && resultHoldsWord(*again, base + 5u), "result memo recycle: with recycling off a patch reused the free spare");
+    }
+    require(ResultMemoReseenCounts().recycled == off.recycled && ResultMemoBytes() == populated + spareBytes, "result memo recycle: with recycling off a patch was counted as reused or kept as a spare");
+    SetResultMemoRecycleGate(nullptr);
+    require(resultMemoPixel(base + 6u, &hit).get() == spare && ResultMemoReseenCounts().recycled == off.recycled + 1u, "result memo recycle: with recycling back on the free spare was not reused");
+    SetResultMemoBudget(1u);
+    require(ResultMemoBytes() == 0u && ResultMemoReseenCounts().spares == 0u, "result memo recycle: a trim left a spare");
+    SetResultMemoBudget(0u);
 }
 
 void verifyResultMemoBudgetThreads() {
@@ -553,6 +614,14 @@ void verifyResultMemoReseenEvicted() {
     require(hits < values, "result memo reseen evicted: three hundred results fit without an eviction");
     require(after.evictedThenPatched == 0u && after.patchedBefore == 0u, "result memo reseen evicted: an unmasked memo counted a patch");
     require(hits + after.evictedThenPopulated == values, std::string("result memo reseen evicted: " + std::to_string(hits) + " hits and " + std::to_string(after.evictedThenPopulated) + " evicted keys seen again do not cover " + std::to_string(values) + " repeats").c_str());
+}
+
+void verifyResultMemoCapacity() {
+    constexpr std::uint32_t values = 300u;
+    for (std::uint32_t value = 1; value <= values; ++value) require(!compileResultMemoPixel(value), "result memo capacity: a first compile hit the memo");
+    std::uint32_t hits = 0;
+    for (std::uint32_t value = 1; value <= values; ++value) hits += compileResultMemoPixel(value) ? 1u : 0u;
+    require(hits >= values / 10u * 9u, std::string("result memo capacity: APS5_RESULT_MEMO_SETS=256 kept only " + std::to_string(hits) + " of " + std::to_string(values) + " results").c_str());
 }
 
 void verifyResultMemoReseenPatched() {
@@ -13302,6 +13371,14 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-reseen-evicted") {
             verifyResultMemoReseenEvicted();
             std::cout << "The result memo counts exact misses for keys it evicted\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-memo-capacity") {
+            verifyResultMemoCapacity();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-memo-recycle") {
+            verifyResultMemoRecycle();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-reseen-patched") {

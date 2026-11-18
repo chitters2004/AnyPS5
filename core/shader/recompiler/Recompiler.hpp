@@ -1044,8 +1044,12 @@ struct ResultMemoReseen {
     std::uint64_t evictedThenPatched = 0;
     std::uint64_t evictedThenPopulated = 0;
     std::uint64_t patchedBefore = 0;
+    std::uint64_t recycled = 0;
+    std::uint64_t spareHeld = 0;
+    std::uint64_t spares = 0;
 };
 [[nodiscard]] ResultMemoReseen ResultMemoReseenCounts();
+void SetResultMemoRecycleGate(bool (*gate)());
 void SetResultMemoTrimHook(std::function<void()> hook);
 struct ResourcePlanCounters {
     std::uint64_t heldBytes = 0;
