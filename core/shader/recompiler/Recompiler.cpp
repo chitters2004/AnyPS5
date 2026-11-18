@@ -1367,7 +1367,11 @@ struct ModuleVariantTally {
     std::uint64_t equal = 0;
     std::uint64_t otherVariant = 0;
     std::uint64_t noRegistration = 0;
+    std::uint64_t refusedFormattedBuffer = 0;
+    std::uint64_t refusedTexelOffsets = 0;
     std::uint64_t notRegistrationForm = 0;
+    std::uint64_t overWordLimit = 0;
+    std::array<std::uint64_t, 3> notRegistrationByStage{};
     std::uint64_t shape = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ModuleField::Count)> firstDiffering{};
 };
@@ -1395,9 +1399,24 @@ void noteModuleVariant(const RecompileRequest& request, const CompiledVariant& v
     ++tally.drawModules;
     if (!variant.artifact.registrationModule) {
         ++tally.notRegistrationForm;
+        if (request.shader.stage == ShaderStage::Fragment) {
+            if (request.target.registrationModules) ++tally.overWordLimit;
+            ++tally.notRegistrationByStage[0];
+        } else {
+            ++tally.notRegistrationByStage[request.shader.stage == ShaderStage::Compute ? 2 : 1];
+        }
         return;
     }
     if (modules.registration.empty()) {
+        const auto& info = variant.info.info;
+        if (std::ranges::any_of(info.buffers, [](const BufferResource& buffer) { return buffer.descriptorFormatted; })) {
+            ++tally.refusedFormattedBuffer;
+            return;
+        }
+        if (std::ranges::any_of(info.samplers, [](const SamplerResource& sampler) { return FoldsTexelOffsets(sampler); })) {
+            ++tally.refusedTexelOffsets;
+            return;
+        }
         const auto found = tally.registeredVariantsByCode.find(request.shader.code.data());
         ++(found != tally.registeredVariantsByCode.end() && !found->second.empty() ? tally.otherVariant : tally.noRegistration);
         return;
@@ -2595,15 +2614,15 @@ std::string ModuleVariantsLine() {
         if (modules.drawn.size() > 1) ++splitVariants;
         most = std::max(most, modules.drawn.size());
     }
-    char item[192];
-    std::snprintf(item, sizeof(item), "[module-variants] since start: draw modules %llu: same as a registration module %llu, registered only as another variant of the same code %llu, no registration module %llu, not in registration form %llu, differing first in:", static_cast<unsigned long long>(tally.drawModules), static_cast<unsigned long long>(tally.equal), static_cast<unsigned long long>(tally.otherVariant), static_cast<unsigned long long>(tally.noRegistration), static_cast<unsigned long long>(tally.notRegistrationForm));
-    std::string text = item;
-    for (std::size_t field = 0; field < ModuleFieldNames.size(); ++field) {
-        std::snprintf(item, sizeof(item), "%s %s %llu", field == 0 ? "" : ",", ModuleFieldNames[field], static_cast<unsigned long long>(tally.firstDiffering[field]));
-        text += item;
-    }
-    std::snprintf(item, sizeof(item), ", other key shape %llu; variants drawn %zu, with more than one draw module %zu, most draw modules for one variant %zu", static_cast<unsigned long long>(tally.shape), drawnVariants, splitVariants, most);
-    return text + item;
+    const auto number = [](std::uint64_t value) { return std::to_string(value); };
+    std::string text = "[module-variants] since start: draw modules " + number(tally.drawModules) + ": same as a registration module " + number(tally.equal);
+    text += ", registered only as another variant of the same code " + number(tally.otherVariant);
+    text += ", no registration module " + number(tally.noRegistration + tally.refusedFormattedBuffer + tally.refusedTexelOffsets) + " (registration refused for a formatted buffer " + number(tally.refusedFormattedBuffer) + ", for a texel-offset sampler " + number(tally.refusedTexelOffsets) + ")";
+    text += ", not in registration form " + number(tally.notRegistrationForm) + " (fragment " + number(tally.notRegistrationByStage[0]) + ", of them over the registration word limit " + number(tally.overWordLimit) + "; vertex-family " + number(tally.notRegistrationByStage[1]) + "; compute " + number(tally.notRegistrationByStage[2]) + ")";
+    text += ", differing first in:";
+    for (std::size_t field = 0; field < ModuleFieldNames.size(); ++field) text += std::string(field == 0 ? " " : ", ") + ModuleFieldNames[field] + " " + number(tally.firstDiffering[field]);
+    text += ", other key shape " + number(tally.shape) + "; variants drawn " + std::to_string(drawnVariants) + ", with more than one draw module " + std::to_string(splitVariants) + ", most draw modules for one variant " + std::to_string(most);
+    return text;
 }
 
 std::shared_ptr<const RecompileResult> RegistrationResult(const RecompileRequest& request, const SourceHandle& handle) {
