@@ -8,6 +8,7 @@
 #include <malloc.h>
 #include <new>
 #include <windows.h>
+#include "prx/libSceAgcDriver/Execution/include/AllocationCensus.hpp"
 
 namespace {
 
@@ -196,20 +197,25 @@ void Release(void* block, std::size_t bytes = 0) noexcept {
     std::free(block);
 }
 
+void* Counted(void* block, std::size_t bytes, const void* caller) noexcept {
+    if (AgcDriver::AllocationCensus::Enabled()) AgcDriver::AllocationCensus::Note(AgcDriver::AllocationCensus::Source::New, caller, bytes);
+    return block;
 }
 
-void* operator new(std::size_t bytes) { return Allocate(bytes); }
-void* operator new[](std::size_t bytes) { return Allocate(bytes); }
+}
+
+void* operator new(std::size_t bytes) { return Counted(Allocate(bytes), bytes, __builtin_return_address(0)); }
+void* operator new[](std::size_t bytes) { return Counted(Allocate(bytes), bytes, __builtin_return_address(0)); }
 void* operator new(std::size_t bytes, const std::nothrow_t&) noexcept {
     try {
-        return Allocate(bytes);
+        return Counted(Allocate(bytes), bytes, __builtin_return_address(0));
     } catch (...) {
         return nullptr;
     }
 }
 void* operator new[](std::size_t bytes, const std::nothrow_t&) noexcept {
     try {
-        return Allocate(bytes);
+        return Counted(Allocate(bytes), bytes, __builtin_return_address(0));
     } catch (...) {
         return nullptr;
     }

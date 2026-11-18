@@ -419,6 +419,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostAllocator.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AllocationCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTraceThread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
@@ -585,6 +586,10 @@ if(APS5_ENABLE_TRACY)
 endif()
 if(MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(libSceAgcDriver PRIVATE LINKER:--exclude-libs,$<TARGET_FILE_NAME:decoder_png>)
+endif()
+if(MINGW)
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AllocationCensusWrap.cpp)
+    target_link_options(libSceAgcDriver PRIVATE LINKER:--wrap=malloc LINKER:--wrap=calloc LINKER:--wrap=realloc)
 endif()
 
 set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)

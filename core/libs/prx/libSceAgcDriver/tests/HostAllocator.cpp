@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/AllocationCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include <atomic>
 #include <cstddef>
@@ -183,6 +184,29 @@ void ThreadsEndWithCachedBlocks() {
     delete[] after;
 }
 
+void* volatile censusSink = nullptr;
+
+void CensusCountsDriverAllocations() {
+    using AgcDriver::AllocationCensus::Source;
+    using AgcDriver::AllocationCensus::Total;
+    Check(AgcDriver::AllocationCensus::Enabled(), "APS5_ALLOC_CENSUS turns the census on");
+    const auto news = Total(Source::New);
+    censusSink = ::operator new(40);
+    ::operator delete(censusSink);
+    censusSink = new std::uint64_t[3];
+    delete[] static_cast<std::uint64_t*>(censusSink);
+    Check(Total(Source::New) == news + 2, "operator new and new[] each count once in the census");
+    const auto mallocs = Total(Source::Malloc);
+    const auto callocs = Total(Source::Calloc);
+    const auto reallocs = Total(Source::Realloc);
+    censusSink = std::malloc(48);
+    censusSink = std::realloc(censusSink, 96);
+    std::free(censusSink);
+    censusSink = std::calloc(3, 16);
+    std::free(censusSink);
+    Check(Total(Source::Malloc) == mallocs + 1 && Total(Source::Calloc) == callocs + 1 && Total(Source::Realloc) == reallocs + 1, "malloc, calloc and realloc linked through --wrap each count once in the census");
+}
+
 void InlineAttachmentLists() {
     for (std::size_t count = 0; count < 34; ++count) {
         auto owner = std::make_shared<int>(7);
@@ -209,6 +233,7 @@ void InlineAttachmentLists() {
 }
 
 int main() {
+    CensusCountsDriverAllocations();
     InlineAttachmentLists();
     EverySizeRoundTrips();
     SizedDeletesKeepTheirClass();
