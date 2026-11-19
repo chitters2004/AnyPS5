@@ -96,7 +96,6 @@ private:
     bool depthBias = false;
     bool libraries = false;
     bool dynamicColorWriteMask = false;
-    bool staticDiscard = false;
     std::uint32_t dynamicSlots = 0;
     std::shared_ptr<OptimizedPipeline> optimized;
     bool dynamicRendering = false;
