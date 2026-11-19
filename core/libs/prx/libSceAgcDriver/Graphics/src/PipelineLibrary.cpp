@@ -466,10 +466,14 @@ unsigned PipelineLibraryWorkers() {
     return runningWorkers.load(std::memory_order_acquire);
 }
 
-bool PrebuildStillServesDraws(VkDevice device, std::size_t part) {
+bool PrebuildStillServesDraws(VkDevice device, std::size_t part, bool journalHoldsPipelines) {
     auto& store = Libraries();
     std::lock_guard lock(store.mutex);
     auto& counters = store.devices[device].counters;
+    if (journalHoldsPipelines) {
+        ++counters.prebuildsSkippedForJournal.at(part);
+        return false;
+    }
     if (PrebuildServesDraws(counters.prebuiltUsedByDraw.at(part), counters.builtByDraw.at(part))) return true;
     ++counters.prebuildsSkipped.at(part);
     return false;

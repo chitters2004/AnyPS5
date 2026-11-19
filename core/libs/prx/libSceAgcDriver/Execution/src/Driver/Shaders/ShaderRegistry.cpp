@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -1659,7 +1660,7 @@ void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Gra
     if (LibraryPrebuildDisabled() || result == nullptr || (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment)) return;
     SubmitLibraryPrebuild([device, stages, stage, result = std::move(result), pushOffset] {
         const std::array<Graphics::CompiledShader, 1> shaders{{{stage, result.get(), pushOffset}}};
-        if (!Graphics::PrebuildStillServesDraws(device->Device(), stage == ShaderRecompiler::ShaderStage::Fragment ? 2u : 1u)) return;
+        if (!Graphics::PrebuildStillServesDraws(device->Device(), stage == ShaderRecompiler::ShaderStage::Fragment ? 2u : 1u, Graphics::PipelineJournalTotals().loadedRecipes != 0u)) return;
         try {
             static_cast<void>(device->PrebuildGraphicsLibraries(stages, shaders));
         } catch (const std::exception& error) {

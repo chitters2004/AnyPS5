@@ -68,6 +68,7 @@ struct PipelineLibraryCounters {
     std::array<std::uint64_t, 4> drawBuiltWithPrebuiltModules{};
     std::array<std::uint64_t, 4> prebuildsSkipped{};
     std::array<std::uint64_t, 4> drawBuiltWithPrebuiltShaderKeys{};
+    std::array<std::uint64_t, 4> prebuildsSkippedForJournal{};
     std::uint64_t linked = 0;
     std::uint64_t optimized = 0;
 };
@@ -82,7 +83,7 @@ constexpr bool PrebuildServesDraws(std::uint64_t served, std::uint64_t drawBuilt
     return needed < PrebuildJudgedAfterDrawParts || served * 100u >= needed * PrebuildMinimumServedPercent;
 }
 
-bool PrebuildStillServesDraws(VkDevice device, std::size_t part);
+bool PrebuildStillServesDraws(VkDevice device, std::size_t part, bool journalHoldsPipelines);
 
 }
 
