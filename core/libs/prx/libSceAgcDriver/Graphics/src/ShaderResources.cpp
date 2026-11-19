@@ -4451,6 +4451,13 @@ struct RangeWriteCounts {
     ProfileCounter discardedUncompared;
     ProfileCounter reuseNanos;
     ProfileCounter takeNanos;
+    ProfileCounter takesNew;
+    ProfileCounter takesChanged;
+    ProfileCounter takeBytes;
+    ProfileCounter takeAllocNanos;
+    ProfileCounter takeCopyNanos;
+    ProfileCounter takeObserveNanos;
+    ProfileCounter takeCompareNanos;
     ProfileCounter compareNanos;
     ProfileCounter rebaseNanos;
     std::array<ProfileCounter, static_cast<std::size_t>(RangeWriteOwner::Count)> unwatchedOwners;
@@ -4509,6 +4516,22 @@ void noteRangeWritten(std::uint64_t begin, std::uint64_t bytes) {
     if (GuestMemory::ProofBreaksCounted()) rangeWriteCounts().markedVolatile.Add();
 }
 
+bool countedSnapshot(std::uint64_t begin, std::span<std::byte> out, std::uint64_t generation) {
+    auto& counts = rangeWriteCounts();
+    counts.takeBytes.Add(out.size());
+    if (out.empty() || generation == 0) return false;
+    auto start = std::chrono::steady_clock::now();
+    const bool copied = GuestMemory::CopyMapped(begin, out) == GuestMemory::Compare::Equal;
+    auto now = std::chrono::steady_clock::now();
+    counts.takeCopyNanos.Add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()));
+    if (!copied) return false;
+    start = now;
+    const bool unchanged = GuestMemory::Observe(begin, out.size()).status == GuestMemory::Observation::Status::Complete && GuestMemory::UnchangedSince(begin, out.size(), generation);
+    now = std::chrono::steady_clock::now();
+    counts.takeObserveNanos.Add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()));
+    return unchanged;
+}
+
 std::uint64_t nanosSince(std::chrono::steady_clock::time_point start) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
 }
@@ -4564,6 +4587,13 @@ std::string takeRangeWriteLine() {
     const auto uncompared = counts.discardedUncompared.Take();
     const auto reuseNanos = counts.reuseNanos.Take();
     const auto takeNanos = counts.takeNanos.Take();
+    const auto takesNew = counts.takesNew.Take();
+    const auto takesChanged = counts.takesChanged.Take();
+    const auto takeBytes = counts.takeBytes.Take();
+    const auto takeAllocNanos = counts.takeAllocNanos.Take();
+    const auto takeCopyNanos = counts.takeCopyNanos.Take();
+    const auto takeObserveNanos = counts.takeObserveNanos.Take();
+    const auto takeCompareNanos = counts.takeCompareNanos.Take();
     const auto compareNanos = counts.compareNanos.Take();
     const auto rebaseNanos = counts.rebaseNanos.Take();
     const auto perCall = [](std::uint64_t nanos, std::uint64_t calls) { return calls == 0 ? std::string("n/a") : std::to_string(nanos / calls) + " ns"; };
@@ -4582,7 +4612,7 @@ std::string takeRangeWriteLine() {
     const auto heldBytes = snapshotBytesHeldTotal.load(std::memory_order_relaxed);
     const auto peakBytes = snapshotBytesHeldPeak.exchange(heldBytes, std::memory_order_relaxed);
     const auto unwatchedSizes = list(counts.unwatchedSizes, RangeWriteSizes);
-    bytes += "; exits passed on matching bytes " + std::to_string(byteExits) + " (ranges " + std::to_string(byteRanges) + "); ranges rebased after a byte pass " + std::to_string(rebased) + ", exits with a range passing on its rebased generation " + std::to_string(rebaseExits) + " (ranges " + std::to_string(rebaseRanges) + "); byte compares " + std::to_string(calls) + " of " + std::to_string(compareBytes) + " bytes, differed " + std::to_string(differed) + "; written ranges without a snapshot " + std::to_string(noSnapshot) + "; snapshots kept " + std::to_string(taken) + ", dropped as written during the proof " + std::to_string(dropped) + ", skipped as never seen written " + std::to_string(skippedCold) + "; ranges marked written (later proofs snapshot them) " + std::to_string(markedVolatile) + "; time: snapshot takes " + std::to_string(takeNanos / 1000) + " us over " + std::to_string(taken + dropped) + " (" + perCall(takeNanos, taken + dropped) + " each), compares " + std::to_string(compareNanos / 1000) + " us (" + perCall(compareNanos, calls) + " each), rebases " + std::to_string(rebaseNanos / 1000) + " us (" + perCall(rebaseNanos, rebased) + " each), reuse compares " + std::to_string(reuseNanos / 1000) + " us; snapshots kept from the previous proof on equal bytes " + std::to_string(reused) + ", discarded never compared (their ranges unmarked) " + std::to_string(uncompared) + "; collect over unwatched memory by owner " + unwatchedOwners + "; by size " + unwatchedSizes + "; by host import: inside an import left unwatched " + std::to_string(unwatchedImported) + ", inside a watched import " + std::to_string(watchedImported) + ", in no import " + std::to_string(notImported) + "; ranged proof breaks: break log too short " + std::to_string(logShort) + ", no logged break over the range (a break elsewhere in its 64 KiB block) " + std::to_string(blockShared) + ", an unranged break in the window " + std::to_string(rangedUnranged) + ", by the overlapping break's site " + rangedSites + "; by the range's owner " + rangedOwners + "; by size " + rangedSizes + "; snapshots held now: sets " + std::to_string(snapshotSetsHeld.load(std::memory_order_relaxed)) + ", ranges " + std::to_string(snapshotRangesHeld.load(std::memory_order_relaxed)) + ", bytes " + std::to_string(heldBytes) + " (peak in the window " + std::to_string(std::max(peakBytes, heldBytes)) + ")";
+    bytes += "; exits passed on matching bytes " + std::to_string(byteExits) + " (ranges " + std::to_string(byteRanges) + "); ranges rebased after a byte pass " + std::to_string(rebased) + ", exits with a range passing on its rebased generation " + std::to_string(rebaseExits) + " (ranges " + std::to_string(rebaseRanges) + "); byte compares " + std::to_string(calls) + " of " + std::to_string(compareBytes) + " bytes, differed " + std::to_string(differed) + "; written ranges without a snapshot " + std::to_string(noSnapshot) + "; snapshots kept " + std::to_string(taken) + ", dropped as written during the proof " + std::to_string(dropped) + ", skipped as never seen written " + std::to_string(skippedCold) + "; ranges marked written (later proofs snapshot them) " + std::to_string(markedVolatile) + "; time: snapshot takes " + std::to_string(takeNanos / 1000) + " us over " + std::to_string(taken + dropped) + " (" + perCall(takeNanos, taken + dropped) + " each), compares " + std::to_string(compareNanos / 1000) + " us (" + perCall(compareNanos, calls) + " each), rebases " + std::to_string(rebaseNanos / 1000) + " us (" + perCall(rebaseNanos, rebased) + " each), reuse compares " + std::to_string(reuseNanos / 1000) + " us; snapshot takes split: new ranges " + std::to_string(takesNew) + ", changed ranges " + std::to_string(takesChanged) + ", bytes " + std::to_string(takeBytes) + ", allocation " + std::to_string(takeAllocNanos / 1000) + " us, copy " + std::to_string(takeCopyNanos / 1000) + " us, observe and stamp check " + std::to_string(takeObserveNanos / 1000) + " us, compares that found a changed range " + std::to_string(takeCompareNanos / 1000) + " us; snapshots kept from the previous proof on equal bytes " + std::to_string(reused) + ", discarded never compared (their ranges unmarked) " + std::to_string(uncompared) + "; collect over unwatched memory by owner " + unwatchedOwners + "; by size " + unwatchedSizes + "; by host import: inside an import left unwatched " + std::to_string(unwatchedImported) + ", inside a watched import " + std::to_string(watchedImported) + ", in no import " + std::to_string(notImported) + "; ranged proof breaks: break log too short " + std::to_string(logShort) + ", no logged break over the range (a break elsewhere in its 64 KiB block) " + std::to_string(blockShared) + ", an unranged break in the window " + std::to_string(rangedUnranged) + ", by the overlapping break's site " + rangedSites + "; by the range's owner " + rangedOwners + "; by size " + rangedSizes + "; snapshots held now: sets " + std::to_string(snapshotSetsHeld.load(std::memory_order_relaxed)) + ", ranges " + std::to_string(snapshotRangesHeld.load(std::memory_order_relaxed)) + ", bytes " + std::to_string(heldBytes) + " (peak in the window " + std::to_string(std::max(peakBytes, heldBytes)) + ")";
     return "range written: write evidence " + sources + "; only coarse units straddling the range edge " + std::to_string(straddles) + "; written share of the range " + shares + "; range size " + sizes + "; first written owner " + owners + " (table spans holding their compared bytes " + std::to_string(same) + "); no write found " + std::to_string(undescribed) + "; sub-page ranges whose bytes match the proof's: " + (bytes.empty() ? "none compared" : bytes);
 }
 
@@ -5484,7 +5514,11 @@ void ShaderResources::recordProofRanges() {
             const auto start = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const bool same = GuestMemory::CompareMapped(begin, old->bytes) == GuestMemory::Compare::Equal;
             if (!same) rangeSnapshotCopies.fetch_add(1, std::memory_order_relaxed);
-            const bool kept = same ? GuestMemory::Observe(begin, old->bytes.size()).status == GuestMemory::Observation::Status::Complete && GuestMemory::UnchangedSince(begin, old->bytes.size(), provedGeneration) : GuestMemory::SnapshotUnchangedSince(begin, old->bytes, provedGeneration);
+            if (!same && counted) {
+                rangeWriteCounts().takesChanged.Add();
+                rangeWriteCounts().takeCompareNanos.Add(nanosSince(start));
+            }
+            const bool kept = same ? GuestMemory::Observe(begin, old->bytes.size()).status == GuestMemory::Observation::Status::Complete && GuestMemory::UnchangedSince(begin, old->bytes.size(), provedGeneration) : counted ? countedSnapshot(begin, old->bytes, provedGeneration) : GuestMemory::SnapshotUnchangedSince(begin, old->bytes, provedGeneration);
             if (counted) (same ? rangeWriteCounts().reuseNanos : rangeWriteCounts().takeNanos).Add(nanosSince(start));
             if (!kept) {
                 if (counted) rangeWriteCounts().snapshotsDropped.Add();
@@ -5498,8 +5532,12 @@ void ShaderResources::recordProofRanges() {
         }
         const auto start = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::vector<std::byte> copy(static_cast<std::size_t>(bytes));
+        if (counted) {
+            rangeWriteCounts().takesNew.Add();
+            rangeWriteCounts().takeAllocNanos.Add(nanosSince(start));
+        }
         rangeSnapshotCopies.fetch_add(1, std::memory_order_relaxed);
-        const bool kept = GuestMemory::SnapshotUnchangedSince(begin, copy, provedGeneration);
+        const bool kept = counted ? countedSnapshot(begin, copy, provedGeneration) : GuestMemory::SnapshotUnchangedSince(begin, copy, provedGeneration);
         if (counted) rangeWriteCounts().takeNanos.Add(nanosSince(start));
         if (!kept) {
             if (counted) rangeWriteCounts().snapshotsDropped.Add();
