@@ -776,7 +776,7 @@ void OversizedRecordKeepsTheJournal() {
         auto result = CompileCompute(*device, code, words, 32);
         result.shaderDataUserWords.resize(400000u);
         std::uint32_t noise = 0x9e3779b9u;
-        for (auto& word : result.shaderDataUserWords) word = noise = noise * 1664525u + 1013904223u;
+        for (auto& word : result.shaderDataUserWords.mutate()) word = noise = noise * 1664525u + 1013904223u;
         AgcDriver::Graphics::RecordComputePipeline(result, false);
         AgcDriver::Graphics::FlushPipelineJournal();
     }

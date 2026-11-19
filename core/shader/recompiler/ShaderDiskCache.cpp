@@ -87,12 +87,12 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 288, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 216, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 240, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(ShaderInvocation) == 176, "ShaderInvocation changed: update the invocation encoder");
 #if defined(__cpp_lib_atomic_shared_ptr)
-static_assert(sizeof(RecompileResult) == 552, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(RecompileResult) == 456, "RecompileResult changed: update EncodeResult and DecodeResult");
 #endif
-static_assert(sizeof(DescriptorBinding) == 920, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 896, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
@@ -326,6 +326,16 @@ public:
     }
 
     template<typename TValue, typename TEncode>
+    void List(const SharedVector<TValue>& values, TEncode&& encode) {
+        List(values.get(), std::forward<TEncode>(encode));
+    }
+
+    template<typename TValue>
+    void Values(const SharedVector<TValue>& values) requires std::is_integral_v<TValue> {
+        Values(std::span<const TValue>(values.get()));
+    }
+
+    template<typename TValue, typename TEncode>
     void List(const std::vector<TValue>& values, TEncode&& encode) {
         Value<std::uint64_t>(values.size());
         for (const auto& value : values) encode(*this, value);
@@ -383,6 +393,20 @@ public:
         TValue value{};
         Value(value);
         return value;
+    }
+
+    template<typename TValue>
+    void Values(SharedVector<TValue>& values) requires std::is_integral_v<TValue> {
+        std::vector<TValue> decoded;
+        Values(decoded);
+        values = std::move(decoded);
+    }
+
+    template<typename TValue, typename TDecode>
+    void List(SharedVector<TValue>& values, std::size_t minimum, TDecode&& decode) {
+        std::vector<TValue> decoded;
+        List(decoded, minimum, std::forward<TDecode>(decode));
+        values = std::move(decoded);
     }
 
     template<typename TValue>

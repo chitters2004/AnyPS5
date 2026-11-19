@@ -15411,7 +15411,7 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
         const std::array<std::uint32_t, 4> arguments{3, 1, 0, 0};
         AgcDriver::GuestMemory::Write(argumentsAddress, std::as_bytes(std::span(arguments)));
         vertex.vertexAttributes = {attributeFor(argumentsAddress + 256, 16, 0)};
-        vertex.vertexAttributes[0].resource.fields[2] = 3;
+        vertex.vertexAttributes.mutate()[0].resource.fields[2] = 3;
         auto indirect = triangle;
         indirect.indirect.emplace();
         indirect.indirect->arguments = argumentsAddress;

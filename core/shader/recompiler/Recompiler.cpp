@@ -424,6 +424,8 @@ struct MemoPatch {
     std::uint32_t touchedAllocations = 0;
     std::uint32_t untouchedWordAllocations = 0;
     std::uint32_t invariantAllocations = 0;
+    std::uint32_t sharedReferences = 0;
+    std::uint32_t sharedInnerAllocations = 0;
 };
 
 struct ResultMemoEntry {
@@ -955,7 +957,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
             if (inputInfo.vertex->fetchEmbedded) {
                 for (const auto& block : program.Blocks()) {
                     for (const auto* instruction : block->Instructions()) {
-                        if (instruction->Opcode() == IrOpcode::GetAttribute && instruction->Argument(0)->Resolve()->ImmediateU32() == input.location) result.vertexInputs.back().outputMask |= 1u << instruction->Argument(1)->Resolve()->ImmediateU32();
+                        if (instruction->Opcode() == IrOpcode::GetAttribute && instruction->Argument(0)->Resolve()->ImmediateU32() == input.location) result.vertexInputs.mutate().back().outputMask |= 1u << instruction->Argument(1)->Resolve()->ImmediateU32();
                     }
                 }
             }
@@ -1452,7 +1454,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             const auto kind = numeric == IrTextureNumericClass::Float ? 0u : numeric == IrTextureNumericClass::Sint ? 1u : 2u;
             vertexClasses.at(input.location) = kind;
             std::uint32_t selectors = kind << 12u;
-            auto& formatComponents = result.vertexAttributes.back().formatComponents;
+            auto& formatComponents = result.vertexAttributes.mutate().back().formatComponents;
             formatComponents = 1u;
             for (std::uint32_t component = 0; component < 4u; ++component) {
                 const auto selector = (input.outputMask & (1u << component)) != 0u ? (resource.fields[3] >> (component * 3u)) & 7u : 0u;
@@ -1871,6 +1873,18 @@ std::atomic<bool (*)()>& resultMemoRecycleGate() {
     return gate;
 }
 
+std::atomic<bool (*)()>& resultMemoShareGate() {
+    static std::atomic<bool (*)()> gate{nullptr};
+    return gate;
+}
+
+bool resultMemoShare() {
+    if (const auto gate = resultMemoShareGate().load(std::memory_order_relaxed)) return gate();
+    static const bool share = std::getenv("APS5_NO_RESULT_MEMO_SHARE") == nullptr;
+    return share;
+}
+
+
 bool resultMemoRecycle() {
     if (const auto gate = resultMemoRecycleGate().load(std::memory_order_relaxed)) return gate();
     static const bool recycle = std::getenv("APS5_NO_RESULT_MEMO_RECYCLE") == nullptr;
@@ -1910,7 +1924,7 @@ struct ResultMemoCounters {
     std::atomic<std::uint64_t> recycled{0}, spareHeld{0}, totalRecycled{0}, totalSpareHeld{0}, spares{0};
     std::array<std::atomic<std::uint64_t>, ResultMemoHeldAges> heldAge{}, totalHeldAge{};
     std::array<std::atomic<std::uint64_t>, ResultMemoHeldRefs> heldRefs{}, totalHeldRefs{};
-    std::atomic<std::uint64_t> copyTouched{0}, copyUntouchedWords{0}, copyInvariant{0}, totalCopyTouched{0}, totalCopyUntouchedWords{0}, totalCopyInvariant{0};
+    std::atomic<std::uint64_t> copyTouched{0}, copyUntouchedWords{0}, copyInvariant{0}, copyShared{0}, totalCopyTouched{0}, totalCopyUntouchedWords{0}, totalCopyInvariant{0}, totalCopyShared{0};
     MemoKeyGhosts evictedKeys, patchedKeys;
     std::atomic<std::int64_t> lastReport{0};
     std::atomic<std::uint64_t> clock{0}, heldBytes{0}, heldEntries{0};
@@ -1971,6 +1985,11 @@ std::uint64_t vectorBytes(const std::vector<T>& values) {
 
 std::uint64_t vectorBytes(const std::vector<bool>& values) {
     return static_cast<std::uint64_t>(values.capacity() + 7u) / 8u;
+}
+
+template <class T>
+std::uint64_t vectorBytes(const SharedVector<T>& values) {
+    return vectorBytes(values.get());
 }
 
 std::uint64_t vectorBytes(const ElementFlags& values) {
@@ -2102,19 +2121,22 @@ void censusCopy(const RecompileResult& result, MemoPatch& patch) {
     std::uint32_t touchedCount = allocates(result.bindings) + (patch.pushData && !patch.userWords.empty() ? allocates(result.pushConstants) : 0u);
     std::uint32_t untouched = 0;
     std::uint32_t invariant = (patch.pushData && !patch.userWords.empty() ? 0u : allocates(result.pushConstants));
-    invariant += allocates(result.vertexInputPatches) + allocates(result.runtimeImageResources) + allocates(result.vertexInputs) + allocates(result.parameterExports) + allocates(result.fragmentParameters) + allocates(result.stencilReferences) + allocates(result.shaderDataUserWords) + allocates(result.specialization) + allocates(result.vertexAttributes) + allocates(result.imageTablePoison) + allocates(result.imageTableRanges) + allocates(result.imageTableReadRanges);
-    for (const auto& ranges : result.imageTableReadRanges) invariant += allocates(ranges);
+    std::uint32_t shared = allocates(result.vertexInputPatches) + allocates(result.runtimeImageResources) + allocates(result.vertexInputs) + allocates(result.parameterExports) + allocates(result.fragmentParameters) + allocates(result.stencilReferences) + allocates(result.shaderDataUserWords) + allocates(result.specialization) + allocates(result.vertexAttributes) + allocates(result.imageTablePoison) + allocates(result.imageTableRanges) + allocates(result.imageTableReadRanges);
+    std::uint32_t inner = 0;
+    for (const auto& ranges : result.imageTableReadRanges) inner += allocates(ranges);
     if (result.meshBarycentrics.has_value()) invariant += allocates(result.meshBarycentrics->parameters);
     for (std::size_t index = 0; index < result.bindings.size(); ++index) {
         const auto& binding = result.bindings[index];
         if (touched[index] != 0u) touchedCount += allocates(binding.guestDescriptor);
         else untouched += allocates(binding.guestDescriptor);
-        invariant += allocates(binding.imageShapes) + allocates(binding.imageSamplers) + allocates(binding.bufferExtent);
+        shared += allocates(binding.imageShapes) + allocates(binding.imageSamplers) + allocates(binding.bufferExtent);
         for (const auto* flags : {&binding.samplerDepthCompare, &binding.imageWritten, &binding.imageDepthCompare, &binding.imageAtomic, &binding.imageAtomic64, &binding.imageUintStorage, &binding.bufferAtomic, &binding.bufferWritten, &binding.samplerUnnormalized, &binding.samplerIntegerBorder, &binding.samplerCoordinatesIgnored, &binding.imageUnnormalized, &binding.imageUnnormalizedBaseLevel, &binding.bufferRead}) invariant += spills(*flags);
     }
     patch.touchedAllocations = touchedCount;
     patch.untouchedWordAllocations = untouched;
-    patch.invariantAllocations = invariant;
+    patch.invariantAllocations = invariant + shared + inner;
+    patch.sharedReferences = shared;
+    patch.sharedInnerAllocations = inner;
 }
 
 void reportResultMemo() {
@@ -2149,10 +2171,11 @@ void reportResultMemo() {
     const auto copyTouched = counters.copyTouched.exchange(0, std::memory_order_relaxed);
     const auto copyUntouched = counters.copyUntouchedWords.exchange(0, std::memory_order_relaxed);
     const auto copyInvariant = counters.copyInvariant.exchange(0, std::memory_order_relaxed);
+    const auto copyShared = counters.copyShared.exchange(0, std::memory_order_relaxed);
     const auto copies = patched > recycledCount ? patched - recycledCount : 0u;
     const auto perPatch = [&](std::uint64_t count) { return copies != 0 ? static_cast<double>(count) / static_cast<double>(copies) : 0.0; };
     const auto total = static_cast<double>(hits + patched + misses);
-    std::fprintf(stderr, "[recompile] result memo keys (10 s): %llu exact misses were for keys evicted earlier (%llu then patched, %llu populated, of %llu evictions); %llu of %llu patches were for keys patched before (patched results are not kept); patch copy %.2f us, rest %.2f us each; %llu patches reused a spare result in place, %llu copied because the spare was still held (spare kept for under 100 ms %llu, under 1 s %llu, under 10 s %llu, longer %llu; held by 1 other owner %llu, 2 %llu, 3 or more %llu), %llu spares held; %zu sets of %zu ways per source; allocations per patch copy: %.1f the patch rewrites, %.1f untouched binding words, %.1f invariant per variant\n", static_cast<unsigned long long>(evictedPatched + evictedMissed), static_cast<unsigned long long>(evictedPatched), static_cast<unsigned long long>(evictedMissed), static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patchedReseen), static_cast<unsigned long long>(patched), patched != 0 ? static_cast<double>(patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, patched != 0 && patching >= patchCopy ? static_cast<double>(patching - patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<unsigned long long>(recycledCount), static_cast<unsigned long long>(spareHeld), static_cast<unsigned long long>(heldAge[0]), static_cast<unsigned long long>(heldAge[1]), static_cast<unsigned long long>(heldAge[2]), static_cast<unsigned long long>(heldAge[3]), static_cast<unsigned long long>(heldRefs[0]), static_cast<unsigned long long>(heldRefs[1]), static_cast<unsigned long long>(heldRefs[2]), static_cast<unsigned long long>(counters.spares.load(std::memory_order_relaxed)), resultMemoSets(), ResultMemoWays, perPatch(copyTouched), perPatch(copyUntouched), perPatch(copyInvariant));
+    std::fprintf(stderr, "[recompile] result memo keys (10 s): %llu exact misses were for keys evicted earlier (%llu then patched, %llu populated, of %llu evictions); %llu of %llu patches were for keys patched before (patched results are not kept); patch copy %.2f us, rest %.2f us each; %llu patches reused a spare result in place, %llu copied because the spare was still held (spare kept for under 100 ms %llu, under 1 s %llu, under 10 s %llu, longer %llu; held by 1 other owner %llu, 2 %llu, 3 or more %llu), %llu spares held; %zu sets of %zu ways per source; allocations per patch copy: %.1f the patch rewrites, %.1f untouched binding words, %.1f invariant per variant, %.1f invariant vectors shared by reference instead (%s)\n", static_cast<unsigned long long>(evictedPatched + evictedMissed), static_cast<unsigned long long>(evictedPatched), static_cast<unsigned long long>(evictedMissed), static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patchedReseen), static_cast<unsigned long long>(patched), patched != 0 ? static_cast<double>(patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, patched != 0 && patching >= patchCopy ? static_cast<double>(patching - patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<unsigned long long>(recycledCount), static_cast<unsigned long long>(spareHeld), static_cast<unsigned long long>(heldAge[0]), static_cast<unsigned long long>(heldAge[1]), static_cast<unsigned long long>(heldAge[2]), static_cast<unsigned long long>(heldAge[3]), static_cast<unsigned long long>(heldRefs[0]), static_cast<unsigned long long>(heldRefs[1]), static_cast<unsigned long long>(heldRefs[2]), static_cast<unsigned long long>(counters.spares.load(std::memory_order_relaxed)), resultMemoSets(), ResultMemoWays, perPatch(copyTouched), perPatch(copyUntouched), perPatch(copyInvariant), perPatch(copyShared), resultMemoShare() ? "shared" : "off, APS5_NO_RESULT_MEMO_SHARE");
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu patched, %llu misses (%.1f%% hits, %.1f%% patched), Populate %.1f us per miss / %.1f ms in total, patch %.1f us each / %.1f ms in total, %llu evictions, %llu patch mismatches, %llu trimmed; %llu results held, %.1f MiB\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(misses), total != 0.0 ? 100.0 * static_cast<double>(hits) / total : 0.0, total != 0.0 ? 100.0 * static_cast<double>(patched) / total : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, patched != 0 ? static_cast<double>(patching) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<double>(patching) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(trimmed), static_cast<unsigned long long>(counters.heldEntries.load(std::memory_order_relaxed)), static_cast<double>(counters.heldBytes.load(std::memory_order_relaxed)) / 1048576.0);
     auto& plans = resourcePlans();
     const auto interval = TakeResourcePlanInterval();
@@ -2408,13 +2431,19 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             counters.totalRecycled.fetch_add(1, std::memory_order_relaxed);
         } else {
             result = std::make_shared<RecompileResult>(*donor);
+            const bool share = resultMemoShare();
+            if (!share) result->UnshareInvariants();
             if (profile) {
+                const auto shared = share ? donorPatch->sharedReferences : 0u;
+                const auto invariant = donorPatch->invariantAllocations - (share ? donorPatch->sharedReferences + donorPatch->sharedInnerAllocations : 0u);
                 counters.copyTouched.fetch_add(donorPatch->touchedAllocations, std::memory_order_relaxed);
                 counters.copyUntouchedWords.fetch_add(donorPatch->untouchedWordAllocations, std::memory_order_relaxed);
-                counters.copyInvariant.fetch_add(donorPatch->invariantAllocations, std::memory_order_relaxed);
+                counters.copyInvariant.fetch_add(invariant, std::memory_order_relaxed);
+                counters.copyShared.fetch_add(shared, std::memory_order_relaxed);
                 counters.totalCopyTouched.fetch_add(donorPatch->touchedAllocations, std::memory_order_relaxed);
                 counters.totalCopyUntouchedWords.fetch_add(donorPatch->untouchedWordAllocations, std::memory_order_relaxed);
-                counters.totalCopyInvariant.fetch_add(donorPatch->invariantAllocations, std::memory_order_relaxed);
+                counters.totalCopyInvariant.fetch_add(invariant, std::memory_order_relaxed);
+                counters.totalCopyShared.fetch_add(shared, std::memory_order_relaxed);
             }
         }
         if (profile) counters.patchCopyNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
@@ -2781,11 +2810,36 @@ ResultMemoReseen ResultMemoReseenCounts() {
     reseen.copyTouched = counters.totalCopyTouched.load(std::memory_order_relaxed);
     reseen.copyUntouchedWords = counters.totalCopyUntouchedWords.load(std::memory_order_relaxed);
     reseen.copyInvariant = counters.totalCopyInvariant.load(std::memory_order_relaxed);
+    reseen.copyShared = counters.totalCopyShared.load(std::memory_order_relaxed);
     return reseen;
 }
 
 void SetResultMemoClockForTest(std::uint64_t (*clock)()) {
     resultMemoClock().store(clock, std::memory_order_relaxed);
+}
+
+void RecompileResult::UnshareInvariants() {
+    vertexInputPatches.unshare();
+    runtimeImageResources.unshare();
+    vertexInputs.unshare();
+    parameterExports.unshare();
+    fragmentParameters.unshare();
+    stencilReferences.unshare();
+    specialization.unshare();
+    vertexAttributes.unshare();
+    imageTablePoison.unshare();
+    imageTableRanges.unshare();
+    imageTableReadRanges.unshare();
+    shaderDataUserWords.unshare();
+    for (auto& binding : bindings) {
+        binding.imageShapes.unshare();
+        binding.imageSamplers.unshare();
+        binding.bufferExtent.unshare();
+    }
+}
+
+void SetResultMemoShareGate(bool (*gate)()) {
+    resultMemoShareGate().store(gate, std::memory_order_relaxed);
 }
 
 void SetResultMemoRecycleGate(bool (*gate)()) {

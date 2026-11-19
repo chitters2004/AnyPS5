@@ -248,6 +248,7 @@ const ShaderRecompiler::DiagnosticSink runReportSink{
 };
 [[maybe_unused]] const bool runReportSinkInstalled = (LibcRunReportSetDescriptorCounters_nid_no_patch(descriptorUse), ShaderRecompiler::SetDiagnosticSink(&runReportSink), true);
 [[maybe_unused]] const bool resultMemoRecycleGateInstalled = (ShaderRecompiler::SetResultMemoRecycleGate(+[] { return !AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::NoResultMemoRecycle); }), true);
+[[maybe_unused]] const bool resultMemoShareGateInstalled = (ShaderRecompiler::SetResultMemoShareGate(+[] { return !AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::NoResultMemoShare); }), true);
 
 
 std::uint64_t fillCompletionSyncs = 0;

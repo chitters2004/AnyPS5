@@ -3,6 +3,7 @@
 
 #include "RuntimeAbi.hpp"
 #include "PipelineSpecialization.hpp"
+#include "SharedVector.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <algorithm>
 #include <array>
@@ -710,7 +711,7 @@ struct DescriptorBinding {
     ElementFlags imageAtomic;
     ElementFlags imageAtomic64;
     ElementFlags imageUintStorage;
-    std::vector<DescriptorImageShape> imageShapes;
+    SharedVector<DescriptorImageShape> imageShapes;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
     // (~0.4-0.5 us each on NVIDIA), so a driver may keep these elements in device-local memory.
@@ -726,9 +727,9 @@ struct DescriptorBinding {
     ElementFlags samplerCoordinatesIgnored;
     ElementFlags imageUnnormalized;
     ElementFlags imageUnnormalizedBaseLevel;
-    std::vector<std::uint64_t> imageSamplers;
+    SharedVector<std::uint64_t> imageSamplers;
     ElementFlags bufferRead;
-    std::vector<std::uint32_t> bufferExtent;
+    SharedVector<std::uint32_t> bufferExtent;
 };
 
 struct ImageTableEntryPoison {
@@ -912,19 +913,19 @@ struct VertexInputPatch {
 };
 
 struct CompiledShaderArtifact {
-    std::vector<VertexInputPatch> vertexInputPatches;
+    SharedVector<VertexInputPatch> vertexInputPatches;
     SharedSpirv spirv;
     std::uint32_t memoryOffsetDword = 0;
     std::uint32_t shaderDataDwords = 0;
     std::uint32_t imageMetadataDword = 0;
     std::uint32_t runtimeImageCount = 0;
-    std::vector<std::uint32_t> runtimeImageResources;
+    SharedVector<std::uint32_t> runtimeImageResources;
     bool registrationModule = false;
     std::uint32_t bdaAbiVersion = 0;
     std::uint32_t windowLaneGuards = 0;
     std::uint32_t descriptorFaults = 0;
     std::uint32_t runtimeAbiVersion = RuntimeAbi::Version;
-    std::vector<VertexInput> vertexInputs;
+    SharedVector<VertexInput> vertexInputs;
     std::int32_t vertexOffsetSgpr = -1;
     std::int32_t instanceOffsetSgpr = -1;
     bool vertexOffsetShared = false;
@@ -936,11 +937,11 @@ struct CompiledShaderArtifact {
     bool functionLdsBuffer = false;
     bool meshWindowBuffer = false;
     std::uint32_t scratchPoolSlotDwords = 0;
-    std::vector<std::uint32_t> parameterExports;
-    std::vector<FragmentParameter> fragmentParameters;
+    SharedVector<std::uint32_t> parameterExports;
+    SharedVector<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;
     std::optional<MeshBarycentricLayout> meshBarycentrics;
-    std::vector<std::uint32_t> stencilReferences;
+    SharedVector<std::uint32_t> stencilReferences;
     bool stencilReplaySafe = false;
     bool bdaWrites = false;
     bool layerReplaySafe = false;
@@ -949,17 +950,17 @@ struct CompiledShaderArtifact {
 };
 
 struct ShaderInvocation {
-    std::vector<PipelineSpecializationConstant> specialization;
+    SharedVector<PipelineSpecializationConstant> specialization;
     std::uint64_t specializationId = 0;
     std::vector<DescriptorBinding> bindings;
     std::vector<std::byte> pushConstants;
     bool readsDepthRemapPush = false;
-    std::vector<VertexAttribute> vertexAttributes;
+    SharedVector<VertexAttribute> vertexAttributes;
     std::uint64_t userDataRegisterReads = 0;
     std::uint32_t poisonedSrtReads = 0;
-    std::vector<ImageTableEntryPoison> imageTablePoison;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
-    std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
+    SharedVector<ImageTableEntryPoison> imageTablePoison;
+    SharedVector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
+    SharedVector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
     std::uint64_t imageTableShader = 0;
     std::uint32_t imageTableFaults = 0;
 };
@@ -992,7 +993,8 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     ResultKeyMemo drawKeyMemo;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
-    std::vector<std::uint32_t> shaderDataUserWords;
+    SharedVector<std::uint32_t> shaderDataUserWords;
+    void UnshareInvariants();
     [[nodiscard]] std::uint64_t PipelineVariantId() const { return specializationId != 0 ? specializationId : variantId; }
     [[nodiscard]] PipelineIdentity Identity() const {
         const auto hash = spirv.ContentHash();
@@ -1054,9 +1056,11 @@ struct ResultMemoReseen {
     std::uint64_t copyTouched = 0;
     std::uint64_t copyUntouchedWords = 0;
     std::uint64_t copyInvariant = 0;
+    std::uint64_t copyShared = 0;
 };
 [[nodiscard]] ResultMemoReseen ResultMemoReseenCounts();
 void SetResultMemoRecycleGate(bool (*gate)());
+void SetResultMemoShareGate(bool (*gate)());
 void SetResultMemoClockForTest(std::uint64_t (*clock)());
 void SetResultMemoTrimHook(std::function<void()> hook);
 struct ResourcePlanCounters {

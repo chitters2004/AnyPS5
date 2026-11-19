@@ -670,7 +670,74 @@ void verifyResultMemoReseenPatched() {
     require(copies.copyTouched == 4u && copies.copyUntouchedWords == 0u, ("result memo reseen patched: four patches of push words were not counted as one rewritten allocation each (" + std::to_string(copies.copyTouched) + " rewritten, " + std::to_string(copies.copyUntouchedWords) + " untouched)").c_str());
     std::uint64_t allocations = 0;
     for (const bool used : {!patchedResult->vertexInputPatches.empty(), !patchedResult->runtimeImageResources.empty(), !patchedResult->vertexInputs.empty(), !patchedResult->parameterExports.empty(), !patchedResult->fragmentParameters.empty(), !patchedResult->stencilReferences.empty(), !patchedResult->shaderDataUserWords.empty(), !patchedResult->specialization.empty(), !patchedResult->vertexAttributes.empty(), !patchedResult->imageTablePoison.empty(), !patchedResult->imageTableRanges.empty(), !patchedResult->imageTableReadRanges.empty()}) allocations += used ? 1u : 0u;
-    require(allocations != 0u && copies.copyInvariant == 4u * allocations, ("result memo reseen patched: " + std::to_string(copies.copyInvariant) + " invariant allocations over four patches, expected " + std::to_string(4u * allocations)).c_str());
+    const bool share = std::getenv("APS5_NO_RESULT_MEMO_SHARE") == nullptr;
+    const auto invariant = share ? 0u : 4u * allocations;
+    const auto shared = share ? 4u * allocations : 0u;
+    require(allocations != 0u && copies.copyInvariant == invariant && copies.copyShared == shared, ("result memo reseen patched: " + std::to_string(copies.copyInvariant) + " invariant allocations and " + std::to_string(copies.copyShared) + " shared references over four patches, expected " + std::to_string(invariant) + " and " + std::to_string(shared)).c_str());
+    const auto again = resultMemoPixel(5u);
+    const auto storage = [](const RecompileResult& result) {
+        return std::vector<const void*>{result.vertexInputPatches.data(), result.runtimeImageResources.data(), result.vertexInputs.data(), result.parameterExports.data(), result.fragmentParameters.data(), result.stencilReferences.data(), result.shaderDataUserWords.data(), result.specialization.data(), result.vertexAttributes.data(), result.imageTablePoison.data(), result.imageTableRanges.data(), result.imageTableReadRanges.data()};
+    };
+    const auto first = storage(*patchedResult);
+    const auto second = storage(*again);
+    std::size_t same = 0;
+    std::size_t used = 0;
+    for (std::size_t index = 0; index < first.size(); ++index) {
+        if (first[index] == nullptr) continue;
+        ++used;
+        same += first[index] == second[index] ? 1u : 0u;
+    }
+    require(used == allocations && same == (share ? used : 0u), ("result memo reseen patched: two patched results share " + std::to_string(same) + " of " + std::to_string(used) + " invariant vectors with sharing " + (share ? "on" : "off")).c_str());
+    require(again->pushConstants != patchedResult->pushConstants && again->pushConstants.data() != patchedResult->pushConstants.data(), "result memo reseen patched: two patches share their rewritten push words");
+}
+
+void verifySharedVector() {
+    using ShaderRecompiler::SharedVector;
+    SharedVector<std::uint32_t> empty;
+    require(empty.empty() && empty.size() == 0u && empty.data() == nullptr && !empty.shared(), "shared vector: an empty vector holds storage");
+    SharedVector<std::uint32_t> original = std::vector<std::uint32_t>{1u, 2u, 3u};
+    auto copy = original;
+    require(copy.data() == original.data() && copy.shared() && original.shared(), "shared vector: a copy did not share its storage");
+    copy.mutate()[1] = 9u;
+    require(original.get() == std::vector<std::uint32_t>{1u, 2u, 3u} && copy.get() == std::vector<std::uint32_t>{1u, 9u, 3u} && copy.data() != original.data(), "shared vector: a write to a copy reached the original");
+    require(!copy.shared() && !original.shared(), "shared vector: a written copy still shares");
+    const auto* owned = copy.data();
+    copy.mutate()[0] = 7u;
+    require(copy.data() == owned && copy[0] == 7u, "shared vector: a write to an unshared vector copied it");
+    auto third = original;
+    third.unshare();
+    require(third.data() != original.data() && third == original && !original.shared(), "shared vector: unshare kept the storage");
+    third.push_back(4u);
+    require(third.size() == 4u && original.size() == 3u, "shared vector: a push on an unshared copy reached the original");
+    third.assign(std::vector<std::uint32_t>{});
+    require(third.empty() && third.data() == nullptr, "shared vector: assigning nothing kept storage");
+    ShaderRecompiler::RecompileResult result;
+    result.vertexInputPatches = std::vector<ShaderRecompiler::VertexInputPatch>(1u);
+    result.runtimeImageResources = std::vector<std::uint32_t>{1u};
+    result.vertexInputs = std::vector<ShaderRecompiler::VertexInput>(1u);
+    result.parameterExports = std::vector<std::uint32_t>{2u};
+    result.fragmentParameters = std::vector<ShaderRecompiler::FragmentParameter>(1u);
+    result.stencilReferences = std::vector<std::uint32_t>{3u};
+    result.specialization = std::vector<ShaderRecompiler::PipelineSpecializationConstant>(1u);
+    result.vertexAttributes = std::vector<ShaderRecompiler::VertexAttribute>(1u);
+    result.imageTablePoison = std::vector<ShaderRecompiler::ImageTableEntryPoison>(1u);
+    result.imageTableRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>{{1u, 2u}};
+    result.imageTableReadRanges = std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>>(1u);
+    result.shaderDataUserWords = std::vector<std::uint32_t>{4u};
+    result.bindings.resize(1u);
+    result.bindings[0].imageShapes = std::vector<ShaderRecompiler::DescriptorImageShape>(1u);
+    result.bindings[0].imageSamplers = std::vector<std::uint64_t>{5u};
+    result.bindings[0].bufferExtent = std::vector<std::uint32_t>{6u};
+    const auto storage = [](const ShaderRecompiler::RecompileResult& value) {
+        return std::vector<const void*>{value.vertexInputPatches.data(), value.runtimeImageResources.data(), value.vertexInputs.data(), value.parameterExports.data(), value.fragmentParameters.data(), value.stencilReferences.data(), value.specialization.data(), value.vertexAttributes.data(), value.imageTablePoison.data(), value.imageTableRanges.data(), value.imageTableReadRanges.data(), value.shaderDataUserWords.data(), value.bindings[0].imageShapes.data(), value.bindings[0].imageSamplers.data(), value.bindings[0].bufferExtent.data()};
+    };
+    auto shared = result;
+    const auto before = storage(result);
+    require(storage(shared) == before, "shared vector: a copied result did not share every invariant vector");
+    shared.UnshareInvariants();
+    const auto after = storage(shared);
+    for (std::size_t index = 0; index < before.size(); ++index) require(after[index] != nullptr && after[index] != before[index], ("shared vector: unsharing a result kept invariant vector " + std::to_string(index)).c_str());
+    require(storage(result) == before, "shared vector: unsharing a copy moved the original's storage");
 }
 
 void verifyResultMemoBudgetMasked() {
@@ -5169,7 +5236,9 @@ void verifyImageTableBindingGrowth() {
                 require(images.imageShapes[index] == DescriptorImageShape::Image2D && images.imageDepthCompare[index] == tables.elements[index].depthCompare && images.imageWritten[index] == ((index + pass) % 2u != 0u) && !images.imageAtomic[index] && images.imageSamplers[index] == 0u, "image table bindings: an element inherited another element's metadata");
                 require(std::equal(tables.samplers[index].words.begin(), tables.samplers[index].words.end(), samplers.guestDescriptor.begin() + index * 4u) && samplers.samplerDepthCompare[index] == tables.samplers[index].compare, "image table bindings: sampler words or comparison state changed");
             }
-            require(allocations <= 11u, ("image table bindings: " + std::to_string(count) + " elements required " + std::to_string(allocations) + " allocations, expected at most one per output array").c_str());
+            const auto sharedArrays = [](const DescriptorBinding& binding) { return (binding.imageShapes.empty() ? 0u : 1u) + (binding.imageSamplers.empty() ? 0u : 1u) + (binding.bufferExtent.empty() ? 0u : 1u); };
+            const auto shared = sharedArrays(images) + sharedArrays(samplers);
+            require(allocations <= 11u + shared, ("image table bindings: " + std::to_string(count) + " elements required " + std::to_string(allocations) + " allocations, expected at most one per output array and one owner block per shared array (" + std::to_string(shared) + ")").c_str());
         }
     }
 }
@@ -13413,6 +13482,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-capacity") {
             verifyResultMemoCapacity();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--shared-vector") {
+            verifySharedVector();
+            std::puts("shared vector tests passed");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-recycle") {

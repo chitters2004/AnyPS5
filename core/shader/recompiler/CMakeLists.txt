@@ -288,6 +288,7 @@ function(add_shader_recompiler target runtimeTarget)
             SetDiagnosticSink
             SetResultMemoClockForTest
             SetResultMemoRecycleGate
+            SetResultMemoShareGate
             Recompile
             RecompileCacheKey::ContextHash
             RecompileCacheKey::SealFeatureDigest
