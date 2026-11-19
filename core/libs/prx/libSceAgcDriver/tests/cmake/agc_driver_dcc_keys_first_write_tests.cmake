@@ -1,4 +1,8 @@
 if(BUILD_TESTING)
+    add_test(NAME agc_driver_dcc_keys_upload_census COMMAND agc_driver_dcc_keys_first_write_tests)
+    set_tests_properties(agc_driver_dcc_keys_upload_census PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_DRAW=1;APS5_PROFILE_UPLOAD_CONTENT=1" TIMEOUT 60 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            PASS_REGULAR_EXPRESSION "keys: unchanged since its last upload 5 .*keys-reason uploads by key change and path [^:]*: uncompressed -> 0000 by GPU clear 6 \\(0\\.4 MiB\\), 3 with unchanged texel bytes. 0000 -> 0001 by GPU clear 1 \\(0\\.1 MiB\\), 1 with unchanged texel bytes. 0001 -> 1111 by GPU clear 1 \\(0\\.1 MiB\\), 1 with unchanged texel bytes[^:-@].*keys-reason uploads by key change and path [^:]*: uncompressed -> 0000 by GPU clear 2 \\(0\\.1 MiB\\), 0 with unchanged texel bytes[^:-@]")
     add_test(NAME agc_driver_dcc_keys_rewrite_after_memo COMMAND agc_driver_dcc_keys_first_write_tests --rewrite-after-memo)
     add_test(NAME agc_driver_dcc_keys_rewrite_after_refresh_proof COMMAND agc_driver_dcc_keys_first_write_tests --rewrite-after-refresh-proof)
     add_test(NAME agc_driver_dcc_keys_rewrite_after_epoch_proof COMMAND agc_driver_dcc_keys_first_write_tests --rewrite-after-epoch-proof)

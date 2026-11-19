@@ -958,6 +958,9 @@ private:
     std::atomic<bool> firstUseAfterWriteBack{false};
     std::atomic<std::uint8_t> firstUseReason{0};
     std::uint64_t lastUploadHash = 0;
+    std::int8_t lastUploadUnchanged = -1;
+    void noteKeysUpload(DccKeys previous, bool cleared, std::uint64_t bytes);
+    static void reportKeysUploads();
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
     // Hook skips of this image since FlushPending last listed it (AccessKeptByCpu), the read site

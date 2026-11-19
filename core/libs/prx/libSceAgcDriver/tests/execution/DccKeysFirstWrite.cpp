@@ -398,6 +398,14 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     image->MarkDirty();
     device.WaitIdle();
     RequireKeys(keys, 0x40, "a write marked after a 0001 key fill over a cleared image, before a refresh saw the fill");
+    image->Refresh();
+    device.WaitIdle();
+    std::memset(keys, 0xc0, KeyBytes);
+    image->Refresh();
+    device.WaitIdle();
+    std::snprintf(message, sizeof(message), "a refresh after the CPU stored 1111 keys uploaded the image under %s keys", AgcDriver::Graphics::DccKeysName(image->UploadedKeys()));
+    Require(image->UploadedKeys() == DccKeys::Clear1111, message);
+    StorageTexture::ReportFormatAliases();
 }
 
 void RunReusedKeys(AgcDriver::VulkanDevice& device, std::uint8_t* block) {

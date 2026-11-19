@@ -3575,11 +3575,14 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         }
         refreshGeneration();
     };
+    const auto previousKeys = uploadedKeys;
     uploadedKeys = ProvedClearKeys(descriptor, guestBytes, keyProof);
     filledKeys = DccKeys::Uncompressed;
     VkClearColorValue clearValue{};
     const bool fastClear = IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle;
-    if (fastClear && (ClearColorFor(storageFormat, uploadedKeys, clearValue) || SingleKeyColorFor(descriptor, guestBytes, now, singleProof, storageFormat, uploadedKeys, clearValue))) {
+    const bool clearedOnGpu = fastClear && (ClearColorFor(storageFormat, uploadedKeys, clearValue) || SingleKeyColorFor(descriptor, guestBytes, now, singleProof, storageFormat, uploadedKeys, clearValue));
+    if (uploadContentProbed()) noteKeysUpload(previousKeys, clearedOnGpu, layers == nullptr ? guestBytes : 0);
+    if (clearedOnGpu) {
         // A fast-cleared surface is cleared on the GPU; its texel memory is neither read nor filled.
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
@@ -4824,6 +4827,7 @@ void StorageTexture::noteFormatAliasUpload(std::uint64_t bytes, bool whole) {
     firstUseUploads.fetch_add(1, std::memory_order_relaxed);
     if (afterWriteBack) firstUseAfterWriteBack.store(true, std::memory_order_relaxed);
     firstUseReason.store(static_cast<std::uint8_t>(uploadReasonIndex(uploadReason)), std::memory_order_relaxed);
+    lastUploadUnchanged = -1;
     if (!afterWriteBack && uploadContentProbed()) noteUploadContent(bytes, whole);
     auto& counts = formatAliasCounts();
     if (otherFormat) {
@@ -4849,10 +4853,12 @@ void StorageTexture::noteFormatAliasUpload(std::uint64_t bytes, bool whole) {
 
 void StorageTexture::noteUploadContent(std::uint64_t bytes, bool whole) {
     std::size_t kind = UploadContentNames.size() - 1;
+    lastUploadUnchanged = -1;
     if (whole) {
         const auto hash = guestRangeHash(descriptor.baseAddress, guestBytes);
         const bool unchanged = lastUploadHash != 0 && hash == lastUploadHash;
         lastUploadHash = hash;
+        lastUploadUnchanged = unchanged ? 1 : 0;
         if (unchanged) {
             kind = 0;
         } else {
@@ -4871,6 +4877,51 @@ void StorageTexture::noteUploadContent(std::uint64_t bytes, bool whole) {
     const auto reason = uploadReasonIndex(uploadReason);
     counts.uploads[reason][kind].fetch_add(1, std::memory_order_relaxed);
     counts.bytes[reason][kind].fetch_add(bytes, std::memory_order_relaxed);
+}
+
+constexpr std::size_t DccKeyStates = 9;
+constexpr std::array<const char*, 3> KeysUploadPaths{"GPU clear", "texel transfer", "other decode"};
+
+struct KeysUploadCounts {
+    std::array<std::array<std::array<std::atomic<std::uint64_t>, KeysUploadPaths.size()>, DccKeyStates>, DccKeyStates> uploads{};
+    std::array<std::array<std::array<std::atomic<std::uint64_t>, KeysUploadPaths.size()>, DccKeyStates>, DccKeyStates> bytes{};
+    std::array<std::array<std::array<std::atomic<std::uint64_t>, KeysUploadPaths.size()>, DccKeyStates>, DccKeyStates> unchanged{};
+};
+
+KeysUploadCounts& keysUploadCounts() {
+    static KeysUploadCounts counts;
+    return counts;
+}
+
+void StorageTexture::noteKeysUpload(DccKeys previous, bool cleared, std::uint64_t bytes) {
+    if (descriptor.dccAddress == 0 || std::strcmp(uploadReason, "keys") != 0) return;
+    const auto from = std::min<std::size_t>(static_cast<std::size_t>(previous), DccKeyStates - 1);
+    const auto to = std::min<std::size_t>(static_cast<std::size_t>(uploadedKeys), DccKeyStates - 1);
+    const auto path = cleared ? 0u : uploadedKeys == DccKeys::Uncompressed ? 1u : 2u;
+    auto& counts = keysUploadCounts();
+    counts.uploads[from][to][path].fetch_add(1, std::memory_order_relaxed);
+    counts.bytes[from][to][path].fetch_add(bytes, std::memory_order_relaxed);
+    if (lastUploadUnchanged == 1) counts.unchanged[from][to][path].fetch_add(1, std::memory_order_relaxed);
+}
+
+void StorageTexture::reportKeysUploads() {
+    const auto mib = [](std::uint64_t value) { return static_cast<double>(value) / 1048576.0; };
+    auto& counts = keysUploadCounts();
+    std::string cells;
+    for (std::size_t from = 0; from < DccKeyStates; ++from) {
+        for (std::size_t to = 0; to < DccKeyStates; ++to) {
+            for (std::size_t path = 0; path < KeysUploadPaths.size(); ++path) {
+                const auto uploads = counts.uploads[from][to][path].exchange(0, std::memory_order_relaxed);
+                const auto bytes = counts.bytes[from][to][path].exchange(0, std::memory_order_relaxed);
+                const auto unchanged = counts.unchanged[from][to][path].exchange(0, std::memory_order_relaxed);
+                if (uploads == 0) continue;
+                char cell[192];
+                std::snprintf(cell, sizeof(cell), "%s%s -> %s by %s %llu (%.1f MiB), %llu with unchanged texel bytes", cells.empty() ? "" : "; ", DccKeysName(static_cast<DccKeys>(from)), DccKeysName(static_cast<DccKeys>(to)), KeysUploadPaths[path], static_cast<unsigned long long>(uploads), mib(bytes), static_cast<unsigned long long>(unchanged));
+                cells += cell;
+            }
+        }
+    }
+    std::fprintf(stderr, "[textures] keys-reason uploads by key change and path (10 s, APS5_PROFILE_UPLOAD_CONTENT; keys of the last upload -> keys now; a GPU clear neither reads nor fills texel memory): %s\n", cells.empty() ? "none" : cells.c_str());
 }
 
 struct FirstUseCounts {
@@ -4957,6 +5008,7 @@ void StorageTexture::reportFirstUses() {
             if (!cells.empty()) byContent += (byContent.empty() ? "" : "; ") + std::string(UploadReasonNames[reason]) + ": " + cells;
         }
         std::fprintf(stderr, "[textures] uploads with no other image's write-back over the range before them, by reason and content (10 s, APS5_PROFILE_UPLOAD_CONTENT): %s\n", byContent.empty() ? "none" : byContent.c_str());
+        reportKeysUploads();
     }
     std::fprintf(stderr, "[textures] first GPU use by the last upload's reason (10 s, APS5_PROFILE_DRAW; first = created, cpu = CPU writes, flushed = after a flush of pending GPU results, store = another write over the range, alias = borrowed from an aliased image, keys = DCC keys changed, untracked = no write tracking): %s\n", byReason.empty() ? "none" : byReason.c_str());
 }
