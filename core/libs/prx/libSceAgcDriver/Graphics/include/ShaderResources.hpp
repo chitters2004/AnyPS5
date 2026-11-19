@@ -870,6 +870,7 @@ private:
         std::uint64_t begin = 0;
         std::vector<std::byte> bytes;
         bool compared = false;
+        bool reused = false;
     };
     std::vector<RangeSnapshot> proofRangeBytes;
     bool provedRanges = false;
@@ -878,7 +879,7 @@ private:
     bool stalePlanesRead();
     std::string rangeOwner(std::uint64_t address, std::uint64_t bytes) const;
     void reportVerifiedWork(const ProofWorkTrace& work) const;
-    void dumpSkippedWork(const char* where, const ProofWorkTrace& work) const;
+    void dumpSkippedWork(const char* where, const ProofWorkTrace& work, const ProofReport* verified = nullptr) const;
     std::uint8_t adoptedBy = 0;
     std::uint32_t exitsSinceFull = 0;
     std::uint32_t uncoveredSources = 0;

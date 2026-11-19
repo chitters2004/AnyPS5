@@ -5486,7 +5486,7 @@ void ShaderResources::recordProofRanges() {
                 continue;
             }
             snapshotBytes += bytes;
-            proofRangeBytes.push_back({begin, std::move(old->bytes), same && old->compared});
+            proofRangeBytes.push_back({begin, std::move(old->bytes), same && old->compared, same});
             old->bytes.clear();
             if (counted) (same ? rangeWriteCounts().snapshotsReused : rangeWriteCounts().snapshotsTaken).Add();
             continue;
@@ -5593,7 +5593,7 @@ void ShaderResources::reportVerifiedStore(std::uint64_t exitSerial, std::uint64_
     std::fprintf(stderr, "[epoch-proofs] verify: the full proof behind a reused proof broke proofs %llu times (the serial moved %llu times since the exit, %llu before the full proof started): %s\n", static_cast<unsigned long long>(trace.Count()), static_cast<unsigned long long>(endSerial - exitSerial), static_cast<unsigned long long>(startSerial - exitSerial), breaks.c_str());
 }
 
-void ShaderResources::dumpSkippedWork(const char* where, const ProofWorkTrace& work) const {
+void ShaderResources::dumpSkippedWork(const char* where, const ProofWorkTrace& work, const ProofReport* verified) const {
     static const bool dump = [] {
         const char* value = std::getenv("APS5_VERIFY_ABORT_ON_FAIL");
         return value != nullptr && value[0] != '\0' && value[0] != '0';
@@ -5612,14 +5612,23 @@ void ShaderResources::dumpSkippedWork(const char* where, const ProofWorkTrace& w
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         const bool covered = std::any_of(proofRanges.begin(), proofRanges.end(), [&](const auto& range) { return range.first <= address && address + bytes <= range.second; });
-        const bool snapshot = std::any_of(proofRangeBytes.begin(), proofRangeBytes.end(), [&](const auto& entry) { return entry.first <= address && address < entry.first + entry.second.size(); });
+        const bool snapshot = std::any_of(proofRangeBytes.begin(), proofRangeBytes.end(), [&](const auto& entry) { return entry.begin <= address && address < entry.begin + entry.bytes.size(); });
         const auto sourceGeneration = surface.source != nullptr ? surface.source->GenerationFor(address, bytes) : 0;
         const auto sourceBegin = surface.source != nullptr ? surface.source->Descriptor().baseAddress : 0;
         const auto sourceBytes = surface.source != nullptr ? surface.source->GuestBytes() : 0;
         const bool sourceCovered = surface.source != nullptr && std::any_of(proofRanges.begin(), proofRanges.end(), [&](const auto& range) { return range.first <= sourceBegin && sourceBegin + sourceBytes <= range.second; });
         std::fprintf(stderr, "[epoch-proofs]   sampled view %zu: 0x%llx+0x%llx %s (source image 0x%llx+0x%llx, %s), %s, %s; generation %llu, source generation %llu, unchanged since the source generation %d, proved generation %llu\n", index, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), surface.source != nullptr ? "storage-sourced" : "snapshot", static_cast<unsigned long long>(sourceBegin), static_cast<unsigned long long>(sourceBytes), sourceCovered ? "inside a proof range" : "not inside one proof range", covered ? "inside a proof range" : "outside every proof range", snapshot ? "byte snapshot held" : "no byte snapshot", static_cast<unsigned long long>(surface.generation), static_cast<unsigned long long>(sourceGeneration), surface.source != nullptr ? static_cast<int>(GuestMemory::UnchangedSince(address, bytes, sourceGeneration)) : -1, static_cast<unsigned long long>(provedGeneration));
     }
-    for (const auto& [begin, end] : proofRanges) std::fprintf(stderr, "[epoch-proofs]   proof range 0x%llx+0x%llx over %s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), rangeOwner(begin, end - begin).c_str());
+    static constexpr std::array<const char*, static_cast<std::size_t>(ProofPath::Count)> fullPaths{"fast", "own objects refreshed", "full walk"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(ProofFailure::Count)> failures{"none", "imports", "evicted", "pending", "changed", "keys", "other"};
+    std::fprintf(stderr, "[epoch-proofs]   this exit: ranges passed on bytes %u, on a rebase %u; the full proof took the %s path, failure %s, %llu units of work\n", rangePassedOnBytes, rangePassedOnRebase, verified != nullptr ? fullPaths[static_cast<std::size_t>(verified->path)] : "unreported", verified != nullptr ? failures[static_cast<std::size_t>(verified->failure)] : "unreported", static_cast<unsigned long long>(work.Total()));
+    for (std::size_t index = 0; index < proofRanges.size(); ++index) {
+        const auto [begin, end] = proofRanges[index];
+        const auto snapshot = std::find_if(proofRangeBytes.begin(), proofRangeBytes.end(), [&](const RangeSnapshot& entry) { return entry.begin == begin && entry.bytes.size() == end - begin; });
+        const bool held = snapshot != proofRangeBytes.end();
+        const int matches = held ? (GuestMemory::CompareMapped(begin, snapshot->bytes) == GuestMemory::Compare::Equal ? 1 : 0) : -1;
+        std::fprintf(stderr, "[epoch-proofs]   proof range 0x%llx+0x%llx over %s; %s%s%s, snapshot matches guest bytes now %d, range generation %llu, unchanged since the proved generation %d\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), rangeOwner(begin, end - begin).c_str(), held ? "byte snapshot held" : "no byte snapshot", held && snapshot->reused ? ", reused from the previous full proof" : "", held && snapshot->compared ? ", compared" : "", matches, static_cast<unsigned long long>(index < proofRangeGenerations.size() ? proofRangeGenerations[index] : 0), static_cast<int>(GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(end - begin), provedGeneration)));
+    }
     std::fflush(stderr);
     std::abort();
 }
@@ -5751,7 +5760,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                             for (const auto& entry : trace.Breaks()) std::fprintf(stderr, "[epoch-proofs]   break at %s 0x%llx+0x%llx\n", GuestMemory::ProofBreakSiteName(entry.site), static_cast<unsigned long long>(entry.address), static_cast<unsigned long long>(entry.bytes));
                             if (continues) reportRangeDisagreement(work, verified);
                         }
-                        dumpSkippedWork("range-version exit", work);
+                        dumpSkippedWork("range-version exit", work, &verified);
                         proved.epoch = 0;
                         noteEpochProof(false, false, false);
                         return ok;
@@ -5789,7 +5798,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 const bool worked = work.Total() != 0;
                 if (stored) reportVerifiedStore(stamp.proof, startSerial, endSerial, trace);
                 if (worked) reportVerifiedWork(work);
-                if (worked || stored || !ok) dumpSkippedWork("epoch exit", work);
+                if (worked || stored || !ok) dumpSkippedWork("epoch exit", work, report);
                 ++exitsSinceFull;
                 noteEpochProof(true, true, !ok, stored, !stored && endSerial != stamp.proof, worked);
                 return ok;
