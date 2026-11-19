@@ -2569,6 +2569,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         return true;
     }
     refreshProof = {};
+    const auto generationBefore = generation;
     struct Exempt {
         const StorageTexture* previous;
         ~Exempt() { Refreshing::Set(previous); }
@@ -2843,6 +2844,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         const auto comparedUnits = std::count(unitCompared.begin(), unitCompared.end(), true);
         const auto rewatchedUnits = std::count(rewatchCompared.begin(), rewatchCompared.end(), true);
         std::fprintf(stderr, "[upload] 0x%llx+0x%llx %ux%u mips %u: %s (keys %s -> %s, originalValid %d, dirty %d); route: ordered flush skipped %d, pending flushed %d, scoped %d, units %u, changed %lld, layers behind %d, outside changed %d, tracked %d, compared untracked %d, untracked units %lld, compared units %lld, rewatch-compared units %lld, stamped blocks %lld of %zu, CPU blocks %lld, generation %llu, collected %llu, unchanged since the generation %d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.mipCount, keys != uploadedKeys ? "DCC keys changed" : "guest memory changed", DccKeysName(uploadedKeys), DccKeysName(keys), originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? 1 : 0, dirty ? 1 : 0, orderedSkipped ? 1 : 0, flushed ? 1 : 0, scoped ? 1 : 0, trackedLayers, static_cast<long long>(changedCount), layerBehind.empty() ? 0 : 1, outsideChanged ? 1 : 0, tracked ? 1 : 0, compared ? 1 : 0, static_cast<long long>(untrackedUnits), static_cast<long long>(comparedUnits), static_cast<long long>(rewatchedUnits), static_cast<long long>(stampedCount), stampedBlocks.size(), static_cast<long long>(cpuCount), static_cast<unsigned long long>(generation), static_cast<unsigned long long>(current), GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation) ? 1 : 0);
+        std::fprintf(stderr, "[upload]   image %p, generation before this refresh %llu, unchanged since it %d\n", static_cast<const void*>(this), static_cast<unsigned long long>(generationBefore), generationBefore != 0 && GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generationBefore) ? 1 : 0);
     }
     // Changed layers with results pending: the CPU wrote this memory while GPU results were
     // pending, so as with an immediate write-back followed by the CPU write, its blocks win and the
