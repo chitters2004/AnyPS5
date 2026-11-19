@@ -83,6 +83,14 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_resource_cache_range_versions_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_EPOCH_PROOFS=1;APS5_VERIFY_RANGE_VERSIONS=1" SKIP_RETURN_CODE 77 TIMEOUT 30
         PASS_REGULAR_EXPRESSION "range-version exits \\(APS5_RANGE_VERSIONS on at the report\\): same epoch 4, across epochs 8[;] declined: [^\n]*[;] verified same epoch storage/tables/sampled 0/0/4, across epochs 0/0/8, disagreed 0, broken meanwhile by other threads 0\n.*resource cache range version tests passed"
         FAIL_REGULAR_EXPRESSION "AGC graphics:|range versions off for the run")
+    add_test(NAME agc_driver_storage_format_share COMMAND agc_driver_sampled_cache_budget_tests storage-format-share)
+    set_tests_properties(agc_driver_storage_format_share PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_WRITE_WATCH_IMPORTS=watch;APS5_PROFILE_DRAW=1" SKIP_RETURN_CODE 77 TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "format share on: the float view reads the integer image. 0 aliased uploads \\(0 bytes\\)\n.*format share reverse on: the integer lookup retires the float lookup.s image, the float view then reads the integer image\n.*format share incompatible on: the 8-bit view keeps its own image, the float view reads the integer image\n.*format share claimed: a float image taken by a storage lookup outlives an integer storage lookup\n.*storage format share tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:|VUID-")
+    add_test(NAME agc_driver_storage_format_share_off COMMAND agc_driver_sampled_cache_budget_tests storage-format-share)
+    set_tests_properties(agc_driver_storage_format_share_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_WRITE_WATCH_IMPORTS=watch;APS5_PROFILE_DRAW=1;APS5_NO_STORAGE_FORMAT_SHARE=1" SKIP_RETURN_CODE 77 TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "format share off: the float view reads an image of its own. [1-9][0-9]* aliased uploads[^\n]*\n.*format share reverse off: the integer lookup keeps the float lookup.s image, the float view then reads its own image\n.*format share incompatible off: the 8-bit view keeps its own image, the float view reads its own image\n.*storage format share tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:|VUID-")
     add_test(NAME agc_driver_resource_cache_range_versions_storage COMMAND agc_driver_sampled_cache_budget_tests resource-range-versions-storage)
     set_tests_properties(agc_driver_resource_cache_range_versions_storage PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_WRITE_WATCH_IMPORTS=watch" SKIP_RETURN_CODE 77 TIMEOUT 30
         PASS_REGULAR_EXPRESSION "range versions over a storage image: (skipped, its host import left the memory unwatched|a new collect epoch: the exit was taken\n.*range versions over a storage image: evicted in a new collect epoch: the exit was refused)\n.*resource cache range version storage tests passed"

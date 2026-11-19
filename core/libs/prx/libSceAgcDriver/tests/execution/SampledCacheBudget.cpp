@@ -55,6 +55,8 @@ using namespace AgcDriver::Graphics;
 
 constexpr std::uint32_t Side = 256;
 constexpr std::uint32_t Format32UInt = 20;
+constexpr std::uint32_t Format32Float = 22;
+constexpr std::uint32_t Format8UNorm = 1;
 constexpr std::uint32_t FormatBc5UNorm = 177;
 constexpr std::uint32_t TileR64KBX = 0x1b;
 constexpr std::uint32_t Type2D = 9;
@@ -647,7 +649,7 @@ void viewTests(const Context& context) {
     Require(heldView.expired() && heldStorage.expired(), "the evicted image outlived its last caller without a sampled lookup");
 }
 
-ShaderRecompiler::RecompileResult SampledProgram(std::uint64_t address) {
+ShaderRecompiler::RecompileResult SampledProgram(std::uint64_t address, std::uint32_t format = Format32UInt) {
     ShaderRecompiler::DescriptorBinding binding{};
     binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
     binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
@@ -657,7 +659,7 @@ ShaderRecompiler::RecompileResult SampledProgram(std::uint64_t address) {
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
     binding.imageWritten.assign(1, false);
     binding.imageSamplers.assign(1, 0u);
-    const auto words = Descriptor(address);
+    const auto words = Descriptor(address, Side, format);
     binding.guestDescriptor.assign(words.begin(), words.end());
     ShaderRecompiler::RecompileResult program;
     program.bindings.push_back(std::move(binding));
@@ -2569,6 +2571,282 @@ void collectRefusalTests(Context context) {
     std::puts("collect refusal counters passed");
 }
 
+std::vector<std::uint32_t> ImageTexels(const Context& context, const StorageTexture& image) {
+    Require(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device) == VK_SUCCESS, "format share: the device did not go idle");
+    Buffer readback(context, SurfaceBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    CommandBatch batch(context);
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {Side, Side, 1};
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), image.Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &region);
+    batch.SubmitAndWait();
+    readback.Invalidate();
+    std::vector<std::uint32_t> texels(SurfaceBytes / 4u);
+    std::memcpy(texels.data(), readback.Bytes().data(), SurfaceBytes);
+    return texels;
+}
+
+bool formatShareTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    if (context.hostImportAlignment == 0) {
+        Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "the format share fixture requires host imports");
+        std::puts("format share: skipped, host imports are unavailable");
+        return false;
+    }
+    WatchedSurface surface(context, SurfaceBytes);
+    ClearCachedTextures(context.device);
+    const auto address = surface.Address();
+    if (HostImportFor(context, address, SurfaceBytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        std::puts("format share: skipped, the surface's host import is refused or unwatched");
+        return false;
+    }
+    const bool share = !RuntimeSwitches::Set(RuntimeSwitch::NoStorageFormatShare);
+    auto* words = reinterpret_cast<std::uint32_t*>(address);
+    constexpr std::size_t Unit = 65536 / 4;
+    constexpr std::uint32_t Before = 0x10101010u;
+    constexpr std::uint32_t After = 0x20202020u;
+    const auto write = [&](std::size_t first, std::size_t count, std::uint32_t value) {
+        Require(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device) == VK_SUCCESS, "format share: the device did not go idle before a host write");
+        std::fill_n(words + first, count, value);
+        AgcDriver::GuestMemory::CollectWritesUncached(address, SurfaceBytes);
+    };
+    write(0, SurfaceBytes / 4u, Before);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    auto owner = CachedStorageSurface(context, Resource(address));
+    Require(owner != nullptr, "format share: no storage image of the integer surface");
+    owner->MarkDirty();
+    Require(StorageTexture::FindPending(address, SurfaceBytes) == owner, "format share: the integer image holds no pending results to write back");
+    StorageTexture::FlushPending(address, SurfaceBytes, nullptr, "format share");
+    Require(owner->Cached(), "format share: the write-back released the integer image");
+    const auto sharedBefore = StorageFormatShareTotals().shared;
+    const auto aliasBefore = StorageTexture::FormatAliasTotals();
+    write(Unit, Unit, After);
+    const auto program = SampledProgram(address, Format32Float);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto sampled = std::make_shared<ShaderResources>(context, shader);
+    struct Release {
+        std::shared_ptr<ShaderResources>& sampled;
+        std::shared_ptr<StorageTexture>& owner;
+        VkDevice device;
+        ~Release() {
+            sampled.reset();
+            owner.reset();
+            ClearCachedTextures(device);
+        }
+    } release{sampled, owner, context.device};
+    Require(sampled->SampledTextures().size() == 1, "format share: the float lookup made no texture");
+    const auto source = sampled->SampledTextures().front()->SharedStorageSource();
+    Require(source != nullptr, "format share: the float view is a snapshot, not a view of a storage image");
+    if (share) Require(source == owner && StorageFormatShareTotals().shared > sharedBefore, "format share: the float view does not view the integer surface's storage image");
+    else Require(source != owner, "format share: with APS5_NO_STORAGE_FORMAT_SHARE the float view shares the integer image");
+    ShaderResources::ProofReport report{};
+    const auto revalidate = [&] {
+        if (!sampled->Revalidate(shader, &report)) sampled = std::make_shared<ShaderResources>(context, shader);
+        Require(sampled->SampledTextures().size() == 1, "format share: the revalidated lookup made no texture");
+    };
+    const auto check = [&](std::size_t changed, const char* what) {
+        const auto viewed = sampled->SampledTextures().front()->SharedStorageSource();
+        Require(viewed != nullptr && (!share || viewed == owner), std::string("format share: ") + what + ": the view no longer reads the single image of the surface");
+        const auto texels = ImageTexels(context, *viewed);
+        const auto guest = static_cast<std::size_t>(std::count(words, words + SurfaceBytes / 4u, After));
+        Require(guest == changed, std::string("format share: ") + what + ": guest memory holds " + std::to_string(guest) + " new texels, the fixture wrote " + std::to_string(changed));
+        const auto updated = static_cast<std::size_t>(std::count(texels.begin(), texels.end(), After));
+        const auto kept = static_cast<std::size_t>(std::count(texels.begin(), texels.end(), Before));
+        Require(updated == changed && kept == texels.size() - changed, std::string("format share: ") + what + ": the viewed image holds " + std::to_string(updated) + " new and " + std::to_string(kept) + " old texels, guest memory " + std::to_string(changed) + " new of " + std::to_string(texels.size()));
+    };
+    check(Unit, "a host write over one unit after the integer image's write-back");
+    for (int round = 0; round < 4; ++round) revalidate();
+    write(2 * Unit, Unit, After);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    revalidate();
+    check(2 * Unit, "a second host write, then a revalidation in a new collect epoch");
+    owner->MarkDirty();
+    Require(StorageTexture::FindPending(address, SurfaceBytes) == owner, "format share: the integer image holds no pending results to write back");
+    StorageTexture::FlushPending(address, SurfaceBytes, nullptr, "format share");
+    Require(owner->Cached(), "format share: the write-back released the integer image");
+    write(3 * Unit, Unit, After);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    revalidate();
+    check(3 * Unit, "the integer image written back again, a third host write, a revalidation");
+    const auto alias = StorageTexture::FormatAliasTotals();
+    const auto aliased = alias.uploads - aliasBefore.uploads;
+    std::printf("format share %s: the float view reads %s; %llu aliased uploads (%llu bytes)\n", share ? "on" : "off", source == owner ? "the integer image" : "an image of its own", static_cast<unsigned long long>(aliased), static_cast<unsigned long long>(alias.uploadBytes - aliasBefore.uploadBytes));
+    if (share) Require(aliased == 0, "format share: an aliased image of the surface still uploaded");
+    return true;
+}
+
+bool formatShareReverseTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context, SurfaceBytes);
+    ClearCachedTextures(context.device);
+    const auto address = surface.Address();
+    if (HostImportFor(context, address, SurfaceBytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        std::puts("format share reverse: skipped, the surface's host import is refused or unwatched");
+        return false;
+    }
+    const bool share = !RuntimeSwitches::Set(RuntimeSwitch::NoStorageFormatShare);
+    auto* words = reinterpret_cast<std::uint32_t*>(address);
+    constexpr std::size_t Unit = 65536 / 4;
+    constexpr std::uint32_t Before = 0x30303030u;
+    constexpr std::uint32_t After = 0x40404040u;
+    const auto write = [&](std::size_t first, std::size_t count, std::uint32_t value) {
+        Require(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device) == VK_SUCCESS, "format share reverse: the device did not go idle before a host write");
+        std::fill_n(words + first, count, value);
+        AgcDriver::GuestMemory::CollectWritesUncached(address, SurfaceBytes);
+    };
+    write(0, SurfaceBytes / 4u, Before);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto program = SampledProgram(address, Format32Float);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto sampled = std::make_shared<ShaderResources>(context, shader);
+    std::shared_ptr<StorageTexture> owner;
+    struct Release {
+        std::shared_ptr<ShaderResources>& sampled;
+        std::shared_ptr<StorageTexture>& owner;
+        VkDevice device;
+        ~Release() {
+            sampled.reset();
+            owner.reset();
+            ClearCachedTextures(device);
+        }
+    } release{sampled, owner, context.device};
+    Require(sampled->SampledTextures().size() == 1, "format share reverse: the float lookup made no texture");
+    const auto first = sampled->SampledTextures().front()->SharedStorageSource();
+    Require(first != nullptr, "format share reverse: the float view is a snapshot, not a view of a storage image");
+    const auto before = StorageFormatShareTotals();
+    owner = CachedStorageSurface(context, Resource(address));
+    Require(owner != nullptr, "format share reverse: no storage image of the integer surface");
+    const auto after = StorageFormatShareTotals();
+    if (share) Require(owner != first && !first->Cached() && after.retired == before.retired + 1, "format share reverse: the integer lookup did not retire the float lookup's image");
+    else Require(owner != first && first->Cached() && after.retired == before.retired, "format share reverse: with APS5_NO_STORAGE_FORMAT_SHARE the integer lookup retired the float lookup's image");
+    owner->MarkDirty();
+    Require(StorageTexture::FindPending(address, SurfaceBytes) == owner, "format share reverse: the integer image holds no pending results to write back");
+    StorageTexture::FlushPending(address, SurfaceBytes, nullptr, "format share reverse");
+    Require(owner->Cached(), "format share reverse: the write-back released the integer image");
+    write(Unit, Unit, After);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    ShaderResources::ProofReport report{};
+    if (!sampled->Revalidate(shader, &report)) sampled = std::make_shared<ShaderResources>(context, shader);
+    Require(sampled->SampledTextures().size() == 1, "format share reverse: the revalidated lookup made no texture");
+    const auto viewed = sampled->SampledTextures().front()->SharedStorageSource();
+    Require(viewed != nullptr, "format share reverse: the revalidated float view is a snapshot");
+    if (share) Require(viewed == owner && StorageFormatShareTotals().shared > after.shared, "format share reverse: the float view does not move to the integer image after its own was retired");
+    else Require(viewed == first, "format share reverse: with APS5_NO_STORAGE_FORMAT_SHARE the float view left its own image");
+    const auto texels = ImageTexels(context, *viewed);
+    const auto updated = static_cast<std::size_t>(std::count(texels.begin(), texels.end(), After));
+    const auto kept = static_cast<std::size_t>(std::count(texels.begin(), texels.end(), Before));
+    Require(updated == Unit && kept == texels.size() - Unit, "format share reverse: the viewed image holds " + std::to_string(updated) + " new and " + std::to_string(kept) + " old texels, guest memory " + std::to_string(Unit) + " new of " + std::to_string(texels.size()));
+    std::printf("format share reverse %s: the integer lookup %s the float lookup's image, the float view then reads %s\n", share ? "on" : "off", share ? "retires" : "keeps", viewed == owner ? "the integer image" : "its own image");
+    return true;
+}
+
+bool formatShareIncompatibleTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context, SurfaceBytes);
+    ClearCachedTextures(context.device);
+    const auto address = surface.Address();
+    if (HostImportFor(context, address, SurfaceBytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        std::puts("format share incompatible: skipped, the surface's host import is refused or unwatched");
+        return false;
+    }
+    std::fill_n(reinterpret_cast<std::uint32_t*>(address), SurfaceBytes / 4u, 0x50505050u);
+    AgcDriver::GuestMemory::CollectWritesUncached(address, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto narrowProgram = SampledProgram(address, Format8UNorm);
+    const CompiledShader narrowShader{ShaderRecompiler::ShaderStage::Compute, &narrowProgram, 0};
+    const auto floatProgram = SampledProgram(address, Format32Float);
+    const CompiledShader floatShader{ShaderRecompiler::ShaderStage::Compute, &floatProgram, 0};
+    auto narrow = std::make_shared<ShaderResources>(context, narrowShader);
+    std::shared_ptr<ShaderResources> wide;
+    std::shared_ptr<StorageTexture> owner;
+    struct Release {
+        std::shared_ptr<ShaderResources>& narrow;
+        std::shared_ptr<ShaderResources>& wide;
+        std::shared_ptr<StorageTexture>& owner;
+        VkDevice device;
+        ~Release() {
+            narrow.reset();
+            wide.reset();
+            owner.reset();
+            ClearCachedTextures(device);
+        }
+    } release{narrow, wide, owner, context.device};
+    Require(narrow->SampledTextures().size() == 1, "format share incompatible: the 8-bit lookup made no texture");
+    const auto narrowSource = narrow->SampledTextures().front()->SharedStorageSource();
+    const auto before = StorageFormatShareTotals();
+    owner = CachedStorageSurface(context, Resource(address));
+    Require(owner != nullptr && owner != narrowSource, "format share incompatible: the 32-bit storage lookup took the 8-bit image");
+    Require(StorageFormatShareTotals().retired == before.retired && (narrowSource == nullptr || narrowSource->Cached()), "format share incompatible: the 32-bit storage lookup retired an 8-bit image it cannot view");
+    wide = std::make_shared<ShaderResources>(context, floatShader);
+    Require(wide->SampledTextures().size() == 1, "format share incompatible: the float lookup made no texture");
+    const auto wideSource = wide->SampledTextures().front()->SharedStorageSource();
+    const bool share = !RuntimeSwitches::Set(RuntimeSwitch::NoStorageFormatShare);
+    if (share) Require(wideSource == owner, "format share incompatible: an 8-bit image over the range kept the float view off the 32-bit storage image");
+    Require(!narrow->Revalidate(narrowShader) || narrow->SampledTextures().front()->SharedStorageSource() != owner, "format share incompatible: the 8-bit view reads the 32-bit storage image");
+    const auto retired = StorageFormatShareTotals().retired;
+    const auto floatStorage = CachedStorageSurface(context, Resource(address, Side, Format32Float));
+    Require(floatStorage != nullptr && floatStorage != owner && owner->Cached() && StorageFormatShareTotals().retired == retired, "format share incompatible: a storage lookup in the float format retired the integer storage image");
+    std::printf("format share incompatible %s: the 8-bit view keeps its own image, the float view reads %s\n", share ? "on" : "off", wideSource == owner ? "the integer image" : "its own image");
+    return true;
+}
+
+bool formatShareClaimedTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context, SurfaceBytes);
+    ClearCachedTextures(context.device);
+    const auto address = surface.Address();
+    if (HostImportFor(context, address, SurfaceBytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        std::puts("format share claimed: skipped, the surface's host import is refused or unwatched");
+        return false;
+    }
+    std::fill_n(reinterpret_cast<std::uint32_t*>(address), SurfaceBytes / 4u, 0x60606060u);
+    AgcDriver::GuestMemory::CollectWritesUncached(address, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto program = SampledProgram(address, Format32Float);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto sampled = std::make_shared<ShaderResources>(context, shader);
+    std::shared_ptr<StorageTexture> floatStorage;
+    std::shared_ptr<StorageTexture> owner;
+    struct Release {
+        std::shared_ptr<ShaderResources>& sampled;
+        std::shared_ptr<StorageTexture>& floatStorage;
+        std::shared_ptr<StorageTexture>& owner;
+        VkDevice device;
+        ~Release() {
+            sampled.reset();
+            floatStorage.reset();
+            owner.reset();
+            ClearCachedTextures(device);
+        }
+    } release{sampled, floatStorage, owner, context.device};
+    Require(sampled->SampledTextures().size() == 1, "format share claimed: the float lookup made no texture");
+    const auto made = sampled->SampledTextures().front()->SharedStorageSource();
+    Require(made != nullptr, "format share claimed: the float view is a snapshot, not a view of a storage image");
+    floatStorage = CachedStorageSurface(context, Resource(address, Side, Format32Float));
+    Require(floatStorage == made, "format share claimed: a storage lookup in the float format did not take the float lookup's image");
+    const auto retired = StorageFormatShareTotals().retired;
+    owner = CachedStorageSurface(context, Resource(address));
+    Require(owner != nullptr && owner != made && made->Cached() && StorageFormatShareTotals().retired == retired, "format share claimed: the integer storage lookup retired an image a float storage lookup had claimed");
+    std::puts("format share claimed: a float image taken by a storage lookup outlives an integer storage lookup");
+    return true;
+}
+
 bool pendingFailCountTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -2784,6 +3062,12 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (!rangeVersionPendingTests(context)) return VulkanTestSkipped;
             std::puts("resource cache range version pending tests passed");
+            return 0;
+        }
+        if (mode == "storage-format-share") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            if (!formatShareTests(context) || !formatShareReverseTests(context) || !formatShareIncompatibleTests(context) || !formatShareClaimedTests(context)) return VulkanTestSkipped;
+            std::puts("storage format share tests passed");
             return 0;
         }
         if (mode == "resource-range-versions-storage") {

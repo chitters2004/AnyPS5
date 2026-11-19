@@ -276,8 +276,8 @@ void noteUncached(const std::shared_ptr<StorageTexture>& image) {
 
 std::atomic<std::uint64_t> textureReleases{0};
 
-enum class ReleaseSite : std::uint8_t { None, TextureErased, TextureRefused, StorageMipAlias, StorageMetadataMoved, StorageBudget, StorageReclaim, Count };
-constexpr std::array<const char*, static_cast<std::size_t>(ReleaseSite::Count)> ReleaseSiteNames{"none", "texture erased", "texture refused", "storage mip alias", "storage metadata moved", "storage budget", "storage reclaim"};
+enum class ReleaseSite : std::uint8_t { None, TextureErased, TextureRefused, StorageMipAlias, StorageMetadataMoved, StorageBudget, StorageReclaim, StorageFormatTwin, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ReleaseSite::Count)> ReleaseSiteNames{"none", "texture erased", "texture refused", "storage mip alias", "storage metadata moved", "storage budget", "storage reclaim", "storage format twin"};
 std::atomic<std::uint8_t> lastRelease{0};
 
 void bumpTextureReleases(ReleaseSite site) {
@@ -536,6 +536,8 @@ struct TextureCounters {
     std::atomic<std::uint64_t> fastMisses{0};
     std::atomic<std::uint64_t> storageHits{0};
     std::atomic<std::uint64_t> storageCreated{0};
+    std::atomic<std::uint64_t> storageFormatShared{0};
+    std::atomic<std::uint64_t> storageFormatRetired{0};
     // Storage images a Revalidate refreshed directly instead of through the lookups (T1, see
     // ShaderResources::refreshOwnObjects).
     std::atomic<std::uint64_t> ownRefreshes{0};
@@ -575,7 +577,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu cleared on the GPU, %llu uploaded on the GPU from host imports, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; dynamic-resolution variants: %llu surfaces, %llu entries substituted, %llu entries rejected; %llu one-layer 2D array entries bound to the 2D texture of their surface; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.cleared), count(counters.imported), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.variantSurfaces), count(counters.variantSubstituted), count(counters.variantRejected), count(counters.arrayViewsShared), count(counters.untrackedKept), count(counters.untrackedCompared));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu cleared on the GPU, %llu uploaded on the GPU from host imports, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes, %llu served to a sampled lookup in another format, %llu sampled-made format twins retired (APS5_NO_STORAGE_FORMAT_SHARE); image tables %llu reused, %llu resolved; dynamic-resolution variants: %llu surfaces, %llu entries substituted, %llu entries rejected; %llu one-layer 2D array entries bound to the 2D texture of their surface; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.cleared), count(counters.imported), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.storageFormatShared), count(counters.storageFormatRetired), count(counters.tablesReused), count(counters.tablesResolved), count(counters.variantSurfaces), count(counters.variantSubstituted), count(counters.variantRejected), count(counters.arrayViewsShared), count(counters.untrackedKept), count(counters.untrackedCompared));
     StorageTexture::ReportFormatAliases();
 }
 
@@ -642,7 +644,7 @@ void refreshForView(StorageTexture& source, const GuestTextureResource& resource
     else source.Refresh();
 }
 
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0, bool written = false, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers = std::nullopt, std::source_location where = std::source_location::current());
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0, bool written = false, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers = std::nullopt, bool sampledLookup = false, std::source_location where = std::source_location::current());
 
 std::uint64_t heldBytes(const StorageTexture& image) {
     return image.BudgetBytes();
@@ -730,7 +732,7 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
         }
     }
     try {
-        return cachedStorageTexture(context, {}, resource, 0, guestBytes, false, std::nullopt, where);
+        return cachedStorageTexture(context, {}, resource, 0, guestBytes, false, std::nullopt, true, where);
     } catch (const std::exception& error) {
         counters.storageFallbacks.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard lock(failures.mutex);
@@ -1410,7 +1412,13 @@ struct CachedStorageTexture {
     std::uint32_t mip;
     std::shared_ptr<StorageTexture> texture;
     std::uint64_t accounted = 0;
+    bool sampledMade = false;
 };
+
+StorageKey LayoutKey(StorageKey key) {
+    key.words[7] = 0;
+    return key;
+}
 
 // As TextureCache: use order with a hash index by key, plus one by image for StorageImageCached.
 struct StorageTextureCache {
@@ -1418,8 +1426,17 @@ struct StorageTextureCache {
     std::list<CachedStorageTexture> entries;
     std::unordered_map<StorageKey, std::list<CachedStorageTexture>::iterator, StorageKeyHash> index;
     std::unordered_map<const StorageTexture*, std::list<CachedStorageTexture>::iterator> byImage;
+    std::unordered_map<StorageKey, std::list<CachedStorageTexture>::iterator, StorageKeyHash> byLayout;
     std::atomic<std::uint64_t> bytes{0};
 };
+
+void unindexLayout(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
+    if (const auto found = cache.byLayout.find(LayoutKey(it->key)); found != cache.byLayout.end() && found->second == it) cache.byLayout.erase(found);
+}
+
+bool StorageFormatShare() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoStorageFormatShare);
+}
 
 StorageTextureCache& StorageTextures() {
     static StorageTextureCache cache;
@@ -1465,6 +1482,7 @@ std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::li
     cache.bytes -= it->accounted;
     cache.index.erase(it->key);
     cache.byImage.erase(it->texture.get());
+    unindexLayout(cache, it);
     cache.entries.erase(it);
     return texture;
 }
@@ -1544,7 +1562,7 @@ static void claimStoredMultisampleMemory(const Context& context, const GuestText
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, std::uint32_t mip, std::uint64_t guestBytes, bool written, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers, std::source_location where) {
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, std::uint32_t mip, std::uint64_t guestBytes, bool written, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers, bool sampledLookup, std::source_location where) {
     const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (viewed.baseAddress != requested.baseAddress) guestBytes = 0;
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
@@ -1591,7 +1609,18 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             evicted.push_back(detached);
             it = cache.entries.end();
         }
+        const auto twin = it == cache.entries.end() && detached == nullptr && StorageFormatShare() ? cache.byLayout.find(LayoutKey(key)) : cache.byLayout.end();
+        if (twin != cache.byLayout.end() && twin->second->key != key && !MetadataMoved(*twin->second->texture, resource) && Texture::CanCopyFrom(*twin->second->texture, resource)) {
+            if (sampledLookup) {
+                it = twin->second;
+                counters.storageFormatShared.fetch_add(1, std::memory_order_relaxed);
+            } else if (!sampledLookup && twin->second->sampledMade) {
+                evicted.push_back(evictStorage(cache, twin->second, ReleaseSite::StorageFormatTwin, true, "format twin"));
+                counters.storageFormatRetired.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (it != cache.entries.end()) {
+            if (!sampledLookup) it->sampledMade = false;
             if (layers) it->texture->RefreshLayers(layers->first, layers->second);
             else it->texture->Refresh();
             cache.entries.splice(cache.entries.begin(), cache.entries, it);
@@ -1610,6 +1639,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             }
             created->AdoptHandOver(std::move(handOver));
             CachedStorageTexture entry{key, mip, std::move(created)};
+            entry.sampledMade = sampledLookup;
             static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
             if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
             entry.accounted = heldBytes(*entry.texture);
@@ -1624,6 +1654,8 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             cache.entries.push_front(std::move(entry));
             cache.index[key] = cache.entries.begin();
             cache.byImage[texture.get()] = cache.entries.begin();
+            if (sampledLookup) cache.byLayout.try_emplace(LayoutKey(key), cache.entries.begin());
+            else cache.byLayout.insert_or_assign(LayoutKey(key), cache.entries.begin());
             texture->SetCached(true);
             counters.storageCreated.fetch_add(1, std::memory_order_relaxed);
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageMade, start);
@@ -1791,6 +1823,7 @@ void ClearCachedTextures(VkDevice device) {
             storage.bytes -= it->accounted;
             storage.index.erase(it->key);
             storage.byImage.erase(it->texture.get());
+            unindexLayout(storage, it);
             it = storage.entries.erase(it);
         }
     }
@@ -1916,6 +1949,15 @@ bool StorageImagesCached(const Context& context, std::span<const StorageTexture*
     return true;
 }
 
+}
+
+StorageFormatShareCounts StorageFormatShareTotals() {
+    const auto& counters = TextureCounts();
+    return {counters.storageFormatShared.load(std::memory_order_relaxed), counters.storageFormatRetired.load(std::memory_order_relaxed)};
+}
+
+std::shared_ptr<StorageTexture> SampledStorageSurface(const Context& context, const GuestTextureResource& resource) {
+    return cachedStorageTexture(context, {}, resource, 0, 0, false, std::nullopt, true);
 }
 
 std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource) {

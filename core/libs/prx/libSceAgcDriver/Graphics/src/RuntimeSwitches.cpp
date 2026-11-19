@@ -39,6 +39,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_HOLD_SITE_BREAKS",
     "APS5_NO_SCOPED_DRIVER_STORES",
     "APS5_RANGE_VERSIONS",
+    "APS5_NO_STORAGE_FORMAT_SHARE",
 };
 
 struct SwitchValues {
@@ -67,6 +68,7 @@ struct SwitchValues {
             std::getenv("APS5_NO_HOLD_SITE_BREAKS") != nullptr,
             std::getenv("APS5_NO_SCOPED_DRIVER_STORES") != nullptr,
             std::getenv("APS5_RANGE_VERSIONS") != nullptr,
+            std::getenv("APS5_NO_STORAGE_FORMAT_SHARE") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

@@ -33,6 +33,7 @@ enum class RuntimeSwitch : std::size_t {
     NoHoldSiteBreaks,
     NoScopedDriverStores,
     RangeVersions,
+    NoStorageFormatShare,
     Count,
 };
 
