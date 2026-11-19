@@ -4170,6 +4170,15 @@ bool ShaderResources::EpochProofs() {
 
 namespace {
 thread_local ProofWorkTrace* proofWorkTrace = nullptr;
+thread_local const void* proofWorkObject = nullptr;
+}
+
+ProofWorkTrace::ObjectScope::ObjectScope(const void* object) : previous(proofWorkObject) {
+    proofWorkObject = object;
+}
+
+ProofWorkTrace::ObjectScope::~ObjectScope() {
+    proofWorkObject = previous;
 }
 
 ProofWorkTrace::ProofWorkTrace() : previous(proofWorkTrace) {
@@ -4185,7 +4194,9 @@ bool ProofWorkTrace::Active() {
 }
 
 void ProofWorkTrace::Note(ProofWork work) {
-    if (proofWorkTrace != nullptr) ++proofWorkTrace->counts[static_cast<std::size_t>(work)];
+    if (proofWorkTrace == nullptr) return;
+    ++proofWorkTrace->counts[static_cast<std::size_t>(work)];
+    if (proofWorkObject != nullptr) proofWorkTrace->objectWork.emplace_back(proofWorkObject, work);
 }
 
 std::uint64_t ProofWorkTrace::Total() const {
@@ -5525,6 +5536,30 @@ void ShaderResources::reportVerifiedStore(std::uint64_t exitSerial, std::uint64_
     std::fprintf(stderr, "[epoch-proofs] verify: the full proof behind a reused proof broke proofs %llu times (the serial moved %llu times since the exit, %llu before the full proof started): %s\n", static_cast<unsigned long long>(trace.Count()), static_cast<unsigned long long>(endSerial - exitSerial), static_cast<unsigned long long>(startSerial - exitSerial), breaks.c_str());
 }
 
+std::vector<const void*> ShaderResources::referencedWorkObjects() const {
+    std::vector<const void*> objects;
+    objects.reserve(storageTextures.size() + textures.size());
+    for (const auto& image : storageTextures) {
+        if (image != nullptr) objects.push_back(image.get());
+    }
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->StorageSource() != nullptr) objects.push_back(texture->StorageSource());
+    }
+    return objects;
+}
+
+void ShaderResources::keepReferencedWork(ProofWorkTrace& work, std::vector<const void*> referenced) const {
+    const auto after = referencedWorkObjects();
+    referenced.insert(referenced.end(), after.begin(), after.end());
+    work.KeepReferenced([&](const void* object) { return std::find(referenced.begin(), referenced.end(), object) != referenced.end(); });
+    const auto uploads = work.Unreferenced(ProofWork::StorageUpload);
+    const auto syncs = work.Unreferenced(ProofWork::CpuWriteSync);
+    if (uploads + syncs == 0) return;
+    static std::atomic<std::uint32_t> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) >= 8u) return;
+    std::fprintf(stderr, "[epoch-proofs] verify: the full proof's work on images no binding of set %p reads was not counted as skipped: %llu storage image uploads, %llu CPU write syncs\n", static_cast<const void*>(this), static_cast<unsigned long long>(uploads), static_cast<unsigned long long>(syncs));
+}
+
 void ShaderResources::reportVerifiedWork(const ProofWorkTrace& work) const {
     auto& verification = exitVerification();
     if (verification.workReported.fetch_add(1, std::memory_order_relaxed) >= 64u) return;
@@ -5633,7 +5668,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     GuestMemory::ProofBreakTrace trace;
                     ProofWorkTrace work;
                     ProofReport verified{};
+                    auto referenced = referencedWorkObjects();
+                    rangeVersionPoint(RangeVersionPoint::InsideVerifiedProof);
                     const bool ok = revalidateFull(shaders, report != nullptr ? report : &verified);
+                    keepReferencedWork(work, std::move(referenced));
                     if (report != nullptr) verified = *report;
                     const bool stored = trace.Count() != 0;
                     const bool worked = work.Total() != 0;
@@ -5676,7 +5714,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 const auto startSerial = GuestMemory::ProofSerial();
                 GuestMemory::ProofBreakTrace trace;
                 ProofWorkTrace work;
+                auto referenced = referencedWorkObjects();
+                rangeVersionPoint(RangeVersionPoint::InsideVerifiedProof);
                 const bool ok = revalidateFull(shaders, report);
+                keepReferencedWork(work, std::move(referenced));
                 const auto endSerial = GuestMemory::ProofSerial();
                 const bool stored = trace.Count() != 0;
                 const bool worked = work.Total() != 0;

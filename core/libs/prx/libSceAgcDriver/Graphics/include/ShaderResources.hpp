@@ -429,7 +429,7 @@ public:
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static bool EpochProofs();
-    enum class RangeVersionPoint : std::uint8_t { AfterFullProof, AfterRangeValidation };
+    enum class RangeVersionPoint : std::uint8_t { AfterFullProof, AfterRangeValidation, InsideVerifiedProof };
     static void SetRangeVersionHookForTest(void (*hook)(RangeVersionPoint point));
     static void SetRangeWriteSnapshotBytesForTest(std::uint64_t bytes);
     static void SetRangeSnapshotsEagerForTest(bool eager);
@@ -871,6 +871,8 @@ private:
     bool stalePlanesRead();
     std::string rangeOwner(std::uint64_t address, std::uint64_t bytes) const;
     void reportVerifiedWork(const ProofWorkTrace& work) const;
+    std::vector<const void*> referencedWorkObjects() const;
+    void keepReferencedWork(ProofWorkTrace& work, std::vector<const void*> referenced) const;
     void reportRangeDisagreement(const ProofWorkTrace& work, const ProofReport& verified) const;
     void reportVerifiedStore(std::uint64_t exitSerial, std::uint64_t startSerial, std::uint64_t endSerial, const GuestMemory::ProofBreakTrace& trace) const;
     bool refreshPerUseCopies();

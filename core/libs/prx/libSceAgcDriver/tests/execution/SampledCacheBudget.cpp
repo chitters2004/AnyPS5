@@ -1029,6 +1029,112 @@ void epochVerifyWorkTests(Context context) {
     std::puts("epoch exit over a storage image stored to with its proof break held: taken");
 }
 
+void epochVerifyBoundWorkTests(Context context, bool sampled) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(SurfaceBytes, 65536));
+    Require(memory != nullptr, "the bound-work fixture needs the guest write watch");
+    std::memset(memory, 0x5a, SurfaceBytes);
+    GuestAllocations::Mutation().Add(memory, SurfaceBytes, true, true, false);
+    struct Cleanup {
+        std::uint8_t* memory;
+        ~Cleanup() {
+            GuestAllocations::Mutation().Remove(memory);
+            ReleaseWatched(memory, SurfaceBytes);
+        }
+    } cleanup{memory};
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    ClearCachedTextures(context.device);
+    Require(ShaderResources::EpochProofs(), "the bound-work fixture needs epoch proofs on");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto words = Descriptor(address);
+    const auto bound = CachedStorageSurface(context, DecodeTextureResource(words));
+    Require(bound != nullptr, "the surface has no storage image");
+    ShaderRecompiler::RecompileResult program;
+    if (sampled) {
+        program = SampledProgram(address);
+    } else {
+        ShaderRecompiler::DescriptorBinding binding{};
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+        binding.descriptorSet = 0;
+        binding.binding = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + PlaceholderDimensionsPerClass + 2u;
+        binding.count = 1;
+        binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+        binding.imageWritten.assign(1, false);
+        binding.imageSamplers.assign(1, 0u);
+        binding.guestDescriptor.assign(words.begin(), words.end());
+        program.bindings.push_back(std::move(binding));
+    }
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader);
+    static std::shared_ptr<StorageTexture> hooked;
+    static bool hookFired = false;
+    std::shared_ptr<StorageTexture> other;
+    struct Release {
+        std::shared_ptr<ShaderResources>& resources;
+        std::shared_ptr<StorageTexture>& other;
+        VkDevice device;
+        ~Release() {
+            ShaderResources::SetRangeVersionHookForTest(nullptr);
+            hooked.reset();
+            other.reset();
+            resources.reset();
+            ClearCachedTextures(device);
+        }
+    } release{resources, other, context.device};
+    Require(resources->Reusable(), "the template is not reusable");
+    if (sampled) Require(resources->SampledTextures().size() == 1 && resources->SampledTextures().front()->StorageSource() == bound.get(), "the template's sampled texture is not a view of the bound storage image");
+    else Require(resources->StorageImages().size() == 1 && resources->StorageImages().front().first == bound->Image(), "the template's storage image is not the cached image of its surface");
+    other = CachedStorageSurface(context, DecodeTextureResource(Descriptor(address, Side / 2u)));
+    Require(other != nullptr && other != bound, "the fixture needs a second, unbound image over the bound image's memory");
+    static_cast<void>(other->Refresh());
+    ShaderResources::ProofReport report{};
+    Require(resources->Revalidate(shader, &report), "the storage image template did not prove current through the full proof");
+    const auto settle = [&](const char* what) {
+        bool settled = false;
+        for (int round = 0; round < 4 && !settled; ++round) {
+            const auto proofs = EpochProofCounts().resourceProofs.Sum();
+            Require(resources->Revalidate(shader, &report), "an unchanged storage image template stopped proving current");
+            settled = EpochProofCounts().resourceProofs.Sum() == proofs;
+        }
+        Require(settled, what);
+    };
+    settle("an unchanged storage image template in the same collect epoch never took the epoch exit");
+    const auto heldStore = [&](std::byte value) {
+        const std::vector<std::byte> fill(SurfaceBytes, value);
+        struct Held {
+            Held() { AgcDriver::GuestMemory::HoldProofBreaksForTest(true); }
+            ~Held() { AgcDriver::GuestMemory::HoldProofBreaksForTest(false); }
+        } held;
+        AgcDriver::GuestMemory::Write(address, fill, 4);
+    };
+    const auto exitWithHook = [&](const std::shared_ptr<StorageTexture>& image) {
+        hooked = image;
+        hookFired = false;
+        ShaderResources::SetRangeVersionHookForTest([](ShaderResources::RangeVersionPoint at) {
+            if (at != ShaderResources::RangeVersionPoint::InsideVerifiedProof || hookFired) return;
+            hookFired = true;
+            if (hooked != nullptr) static_cast<void>(hooked->Refresh());
+        });
+        const auto proofs = EpochProofCounts().resourceProofs.Sum();
+        const bool ok = resources->Revalidate(shader, &report);
+        ShaderResources::SetRangeVersionHookForTest(nullptr);
+        hooked.reset();
+        Require(ok && hookFired && EpochProofCounts().resourceProofs.Sum() == proofs, "the template did not take the verified epoch exit");
+    };
+    heldStore(std::byte{0x21});
+    Require(!bound->Refresh() && bound->Refresh(), "the bound image did not catch up with the held store");
+    exitWithHook(other);
+    std::printf("bound work (%s): the unbound image caught up inside the verified full proof\n", sampled ? "sampled view" : "storage image");
+    settle("the template did not take the exit again after the unbound image's catch-up");
+    heldStore(std::byte{0x34});
+    exitWithHook(nullptr);
+    std::printf("bound work (%s): the bound image caught up inside the verified full proof\n", sampled ? "sampled view" : "storage image");
+}
+
 void epochScopeLevelsTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -2672,6 +2778,13 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             epochVerifyWorkTests(context);
             std::puts("resource cache epoch verify work tests passed");
+            return 0;
+        }
+        if (mode == "resource-epoch-verify-bound-work") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            epochVerifyBoundWorkTests(context, false);
+            epochVerifyBoundWorkTests(context, true);
+            std::puts("resource cache epoch verify bound work tests passed");
             return 0;
         }
         if (mode == "resource-epoch-scope-levels") {
