@@ -260,6 +260,33 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool counted) {
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
 }
 
+void ContentRun(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::uint8_t* copy, std::uint8_t* unlike, std::uint8_t* unwritten) {
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const auto surface = AddressOf(texels);
+    const auto elsewhere = AddressOf(copy);
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
+    AgcDriver::GuestMemory::CollectWritesUncached(surface, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Store(device, texels, 0x44444444u);
+    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
+    device.WaitIdle();
+    std::copy_n(texels, SurfaceBytes, copy);
+    AgcDriver::GuestMemory::CollectWritesUncached(elsewhere, SurfaceBytes);
+    const auto copied = FloatImage(context, copy, Format32UInt);
+    Require(copied != nullptr, "the copy's lookup made no image");
+    std::fill_n(reinterpret_cast<std::uint32_t*>(unlike), SurfaceBytes / 4u, 0x55555555u);
+    AgcDriver::GuestMemory::CollectWritesUncached(AddressOf(unlike), SurfaceBytes);
+    Require(FloatImage(context, unlike, Format32UInt) != nullptr, "the unlike surface's lookup made no image");
+    std::copy_n(unlike, SurfaceBytes, unwritten);
+    AgcDriver::GuestMemory::CollectWritesUncached(AddressOf(unwritten), SurfaceBytes);
+    Require(FloatImage(context, unwritten, Format32UInt) != nullptr, "the surface matching an image that never wrote back made no image");
+    AgcDriver::GuestMemory::MarkWritten(elsewhere, SurfaceBytes);
+    Require(FloatImage(context, copy, Format32UInt) == copied, "the copy's second lookup made another image");
+    StorageTexture::ReportFormatAliases();
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+}
+
 }
 
 int main() {
@@ -271,6 +298,13 @@ int main() {
         const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         FullExtentRule();
         Run(*device, block.Data(), counted);
+        if (counted && std::getenv("APS5_PROFILE_UPLOAD_CONTENT") != nullptr) {
+            GuestBlock writer(watched);
+            GuestBlock copy(watched);
+            GuestBlock unlike(watched);
+            GuestBlock unwritten(watched);
+            ContentRun(*device, writer.Data(), copy.Data(), unlike.Data(), unwritten.Data());
+        }
         std::printf("storage format alias census tests passed (%s)\n", counted ? "counted" : "not counted");
         return 0;
     } catch (const std::exception& error) {

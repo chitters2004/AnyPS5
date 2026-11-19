@@ -749,7 +749,8 @@ private:
     bool refresh(std::uint32_t firstLayer, std::uint32_t lastLayer);
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration(std::source_location where = std::source_location::current());
-    void noteFormatAliasUpload(std::uint64_t bytes);
+    void noteFormatAliasUpload(std::uint64_t bytes, bool whole);
+    void noteUploadContent(std::uint64_t bytes, bool whole);
     bool fillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal, bool allowRegisterClear);
     static void reportFirstUses();
     std::uint64_t advanceUnchanged(std::uint32_t unit, std::uint64_t to);
@@ -955,6 +956,8 @@ private:
     std::atomic<std::uint64_t> firstUseBytes{0};
     std::atomic<std::uint64_t> firstUseUploads{0};
     std::atomic<bool> firstUseAfterWriteBack{false};
+    std::atomic<std::uint8_t> firstUseReason{0};
+    std::uint64_t lastUploadHash = 0;
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
     // Hook skips of this image since FlushPending last listed it (AccessKeptByCpu), the read site

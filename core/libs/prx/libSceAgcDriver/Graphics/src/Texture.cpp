@@ -303,6 +303,57 @@ bool formatAliasesCounted() {
     return counted;
 }
 
+constexpr std::array<const char*, 9> UploadReasonNames{"first", "alias", "keys", "cpu", "untracked", "flushed", "store", "shadow", "other"};
+
+std::size_t uploadReasonIndex(const char* reason) {
+    for (std::size_t index = 0; index + 1 < UploadReasonNames.size(); ++index) {
+        if (reason != nullptr && std::strcmp(reason, UploadReasonNames[index]) == 0) return index;
+    }
+    return UploadReasonNames.size() - 1;
+}
+
+bool uploadContentProbed() {
+    static const bool probed = formatAliasesCounted() && std::getenv("APS5_PROFILE_UPLOAD_CONTENT") != nullptr;
+    return probed;
+}
+
+constexpr std::array<const char*, 4> UploadContentNames{"unchanged since its last upload", "the bytes of a live image's written-back range of the same size elsewhere", "other bytes", "partial upload, not compared"};
+
+struct UploadContentCounts {
+    std::array<std::array<std::atomic<std::uint64_t>, UploadContentNames.size()>, UploadReasonNames.size()> uploads{};
+    std::array<std::array<std::atomic<std::uint64_t>, UploadContentNames.size()>, UploadReasonNames.size()> bytes{};
+};
+
+UploadContentCounts& uploadContentCounts() {
+    static UploadContentCounts counts;
+    return counts;
+}
+
+constexpr std::size_t ContentChunkBytes = 65536;
+
+std::uint64_t guestRangeHash(std::uint64_t address, std::uint64_t bytes) {
+    std::vector<std::byte> chunk(static_cast<std::size_t>(std::min<std::uint64_t>(ContentChunkBytes, bytes)));
+    std::uint64_t hash = 0x5eed7e0d00000003ull;
+    for (std::uint64_t at = 0; at < bytes; at += ContentChunkBytes) {
+        const auto part = std::span<std::byte>(chunk).first(static_cast<std::size_t>(std::min<std::uint64_t>(ContentChunkBytes, bytes - at)));
+        GuestMemory::ReadCommittedUnsynced(address + at, part);
+        hash = ShaderRecompiler::HashBytes(part, hash);
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+bool sameGuestBytes(std::uint64_t left, std::uint64_t right, std::uint64_t bytes) {
+    std::vector<std::byte> one(static_cast<std::size_t>(std::min<std::uint64_t>(ContentChunkBytes, bytes)));
+    std::vector<std::byte> other(one.size());
+    for (std::uint64_t at = 0; at < bytes; at += ContentChunkBytes) {
+        const auto size = static_cast<std::size_t>(std::min<std::uint64_t>(ContentChunkBytes, bytes - at));
+        GuestMemory::ReadCommittedUnsynced(left + at, std::span<std::byte>(one).first(size));
+        GuestMemory::ReadCommittedUnsynced(right + at, std::span<std::byte>(other).first(size));
+        if (std::memcmp(one.data(), other.data(), size) != 0) return false;
+    }
+    return true;
+}
+
 bool sameFormat(const GuestTextureResource& left, VkFormat leftStorage, const GuestTextureResource& right, VkFormat rightStorage) {
     return left.format == right.format && leftStorage == rightStorage;
 }
@@ -3501,7 +3552,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             uploaded = 0;
             for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) uploaded += (*layers)[layer] ? layerBytes(layer) : 0u;
         }
-        noteFormatAliasUpload(uploaded);
+        noteFormatAliasUpload(uploaded, layers == nullptr);
     }
     GuestMemory::MaterializeKnownZero(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -4753,7 +4804,7 @@ std::uint64_t StorageTexture::advanceUnchanged(std::uint32_t unit, std::uint64_t
     return to;
 }
 
-void StorageTexture::noteFormatAliasUpload(std::uint64_t bytes) {
+void StorageTexture::noteFormatAliasUpload(std::uint64_t bytes, bool whole) {
     bool otherFormat = false;
     bool otherLayout = false;
     bool afterWriteBack = false;
@@ -4772,6 +4823,8 @@ void StorageTexture::noteFormatAliasUpload(std::uint64_t bytes) {
     firstUseBytes.fetch_add(bytes, std::memory_order_relaxed);
     firstUseUploads.fetch_add(1, std::memory_order_relaxed);
     if (afterWriteBack) firstUseAfterWriteBack.store(true, std::memory_order_relaxed);
+    firstUseReason.store(static_cast<std::uint8_t>(uploadReasonIndex(uploadReason)), std::memory_order_relaxed);
+    if (!afterWriteBack && uploadContentProbed()) noteUploadContent(bytes, whole);
     auto& counts = formatAliasCounts();
     if (otherFormat) {
         counts.uploads.fetch_add(1, std::memory_order_relaxed);
@@ -4794,9 +4847,37 @@ void StorageTexture::noteFormatAliasUpload(std::uint64_t bytes) {
     }
 }
 
+void StorageTexture::noteUploadContent(std::uint64_t bytes, bool whole) {
+    std::size_t kind = UploadContentNames.size() - 1;
+    if (whole) {
+        const auto hash = guestRangeHash(descriptor.baseAddress, guestBytes);
+        const bool unchanged = lastUploadHash != 0 && hash == lastUploadHash;
+        lastUploadHash = hash;
+        if (unchanged) {
+            kind = 0;
+        } else {
+            std::vector<std::uint64_t> candidates;
+            {
+                auto& live = Live();
+                std::lock_guard lock(live.mutex);
+                for (const auto* other : live.textures) {
+                    if (other != this && !other->released && other->guestBytes == guestBytes && other->lastWriteBack.load(std::memory_order_relaxed) != 0 && !other->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) candidates.push_back(other->descriptor.baseAddress);
+                }
+            }
+            kind = std::any_of(candidates.begin(), candidates.end(), [&](std::uint64_t address) { return sameGuestBytes(descriptor.baseAddress, address, guestBytes); }) ? 1 : 2;
+        }
+    }
+    auto& counts = uploadContentCounts();
+    const auto reason = uploadReasonIndex(uploadReason);
+    counts.uploads[reason][kind].fetch_add(1, std::memory_order_relaxed);
+    counts.bytes[reason][kind].fetch_add(bytes, std::memory_order_relaxed);
+}
+
 struct FirstUseCounts {
     std::array<std::array<std::atomic<std::uint64_t>, 2>, static_cast<std::size_t>(StorageTexture::FirstUse::Count)> uploads{};
     std::array<std::array<std::atomic<std::uint64_t>, 2>, static_cast<std::size_t>(StorageTexture::FirstUse::Count)> bytes{};
+    std::array<std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StorageTexture::FirstUse::Count)>, UploadReasonNames.size()> reasonUploads{};
+    std::array<std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StorageTexture::FirstUse::Count)>, UploadReasonNames.size()> reasonBytes{};
 };
 
 FirstUseCounts& firstUseCounts() {
@@ -4813,6 +4894,9 @@ void StorageTexture::NoteFirstUse(FirstUse use) {
     auto& counts = firstUseCounts();
     counts.uploads[static_cast<std::size_t>(use)][after].fetch_add(uploads, std::memory_order_relaxed);
     counts.bytes[static_cast<std::size_t>(use)][after].fetch_add(bytes, std::memory_order_relaxed);
+    const auto reason = std::min<std::size_t>(firstUseReason.load(std::memory_order_relaxed), UploadReasonNames.size() - 1);
+    counts.reasonUploads[reason][static_cast<std::size_t>(use)].fetch_add(uploads, std::memory_order_relaxed);
+    counts.reasonBytes[reason][static_cast<std::size_t>(use)].fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void StorageTexture::reportFirstUses() {
@@ -4829,6 +4913,19 @@ void StorageTexture::reportFirstUses() {
             lists[after] += entry;
         }
     }
+    std::string byReason;
+    for (std::size_t reason = 0; reason < UploadReasonNames.size(); ++reason) {
+        std::string cells;
+        for (std::size_t use = 0; use < names.size(); ++use) {
+            const auto uploads = counts.reasonUploads[reason][use].exchange(0, std::memory_order_relaxed);
+            const auto bytes = counts.reasonBytes[reason][use].exchange(0, std::memory_order_relaxed);
+            if (uploads == 0) continue;
+            char cell[96];
+            std::snprintf(cell, sizeof(cell), "%s%s %llu (%.1f MiB)", cells.empty() ? "" : ", ", names[use], static_cast<unsigned long long>(uploads), mib(bytes));
+            cells += cell;
+        }
+        if (!cells.empty()) byReason += (byReason.empty() ? "" : "; ") + std::string(UploadReasonNames[reason]) + ": " + cells;
+    }
     std::size_t waiting = 0;
     std::uint64_t waitingUploads = 0;
     std::uint64_t waitingBytes = 0;
@@ -4844,6 +4941,24 @@ void StorageTexture::reportFirstUses() {
         }
     }
     std::fprintf(stderr, "[textures] first GPU use after an upload (10 s, APS5_PROFILE_DRAW; a full-extent draw has scissor and viewport over the whole target, no blend, every channel of the format written, a copy ROP, no depth, stencil or alpha-to-coverage test, geometry coverage not checked): uploads with no other image's write-back over the range before them: %s; uploads after another image's write-back over the range: %s; awaiting a first use now: %zu images, %llu uploads (%.1f MiB)\n", lists[0].c_str(), lists[1].c_str(), waiting, static_cast<unsigned long long>(waitingUploads), mib(waitingBytes));
+    if (uploadContentProbed()) {
+        auto& content = uploadContentCounts();
+        std::string byContent;
+        for (std::size_t reason = 0; reason < UploadReasonNames.size(); ++reason) {
+            std::string cells;
+            for (std::size_t kind = 0; kind < UploadContentNames.size(); ++kind) {
+                const auto uploads = content.uploads[reason][kind].exchange(0, std::memory_order_relaxed);
+                const auto bytes = content.bytes[reason][kind].exchange(0, std::memory_order_relaxed);
+                if (uploads == 0) continue;
+                char cell[160];
+                std::snprintf(cell, sizeof(cell), "%s%s %llu (%.1f MiB)", cells.empty() ? "" : ", ", UploadContentNames[kind], static_cast<unsigned long long>(uploads), mib(bytes));
+                cells += cell;
+            }
+            if (!cells.empty()) byContent += (byContent.empty() ? "" : "; ") + std::string(UploadReasonNames[reason]) + ": " + cells;
+        }
+        std::fprintf(stderr, "[textures] uploads with no other image's write-back over the range before them, by reason and content (10 s, APS5_PROFILE_UPLOAD_CONTENT): %s\n", byContent.empty() ? "none" : byContent.c_str());
+    }
+    std::fprintf(stderr, "[textures] first GPU use by the last upload's reason (10 s, APS5_PROFILE_DRAW; first = created, cpu = CPU writes, flushed = after a flush of pending GPU results, store = another write over the range, alias = borrowed from an aliased image, keys = DCC keys changed, untracked = no write tracking): %s\n", byReason.empty() ? "none" : byReason.c_str());
 }
 
 StorageTexture::FormatAliasCensus StorageTexture::FormatAliasTotals() {
