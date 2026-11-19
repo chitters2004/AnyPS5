@@ -1690,9 +1690,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeRegistration
 void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Graphics::ShaderStages& stages, ShaderRecompiler::ShaderStage stage, std::shared_ptr<const ShaderRecompiler::RecompileResult> result, std::uint32_t pushOffset, std::uint64_t program) {
     if (LibraryPrebuildDisabled() || result == nullptr || (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment)) return;
     const bool profile = ProfilingRegistrationPrebuilds();
-    const auto submitted = std::chrono::steady_clock::now();
+    const auto submitted = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SubmitLibraryPrebuild([device, stages, stage, result = std::move(result), pushOffset, profile] {
-        const auto started = std::chrono::steady_clock::now();
+        const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const std::array<Graphics::CompiledShader, 1> shaders{{{stage, result.get(), pushOffset}}};
         if (!Graphics::PrebuildStillServesDraws(device->Device(), stage == ShaderRecompiler::ShaderStage::Fragment ? 2u : 1u, device->PipelineJournalHoldsPipelines())) {
             if (profile) {
@@ -2155,7 +2155,7 @@ private:
                     if (task.program != 0) pool.waitingPrograms.fetch_sub(1, std::memory_order_relaxed);
                 }
                 ++pool.running;
-                busyWorkers.fetch_add(1, std::memory_order_relaxed);
+                if (ProfilingRegistrationPrebuilds()) busyWorkers.fetch_add(1, std::memory_order_relaxed);
                 if (task.budgeted) ++pool.budgetedRunning;
             }
             const auto sequence = task.sequence;
@@ -2167,7 +2167,7 @@ private:
             {
                 std::lock_guard lock(pool.mutex);
                 --pool.running;
-                busyWorkers.fetch_sub(1, std::memory_order_relaxed);
+                if (ProfilingRegistrationPrebuilds()) busyWorkers.fetch_sub(1, std::memory_order_relaxed);
                 if (budgeted) --pool.budgetedRunning;
                 pool.unfinished.erase(sequence);
                 pool.disown(prepared, sequence);
