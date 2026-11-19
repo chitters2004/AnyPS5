@@ -326,7 +326,20 @@ Totals Snapshot() {
     return {AgcDriver::Graphics::PipelineJournalTotals(), AgcDriver::Graphics::PipelineStoreTotals()};
 }
 
-void JournalTests() {
+bool ChildSeesHeldJournal(const std::string& self) {
+#ifdef _WIN32
+    (void)self;
+    std::wstring executable(32768, L'\0');
+    executable.resize(GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size())));
+    return _wsystem((L"\"\"" + executable + L"\" --holds-pipelines\"").c_str()) == 0;
+#else
+    std::string quoted = "'";
+    for (const char character : self) quoted += character == '\'' ? std::string("'\\''") : std::string(1, character);
+    return std::system((quoted + "' --holds-pipelines").c_str()) == 0;
+#endif
+}
+
+void JournalTests(const std::string& self) {
     using namespace NarrowConstantStoreFixture;
     Require(AgcDriver::Graphics::PipelineJournalEnabled(), "the pipeline journal is disabled although the shader cache directory is set");
     const auto journalPath = AgcDriver::Graphics::PipelineJournalPath();
@@ -339,6 +352,7 @@ void JournalTests() {
         const auto device = OpenVulkanTestDevice();
         Require(device != nullptr, "the first device is required once the second opened");
         device->WaitForPipelineJournalReplay();
+        Require(!device->PipelineJournalHoldsPipelines(), "an empty cache directory holds journal pipelines");
         const auto before = Snapshot();
         Require(before.journal.loadedRecipes == 0 && before.journal.replayedGraphics == 0 && before.journal.replayedCompute == 0, "an empty journal replayed pipelines");
         std::memset(compute.data, Fill, compute.bytes);
@@ -363,6 +377,11 @@ void JournalTests() {
         Require(repeated.journal.recordedGraphics == 1 && repeated.journal.recordedModules == 3, "a repeated draw recorded its pipeline again");
     }
     Require(std::filesystem::exists(journalPath) && std::filesystem::file_size(journalPath) > 0, "the journal file was not written");
+    {
+        const auto device = OpenVulkanTestDevice();
+        Require(device != nullptr && !device->PipelineJournalHoldsPipelines(), "pipelines this run journaled count as a prior run's");
+    }
+    Require(ChildSeesHeldJournal(self), "a run started after the journal was written does not see its pipelines");
     {
         const auto device = OpenVulkanTestDevice();
         Require(device != nullptr, "the second device could not be opened");
@@ -856,6 +875,10 @@ void UndecodableModuleIsNotExpanded() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc >= 2 && std::string(argv[1]) == "--holds-pipelines") {
+            const auto device = OpenVulkanTestDevice();
+            return device != nullptr && device->PipelineJournalHoldsPipelines() ? 0 : 1;
+        }
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-pipeline-journal-test-" + std::to_string(std::random_device{}()));
         std::filesystem::create_directories(directory);
         SetEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
@@ -885,7 +908,7 @@ int main(int argc, char** argv) {
             std::puts("pipeline journal undecodable module passed");
             return 0;
         }
-        JournalTests();
+        JournalTests(argv[0]);
         ReplayRacesDispatchTests();
         NewestEntriesTests();
         EvictionTests();

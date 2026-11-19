@@ -4813,6 +4813,10 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
     return state->graphicsPipelineLibrary;
 }
 
+bool VulkanDevice::PipelineJournalHoldsPipelines() const {
+    return Graphics::PipelineJournalHoldsPipelines(Graphics::PipelineJournalDeviceFingerprint(state->properties));
+}
+
 std::pair<VkBuffer, std::uint64_t> VulkanDevice::scratchPoolHeader(const ShaderRecompiler::RecompileResult& shader) const {
     std::lock_guard lock(state->scratchPoolsMutex);
     const auto found = state->scratchPools.find(shader.Identity());

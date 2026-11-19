@@ -74,6 +74,7 @@ struct PipelineJournalCounters {
 // A decimal switch of the pipeline store or journal, or its default when unset; anything else throws.
 [[nodiscard]] std::uint64_t PipelineSwitch(const char* name, std::uint64_t fallback);
 [[nodiscard]] bool PipelineJournalEnabled();
+[[nodiscard]] bool PipelineJournalHoldsPipelines(std::uint64_t deviceFingerprint);
 // True on a replay thread while it builds an entry: what it builds is already in the file.
 [[nodiscard]] bool PipelineJournalReplaying();
 [[nodiscard]] std::filesystem::path PipelineJournalPath();

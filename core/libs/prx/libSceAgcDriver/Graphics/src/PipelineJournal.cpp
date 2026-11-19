@@ -19,6 +19,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <system_error>
@@ -71,6 +72,10 @@ struct FileHeader {
     std::uint64_t device;
 };
 static_assert(sizeof(FileHeader) == 32 && std::is_trivially_copyable_v<FileHeader>);
+
+bool HeaderMatches(const FileHeader& header, std::uint64_t device) {
+    return header.magic == FileMagic && header.format == FileFormat && header.runtimeAbi == ShaderRecompiler::RuntimeAbi::Version && header.sourceVersion == ShaderRecompiler::ShaderDiskCache::SourceVersion() && header.device == device;
+}
 
 struct RecordHeader {
     std::uint32_t kind;
@@ -688,8 +693,7 @@ bool scanSpans(const std::filesystem::path& path, std::uint64_t device, SpanScan
     FileHeader header{};
     file.read(reinterpret_cast<char*>(&header), sizeof(header));
     if (file.gcount() != sizeof(header)) return false;
-    if (header.magic != FileMagic || header.format != FileFormat || header.runtimeAbi != ShaderRecompiler::RuntimeAbi::Version ||
-        header.sourceVersion != ShaderRecompiler::ShaderDiskCache::SourceVersion() || header.device != device) return false;
+    if (!HeaderMatches(header, device)) return false;
     scan.headerValid = true;
     auto cursor = padded(sizeof(FileHeader));
     while (cursor + sizeof(RecordHeader) <= fileSize) {
@@ -772,6 +776,8 @@ public:
     static Journal* Existing() { return created().load(std::memory_order_acquire); }
 
     [[nodiscard]] bool Enabled() const { return !path.empty() && !mismatched.load(std::memory_order_relaxed); }
+
+    [[nodiscard]] bool HoldsPipelines(std::uint64_t fingerprint) const { return Enabled() && startHeader && HeaderMatches(*startHeader, fingerprint); }
     [[nodiscard]] const std::filesystem::path& Path() const { return path; }
 
     // The journal belongs to one device per process: the first device to replay binds its
@@ -916,6 +922,14 @@ private:
         path = directory / "pipelines.journal";
         lockPath = directory / "pipelines.journal.lock";
         maxBytes = configured("APS5_PIPELINE_JOURNAL_MAX_MIB", 1024u) << 20u;
+        std::error_code sizeError;
+        const auto size = std::filesystem::file_size(path, sizeError);
+        if (!sizeError && size > padded(sizeof(FileHeader))) {
+            std::ifstream file(path, std::ios::binary);
+            FileHeader header{};
+            file.read(reinterpret_cast<char*>(&header), sizeof(header));
+            if (file.gcount() == sizeof(header)) startHeader = header;
+        }
         Libc::StartHostThread([this] { run(); }).detach();
     }
 
@@ -930,7 +944,7 @@ private:
         if (size >= sizeof(FileHeader)) {
             FileHeader fileHeader;
             if (!file.ReadValue(0, fileHeader)) return false;
-            header = fileHeader.magic == FileMagic && fileHeader.format == FileFormat && fileHeader.runtimeAbi == ShaderRecompiler::RuntimeAbi::Version && fileHeader.sourceVersion == ShaderRecompiler::ShaderDiskCache::SourceVersion() && fileHeader.device == device.load(std::memory_order_relaxed);
+            header = HeaderMatches(fileHeader, device.load(std::memory_order_relaxed));
         }
         if (header) {
             valid = padded(sizeof(FileHeader));
@@ -1324,6 +1338,7 @@ private:
     bool writing = false;
     bool indexed = false;
     bool headerValid = false;
+    std::optional<FileHeader> startHeader;
     std::uint64_t validBytes = 0;
     std::set<ShaderRecompiler::PipelineIdentity> writtenModules;
     std::set<std::uint64_t> writtenRecords;
@@ -1666,6 +1681,10 @@ std::uint64_t PipelineSwitch(const char* name, std::uint64_t fallback) {
 
 bool PipelineJournalEnabled() {
     return Journal::Instance().Enabled();
+}
+
+bool PipelineJournalHoldsPipelines(std::uint64_t deviceFingerprint) {
+    return Journal::Instance().HoldsPipelines(deviceFingerprint);
 }
 
 bool PipelineJournalReplaying() {
