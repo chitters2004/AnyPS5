@@ -5654,6 +5654,11 @@ void ShaderResources::dumpSkippedWork(const char* where, const ProofWorkTrace& w
         const auto* sampled = index < textures.size() && textures[index] != nullptr ? textures[index]->StorageSource() : nullptr;
         std::fprintf(stderr, "[epoch-proofs]   sampled view %zu source image %p (the bound texture's source now %p), generation %llu\n", index, static_cast<const void*>(source), static_cast<const void*>(sampled), static_cast<unsigned long long>(source->GenerationFor(source->Descriptor().baseAddress, source->GuestBytes())));
     }
+    for (std::size_t index = 0; index < textures.size(); ++index) {
+        if (textures[index] == nullptr) continue;
+        std::fprintf(stderr, "[epoch-proofs]   bound texture %zu: %p, its storage source %p\n", index, static_cast<const void*>(textures[index].get()), static_cast<const void*>(textures[index]->StorageSource()));
+    }
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) std::fprintf(stderr, "[epoch-proofs]   bound storage image %zu: %p\n", index, static_cast<const void*>(storageTextures[index].get()));
     static constexpr std::array<const char*, 4> kinds{"full proof", "log exit adopted", "range-version exit adopted", "matched epoch exit"};
     std::fprintf(stderr, "[epoch-proofs]   exit history of the set, oldest first (write generation now %llu):\n", static_cast<unsigned long long>(GuestMemory::WriteGeneration()));
     for (std::size_t step = 0; step < exitHistory.size() && step < exitHistoryNext; ++step) {
