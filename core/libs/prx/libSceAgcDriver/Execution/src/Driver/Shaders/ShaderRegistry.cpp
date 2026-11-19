@@ -1647,12 +1647,12 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     return plan;
 }
 
-bool LibraryPrebuildDisabled() {
-    static const bool disabled = [] {
-        const auto* value = std::getenv("APS5_NO_LIBRARY_PREBUILD");
+bool LibraryPrebuildEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_LIBRARY_PREBUILD");
         return value != nullptr && std::strcmp(value, "1") == 0;
     }();
-    return disabled;
+    return enabled;
 }
 
 namespace {
@@ -1688,7 +1688,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeRegistration
 }
 
 void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Graphics::ShaderStages& stages, ShaderRecompiler::ShaderStage stage, std::shared_ptr<const ShaderRecompiler::RecompileResult> result, std::uint32_t pushOffset, std::uint64_t program) {
-    if (LibraryPrebuildDisabled() || result == nullptr || (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment)) return;
+    if (!LibraryPrebuildEnabled() || result == nullptr || (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment)) return;
     const bool profile = ProfilingRegistrationPrebuilds();
     const auto submitted = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SubmitLibraryPrebuild([device, stages, stage, result = std::move(result), pushOffset, profile] {
@@ -1724,7 +1724,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
         entries.push_back({plan.codeOffset, PrepareShaderWithDiagnostics(request, &preparation)});
     };
     append();
-    if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && !LibraryPrebuildDisabled() && Graphics::PrebuildStillServesDraws(plan.prebuildDevice->Device(), 2u, plan.prebuildDevice->PipelineJournalHoldsPipelines())) {
+    if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && LibraryPrebuildEnabled() && Graphics::PrebuildStillServesDraws(plan.prebuildDevice->Device(), 2u, plan.prebuildDevice->PipelineJournalHoldsPipelines())) {
         try {
             PrebuildStageLibrary(plan.prebuildDevice, {Graphics::ShaderPath::Vertex, 0u, 32u, request.context.waveSize, {}, {}}, request.shader.stage, MaterializeRegistration(request, *entries.front().handle), request.layout.pushConstantOffsetBytes, plan.program);
         } catch (const std::exception& error) {
@@ -2419,7 +2419,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         const auto bytes = handle->artifact->bindings.pushConstantSizeBytes;
         require(bytes <= room, "prepared graphics stages exceed the push constant block");
         std::shared_ptr<const ShaderRecompiler::RecompileResult> registration;
-        if (registrationResults && target.registrationModules && !LibraryPrebuildDisabled()) {
+        if (registrationResults && target.registrationModules && LibraryPrebuildEnabled()) {
             try {
                 registration = MaterializeRegistration(request, *handle);
             } catch (const std::exception& error) {
