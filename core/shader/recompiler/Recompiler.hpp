@@ -1073,11 +1073,13 @@ struct ResultMemoReseen {
     std::uint64_t copyUntouchedWords = 0;
     std::uint64_t copyInvariant = 0;
     std::uint64_t copyShared = 0;
+    std::uint64_t rotated = 0;
 };
 [[nodiscard]] ResultMemoReseen ResultMemoReseenCounts();
 void SetResultMemoRecycleGate(bool (*gate)());
 void NoteResultHolder(const RecompileResult& result, ResultHolder holder);
 void SetResultMemoShareGate(bool (*gate)());
+void SetResultMemoRotateGate(bool (*gate)());
 void SetResultMemoClockForTest(std::uint64_t (*clock)());
 void SetResultMemoTrimHook(std::function<void()> hook);
 struct ResourcePlanCounters {

@@ -531,6 +531,10 @@ bool resultHoldsWord(const ShaderRecompiler::RecompileResult& result, std::uint3
     return std::ranges::any_of(result.bindings, [&](const auto& binding) { return std::ranges::find(binding.guestDescriptor, value) != binding.guestDescriptor.end(); });
 }
 
+bool rotateOff() {
+    return false;
+}
+
 bool recycleOff() {
     return false;
 }
@@ -545,6 +549,7 @@ void verifyResultMemoRecycle() {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t base = 0x51a7e000u;
     bool hit = true;
+    SetResultMemoRotateGate(&rotateOff);
     SetResultMemoClockForTest(&resultMemoTestClock);
     resultMemoTestNow = 1000u;
     require(resultMemoPixel(base + 1u, &hit) != nullptr && !hit, "result memo recycle: the first compile hit the memo");
@@ -608,6 +613,7 @@ void verifyResultMemoRecycle() {
     require(ResultMemoBytes() == 0u && ResultMemoReseenCounts().spares == 0u, "result memo recycle: a trim left a spare");
     SetResultMemoBudget(0u);
     SetResultMemoClockForTest(nullptr);
+    SetResultMemoRotateGate(nullptr);
 }
 
 std::string resultMemoHeldBy(const ShaderRecompiler::ResultMemoReseen& from, const ShaderRecompiler::ResultMemoReseen& to) {
@@ -623,6 +629,7 @@ void verifyResultMemoHolders(bool profiled) {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t base = 0x51b7e000u;
     bool hit = true;
+    SetResultMemoRotateGate(&rotateOff);
     SetResultMemoClockForTest(&resultMemoTestClock);
     resultMemoTestNow = 1000u;
     {
@@ -663,7 +670,48 @@ void verifyResultMemoHolders(bool profiled) {
     SetResultMemoBudget(1u);
     SetResultMemoBudget(0u);
     SetResultMemoClockForTest(nullptr);
+    SetResultMemoRotateGate(nullptr);
     std::puts("result memo holder tests passed");
+}
+
+void verifyResultMemoRotate() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t base = 0x51c7e000u;
+    bool hit = true;
+    require(resultMemoPixel(base + 1u, &hit) != nullptr && !hit, "result memo rotate: the first compile hit the memo");
+    const auto populated = ResultMemoBytes();
+    auto pinned = resultMemoPixel(base + 2u, &hit);
+    const auto spareBytes = ResultMemoBytes() - populated;
+    require(spareBytes != 0u && ResultMemoReseenCounts().spares == 1u, "result memo rotate: the first patch was not kept as the spare");
+    const auto before = ResultMemoReseenCounts();
+    auto newer = resultMemoPixel(base + 3u, &hit);
+    const auto after = ResultMemoReseenCounts();
+    require(newer.get() != pinned.get() && after.spareHeld == before.spareHeld + 1u, "result memo rotate: a patch reused a spare its caller still holds");
+    require(after.rotated == before.rotated + 1u && after.spares == 1u, "result memo rotate: a held spare was not replaced by the newer patch");
+    require(pinned.use_count() == 1, "result memo rotate: the memo still holds the spare it replaced");
+    require(ResultMemoBytes() == populated + spareBytes, "result memo rotate: replacing the spare left its bytes counted");
+    const auto* newerSpare = newer.get();
+    newer.reset();
+    const auto beforeReuse = ResultMemoReseenCounts();
+    auto reused = resultMemoPixel(base + 4u, &hit);
+    require(reused.get() == newerSpare && ResultMemoReseenCounts().recycled == beforeReuse.recycled + 1u, "result memo rotate: with the old spare still held elsewhere, the replaced spare was not reused in place");
+    require(resultHoldsWord(*reused, base + 4u) && resultHoldsWord(*pinned, base + 2u), "result memo rotate: a patch changed a result its caller still holds");
+    reused.reset();
+    SetResultMemoRecycleGate(&recycleOff);
+    const auto beforeFree = ResultMemoReseenCounts();
+    static_cast<void>(resultMemoPixel(base + 5u, &hit));
+    require(ResultMemoReseenCounts().rotated == beforeFree.rotated, "result memo rotate: with recycling off a spare was replaced");
+    SetResultMemoRecycleGate(nullptr);
+    SetResultMemoRotateGate(&rotateOff);
+    auto held = resultMemoPixel(base + 6u, &hit);
+    const auto beforeOff = ResultMemoReseenCounts();
+    auto other = resultMemoPixel(base + 7u, &hit);
+    require(ResultMemoReseenCounts().rotated == beforeOff.rotated && ResultMemoReseenCounts().spareHeld == beforeOff.spareHeld + 1u, "result memo rotate: with APS5_NO_RESULT_MEMO_SPARE_ROTATE a held spare was replaced");
+    SetResultMemoRotateGate(nullptr);
+    SetResultMemoBudget(1u);
+    require(ResultMemoBytes() == 0u && ResultMemoReseenCounts().spares == 0u, "result memo rotate: a trim left a spare");
+    SetResultMemoBudget(0u);
+    std::puts("result memo rotate tests passed");
 }
 
 void verifyResultMemoBudgetThreads() {
@@ -13543,6 +13591,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--shared-vector") {
             verifySharedVector();
             std::puts("shared vector tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-memo-rotate") {
+            verifyResultMemoRotate();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-holders") {

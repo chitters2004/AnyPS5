@@ -289,6 +289,7 @@ function(add_shader_recompiler target runtimeTarget)
             SetResultMemoClockForTest
             SetResultMemoRecycleGate
             SetResultMemoShareGate
+            SetResultMemoRotateGate
             NoteResultHolder
             Recompile
             RecompileCacheKey::ContextHash
