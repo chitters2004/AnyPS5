@@ -1,0 +1,13 @@
+if(BUILD_TESTING)
+    agc_add_draw_pipeline_test(agc_driver_draw_allocations)
+    set_property(TEST agc_driver_draw_allocations agc_driver_draw_allocations_draw_pipeline agc_driver_draw_allocations_plan_verify APPEND PROPERTY ENVIRONMENT_MODIFICATION "VK_INSTANCE_LAYERS=unset:")
+    # LAB-ONLY BASELINE ARMS (never pushed): the settled census on unchanged baseline production must still fail.
+    function(agc_lab_census_arm name environment)
+        add_test(NAME agc_driver_draw_allocations_lab_${name} COMMAND agc_driver_draw_allocations_tests)
+        set_tests_properties(agc_driver_draw_allocations_lab_${name} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;MESA_SHADER_CACHE_DISABLE=true;${environment}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" ENVIRONMENT_MODIFICATION "VK_INSTANCE_LAYERS=unset:")
+    endfunction()
+    agc_lab_census_arm(baseline_no_limit "APS5_DRAW_ALLOCATIONS_NO_LIMIT=1")
+    foreach(round RANGE 1 3)
+        agc_lab_census_arm(baseline_strict_${round} "APS5_LAB=1")
+    endforeach()
+endif()
