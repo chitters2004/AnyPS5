@@ -101,6 +101,7 @@ public:
     };
     static DepthCopyCounts TakeDepthCopyCounts();
     static bool CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
+    static const char* CopyMismatch(const GuestTextureResource& from, const GuestTextureResource& descriptor);
     ~Texture();
     Texture(const Texture&) = delete;
     Texture& operator=(const Texture&) = delete;
@@ -945,6 +946,8 @@ private:
     std::atomic<std::uint64_t> lastWriteBack{0};
     std::uint64_t lastAliasUpload = 0;
     std::atomic<std::uint64_t> aliasUploadBytes{0};
+    std::atomic<std::uint64_t> aliasUploads{0};
+    std::atomic<std::uint64_t> windowWriteBacks{0};
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
     // Hook skips of this image since FlushPending last listed it (AccessKeptByCpu), the read site

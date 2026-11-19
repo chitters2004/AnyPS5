@@ -1405,13 +1405,25 @@ Texture::ReuseLookupCounts Texture::TakeReuseLookupCounts() {
     return {reuseLookupsHeld.exchange(0, std::memory_order_relaxed), reuseLookupsChanged.exchange(0, std::memory_order_relaxed)};
 }
 
-bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor) {
-    const auto& from = source.Descriptor();
-    if (IsBlockCompressed(descriptor.format) || IsBlockCompressed(from.format)) return false;
+const char* Texture::CopyMismatch(const GuestTextureResource& from, const GuestTextureResource& descriptor) {
+    if (IsBlockCompressed(descriptor.format) || IsBlockCompressed(from.format)) return "block-compressed";
     // Same memory, same layout, same texel size: the GPU copy reinterprets the texels exactly as a
     // guest read through the sampled descriptor would.
-    if (IsRepackedTextureFormat(descriptor.format)) return false;
-    return descriptor.baseAddress == from.baseAddress && descriptor.pipeBankXor == from.pipeBankXor && descriptor.width == from.width && descriptor.height == from.height && descriptor.linearPitch == from.linearPitch && ArrayLayersServeView(from, descriptor) && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
+    if (IsRepackedTextureFormat(descriptor.format)) return "repacked";
+    if (descriptor.baseAddress != from.baseAddress) return "base";
+    if (descriptor.pipeBankXor != from.pipeBankXor) return "bank xor";
+    if (descriptor.width != from.width || descriptor.height != from.height) return "extent";
+    if (descriptor.linearPitch != from.linearPitch) return "pitch";
+    if (!ArrayLayersServeView(from, descriptor)) return "slices";
+    if (descriptor.tileMode != from.tileMode) return "tile";
+    if (descriptor.mipCount > from.mipCount) return "mips";
+    if (BytesPerElement(descriptor.format) != BytesPerElement(from.format)) return "texel size";
+    if (BlockWidth(descriptor.format) != BlockWidth(from.format)) return "block width";
+    return nullptr;
+}
+
+bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor) {
+    return CopyMismatch(source.Descriptor(), descriptor) == nullptr;
 }
 
 Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components) : context(context), storageSource(source) {
@@ -4764,6 +4776,7 @@ void StorageTexture::noteFormatAliasUpload(std::uint64_t bytes) {
         counts.totalUploads.fetch_add(1, std::memory_order_relaxed);
         counts.totalBytes.fetch_add(bytes, std::memory_order_relaxed);
         aliasUploadBytes.fetch_add(bytes, std::memory_order_relaxed);
+        aliasUploads.fetch_add(1, std::memory_order_relaxed);
         if (afterWriteBack) {
             counts.afterWriteBack.fetch_add(1, std::memory_order_relaxed);
             counts.afterWriteBackBytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -4792,6 +4805,11 @@ void StorageTexture::ReportFormatAliases() {
         VkFormat storage;
         GuestTextureResource descriptor;
         std::uint64_t uploaded;
+        std::uint64_t uploads;
+        std::uint64_t writeBacks;
+        const void* id;
+        std::source_location createdAt;
+        bool cached;
     };
     std::vector<Image> images;
     {
@@ -4800,11 +4818,20 @@ void StorageTexture::ReportFormatAliases() {
         images.reserve(live.textures.size());
         for (auto* texture : live.textures) {
             const auto uploaded = texture->aliasUploadBytes.exchange(0, std::memory_order_relaxed);
+            const auto uploads = texture->aliasUploads.exchange(0, std::memory_order_relaxed);
+            const auto writeBacks = texture->windowWriteBacks.exchange(0, std::memory_order_relaxed);
             if (texture->released) continue;
-            images.push_back({texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes, texture->descriptor.format, texture->storageFormat, texture->descriptor, uploaded});
+            images.push_back({texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes, texture->descriptor.format, texture->storageFormat, texture->descriptor, uploaded, uploads, writeBacks, texture, texture->createdAt, texture->cached.load(std::memory_order_acquire)});
         }
     }
-    std::sort(images.begin(), images.end(), [](const Image& left, const Image& right) { return left.begin < right.begin; });
+    std::sort(images.begin(), images.end(), [](const Image& left, const Image& right) { return std::tie(left.begin, left.format, left.end) < std::tie(right.begin, right.format, right.end); });
+    struct Listed {
+        std::size_t first;
+        std::size_t last;
+        std::uint64_t end;
+        std::uint64_t uploaded;
+    };
+    std::vector<Listed> listed;
     std::size_t ranges = 0;
     std::size_t aliasedImages = 0;
     std::size_t compatibleRanges = 0;
@@ -4830,6 +4857,7 @@ void StorageTexture::ReportFormatAliases() {
             aliasedImages += last - first;
             rangeBytes += end - images[first].begin;
             if (compatible) ++compatibleRanges;
+            if (uploaded != 0) listed.push_back({first, last, end, uploaded});
             if (uploaded > topBytes || topFormats.empty()) {
                 topBytes = uploaded;
                 topBegin = images[first].begin;
@@ -4849,6 +4877,34 @@ void StorageTexture::ReportFormatAliases() {
     const auto layoutBytes = counts.layoutBytes.exchange(0, std::memory_order_relaxed);
     const auto mib = [](std::uint64_t value) { return static_cast<double>(value) / 1048576.0; };
     std::fprintf(stderr, "[textures] format aliases (10 s, APS5_PROFILE_DRAW): %zu guest ranges under storage images of different formats now (%zu images, %.1f MiB; %zu ranges with every format the same texel size); %llu uploads of such images (%.1f MiB), %llu of them after another image's write-back over the range (%.1f MiB); same format, other layout: %llu uploads (%.1f MiB); top range 0x%llx+0x%llx formats %s (guest/vk): %.1f MiB uploaded; since start %llu uploads (%.1f MiB), %llu after a write-back (%.1f MiB)\n", ranges, aliasedImages, mib(rangeBytes), compatibleRanges, static_cast<unsigned long long>(uploads), mib(bytes), static_cast<unsigned long long>(afterWriteBack), mib(afterWriteBackBytes), static_cast<unsigned long long>(layoutUploads), mib(layoutBytes), static_cast<unsigned long long>(topBegin), static_cast<unsigned long long>(topEnd - topBegin), topFormats.empty() ? "none" : topFormats.c_str(), mib(topBytes), static_cast<unsigned long long>(counts.totalUploads.load(std::memory_order_relaxed)), mib(counts.totalBytes.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.totalAfterWriteBack.load(std::memory_order_relaxed)), mib(counts.totalAfterWriteBackBytes.load(std::memory_order_relaxed)));
+    constexpr std::size_t ListedRanges = 8;
+    std::sort(listed.begin(), listed.end(), [](const Listed& left, const Listed& right) { return left.uploaded > right.uploaded; });
+    if (listed.size() > ListedRanges) listed.resize(ListedRanges);
+    const auto apart = [](const Image& left, const Image& right) -> const char* {
+        const auto* forward = Texture::CopyMismatch(left.descriptor, right.descriptor);
+        const auto* backward = Texture::CopyMismatch(right.descriptor, left.descriptor);
+        if (forward != nullptr && backward != nullptr) return forward;
+        if (left.descriptor.dimension != right.descriptor.dimension) return "key dimension";
+        if (left.descriptor.baseArray != right.descriptor.baseArray || left.descriptor.depthOrLastArray != right.descriptor.depthOrLastArray) return "key slices";
+        if (left.descriptor.mipCount != right.descriptor.mipCount) return "key mips";
+        if (sameFormat(left.descriptor, left.storage, right.descriptor, right.storage)) return "same format";
+        return "same layout";
+    };
+    for (std::size_t rank = 0; rank < listed.size(); ++rank) {
+        const auto& range = listed[rank];
+        std::uint64_t uploads = 0;
+        for (auto index = range.first; index < range.last; ++index) uploads += images[index].uploads;
+        std::string pairs;
+        for (auto left = range.first; left < range.last; ++left) {
+            for (auto right = left + 1; right < range.last; ++right) pairs += (pairs.empty() ? "" : ", ") + std::to_string(left - range.first) + "-" + std::to_string(right - range.first) + " " + apart(images[left], images[right]);
+        }
+        std::fprintf(stderr, "[textures] format alias range %zu 0x%llx+0x%llx: %zu images, %llu uploads (%.1f MiB) this window; apart by: %s\n", rank, static_cast<unsigned long long>(images[range.first].begin), static_cast<unsigned long long>(range.end - images[range.first].begin), range.last - range.first, static_cast<unsigned long long>(uploads), mib(range.uploaded), pairs.c_str());
+        for (auto index = range.first; index < range.last; ++index) {
+            const auto& image = images[index];
+            const auto& seen = image.descriptor;
+            std::fprintf(stderr, "[textures]   range %zu image %zu %p 0x%llx+0x%llx %ux%u pitch %u format %u/%d, tile %d, dimension %d, slices %u..%u, mips %u, cached %d, created at %s:%u: %llu uploads (%.1f MiB), %llu write-backs this window\n", rank, index - range.first, image.id, static_cast<unsigned long long>(image.begin), static_cast<unsigned long long>(image.end - image.begin), seen.width, seen.height, seen.linearPitch, seen.format, static_cast<int>(image.storage), static_cast<int>(seen.tileMode), static_cast<int>(seen.dimension), seen.baseArray, seen.depthOrLastArray, seen.mipCount, image.cached ? 1 : 0, image.createdAt.file_name(), static_cast<unsigned>(image.createdAt.line()), static_cast<unsigned long long>(image.uploads), mib(image.uploaded), static_cast<unsigned long long>(image.writeBacks));
+        }
+    }
 }
 
 void StorageTexture::refreshGeneration(std::source_location where) {
@@ -7866,6 +7922,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
         refreshGeneration();
         lastWriteBack.store(writeBackSequence.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        windowWriteBacks.fetch_add(1, std::memory_order_relaxed);
         advanceAdjacent(adjacent, now, firstBlock, lastBlock);
         if (!shadowed.empty()) markShadowed(now);
     };

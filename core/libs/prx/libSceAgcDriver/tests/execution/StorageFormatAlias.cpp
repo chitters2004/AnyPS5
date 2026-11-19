@@ -44,6 +44,7 @@ constexpr std::uint32_t Threads = 32;
 constexpr std::uint32_t Side = 128;
 constexpr std::uint32_t Format32UInt = 20;
 constexpr std::uint32_t Format32Float = 22;
+constexpr std::uint32_t Format8UNorm = 1;
 constexpr std::uint32_t TileR64KBX = 0x1b;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::size_t SurfaceBytes = 65536;
@@ -139,8 +140,8 @@ void Store(AgcDriver::VulkanDevice& device, const std::uint8_t* texels, std::uin
     Dispatch(device, StoreCode, userData);
 }
 
-std::shared_ptr<StorageTexture> FloatImage(const AgcDriver::Graphics::Context& context, const std::uint8_t* texels) {
-    const auto words = TextureDescriptor(texels, Type2D, Format32Float);
+std::shared_ptr<StorageTexture> FloatImage(const AgcDriver::Graphics::Context& context, const std::uint8_t* texels, std::uint32_t format = Format32Float) {
+    const auto words = TextureDescriptor(texels, Type2D, format);
     return AgcDriver::Graphics::CachedStorageSurface(context, AgcDriver::Graphics::DecodeTextureResource(words));
 }
 
@@ -181,6 +182,9 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool counted) {
     AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
     Require(FloatImage(context, texels) == sampled, "the float lookup made a third image after the CPU write");
     RequireCensus(base, 3 * on, 2 * on, "the float image refreshed after a CPU write");
+    const auto narrow = FloatImage(context, texels, Format8UNorm);
+    Require(narrow != nullptr && narrow != sampled && narrow != written, "the 8-bit lookup did not make a third image over the surface");
+    Require(StorageTexture::FormatAliasTotals().uploads - base.uploads == 4 * on, "the 8-bit image's upload was not counted as aliased");
     StorageTexture::ReportFormatAliases();
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
 }
