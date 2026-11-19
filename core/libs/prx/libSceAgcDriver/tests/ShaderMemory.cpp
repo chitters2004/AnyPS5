@@ -610,6 +610,62 @@ void verifyResultMemoRecycle() {
     SetResultMemoClockForTest(nullptr);
 }
 
+std::string resultMemoHeldBy(const ShaderRecompiler::ResultMemoReseen& from, const ShaderRecompiler::ResultMemoReseen& to) {
+    std::string text;
+    for (std::size_t site = 0; site <= ShaderRecompiler::ResultHolderSites; ++site) {
+        if (site != 0) text += " ";
+        for (std::size_t age = 0; age < ShaderRecompiler::ResultMemoHolderAges; ++age) text += std::to_string(to.heldBy[site][age] - from.heldBy[site][age]);
+    }
+    return text;
+}
+
+void verifyResultMemoHolders(bool profiled) {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t base = 0x51b7e000u;
+    bool hit = true;
+    SetResultMemoClockForTest(&resultMemoTestClock);
+    resultMemoTestNow = 1000u;
+    {
+        RecompileResult tagged;
+        NoteResultHolder(tagged, ResultHolder::VariantCopy);
+        const RecompileResult copy(tagged);
+        RecompileResult assigned;
+        NoteResultHolder(assigned, ResultHolder::DrawVariant);
+        assigned = tagged;
+        require(tagged.holders.bits.load() == (profiled ? 4u : 0u), "result memo holders: a holder tag was not kept, or was kept without APS5_PROFILE_DRAW");
+        require(copy.holders.bits.load() == 0u && assigned.holders.bits.load() == 0u, "result memo holders: a copied result kept the holder tags of its source");
+    }
+    require(resultMemoPixel(base + 1u, &hit) != nullptr && !hit, "result memo holders: the first compile hit the memo");
+    auto first = resultMemoPixel(base + 2u, &hit);
+    NoteResultHolder(*first, ResultHolder::DrawVariant);
+    NoteResultHolder(*first, ResultHolder::ParkedDispatch);
+    resultMemoTestNow += 500u;
+    const auto beforeYoung = ResultMemoReseenCounts();
+    static_cast<void>(resultMemoPixel(base + 6u, &hit));
+    const auto young = profiled ? std::string("100 000 000 100 000") : std::string("000 000 000 000 100");
+    require(resultMemoHeldBy(beforeYoung, ResultMemoReseenCounts()) == young, (std::string("result memo holders: a spare tagged draw variant and parked dispatch, held 0.5 s, was split as ") + resultMemoHeldBy(beforeYoung, ResultMemoReseenCounts())).c_str());
+    resultMemoTestNow += 1000u;
+    const auto before = ResultMemoReseenCounts();
+    auto copied = resultMemoPixel(base + 3u, &hit);
+    const auto afterHeld = ResultMemoReseenCounts();
+    const auto expected = profiled ? std::string("010 000 000 010 000") : std::string("000 000 000 000 010");
+    require(copied.get() != first.get() && resultMemoHeldBy(before, afterHeld) == expected, (std::string("result memo holders: a spare tagged draw variant and parked dispatch, held 1.5 s, was split as ") + resultMemoHeldBy(before, afterHeld)).c_str());
+    const auto* spare = first.get();
+    first.reset();
+    copied.reset();
+    auto reused = resultMemoPixel(base + 4u, &hit);
+    require(reused.get() == spare, "result memo holders: a patch with the spare free did not reuse it");
+    resultMemoTestNow += 20000u;
+    const auto beforeReused = ResultMemoReseenCounts();
+    static_cast<void>(resultMemoPixel(base + 5u, &hit));
+    require(resultMemoHeldBy(beforeReused, ResultMemoReseenCounts()) == "000 000 000 000 001", (std::string("result memo holders: a reused spare kept its old holder tags, split as ") + resultMemoHeldBy(beforeReused, ResultMemoReseenCounts())).c_str());
+    reused.reset();
+    SetResultMemoBudget(1u);
+    SetResultMemoBudget(0u);
+    SetResultMemoClockForTest(nullptr);
+    std::puts("result memo holder tests passed");
+}
+
 void verifyResultMemoBudgetThreads() {
     using namespace ShaderRecompiler;
     require(!compileResultMemoPixel(1u) && compileResultMemoPixel(1u), "result memo budget threads: the memo did not keep a result");
@@ -13487,6 +13543,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--shared-vector") {
             verifySharedVector();
             std::puts("shared vector tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-memo-holders") {
+            verifyResultMemoHolders(std::getenv("APS5_PROFILE_DRAW") != nullptr);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-recycle") {

@@ -481,6 +481,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::copy_n(packet.begin(), std::min(packet.size(), parked.packet.size()), parked.packet.begin());
         parked.registeredShader = registeredShader;
         parked.compiledResult = compiledResult;
+        if (compiledResult != nullptr) ShaderRecompiler::NoteResultHolder(*compiledResult, ShaderRecompiler::ResultHolder::ParkedDispatch);
         parked.keepVariant = keepVariant;
         parked.attachVariant = attachVariant;
         parked.missedEntry = missedEntry;

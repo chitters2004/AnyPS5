@@ -321,6 +321,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->words = variant->words;
             copy->forgetSerial = variant->forgetSerial;
             copy->compiled = variant->compiled;
+            if (copy->compiled != nullptr) ShaderRecompiler::NoteResultHolder(*copy->compiled, ShaderRecompiler::ResultHolder::VariantCopy);
             copy->meshIndexDescriptor = variant->meshIndexDescriptor;
             copy->shader = variant->shader;
             copy->dataPositions = variant->dataPositions;

@@ -989,9 +989,23 @@ struct ResultKeyMemo {
     }
 };
 
+enum class ResultHolder : std::uint8_t { DrawVariant, DispatchVariant, VariantCopy, ParkedDispatch };
+constexpr std::size_t ResultHolderSites = 4;
+
+struct ResultHolders {
+    mutable std::atomic<std::uint8_t> bits{0};
+    ResultHolders() = default;
+    ResultHolders(const ResultHolders&) {}
+    ResultHolders& operator=(const ResultHolders&) {
+        bits.store(0, std::memory_order_relaxed);
+        return *this;
+    }
+};
+
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     ResultKeyMemo drawKeyMemo;
     bool cacheHit = false;
+    ResultHolders holders;
     std::uint32_t workgroupMemoryDwords = 0;
     SharedVector<std::uint32_t> shaderDataUserWords;
     void UnshareInvariants();
@@ -1044,6 +1058,7 @@ void SetResultMemoBudget(std::uint64_t bytes);
 [[nodiscard]] std::uint64_t ResultMemoBytes();
 constexpr std::size_t ResultMemoHeldAges = 4;
 constexpr std::size_t ResultMemoHeldRefs = 3;
+constexpr std::size_t ResultMemoHolderAges = 3;
 struct ResultMemoReseen {
     std::uint64_t evictedThenPatched = 0;
     std::uint64_t evictedThenPopulated = 0;
@@ -1053,6 +1068,7 @@ struct ResultMemoReseen {
     std::uint64_t spares = 0;
     std::array<std::uint64_t, ResultMemoHeldAges> heldAge{};
     std::array<std::uint64_t, ResultMemoHeldRefs> heldRefs{};
+    std::array<std::array<std::uint64_t, ResultMemoHolderAges>, ResultHolderSites + 1> heldBy{};
     std::uint64_t copyTouched = 0;
     std::uint64_t copyUntouchedWords = 0;
     std::uint64_t copyInvariant = 0;
@@ -1060,6 +1076,7 @@ struct ResultMemoReseen {
 };
 [[nodiscard]] ResultMemoReseen ResultMemoReseenCounts();
 void SetResultMemoRecycleGate(bool (*gate)());
+void NoteResultHolder(const RecompileResult& result, ResultHolder holder);
 void SetResultMemoShareGate(bool (*gate)());
 void SetResultMemoClockForTest(std::uint64_t (*clock)());
 void SetResultMemoTrimHook(std::function<void()> hook);

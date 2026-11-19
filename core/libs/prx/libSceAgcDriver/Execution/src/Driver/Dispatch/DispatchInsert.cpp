@@ -49,6 +49,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
+        if (compiledResult != nullptr) ShaderRecompiler::NoteResultHolder(*compiledResult, ShaderRecompiler::ResultHolder::DispatchVariant);
         if (capture != nullptr && !capture->snapshot.registeredImages.empty()) fresh->registeredViews = std::make_shared<const std::vector<ShaderRecompiler::RegisteredImageView>>(capture->snapshot.registeredImages);
         fresh->shader = registeredShader;
         fresh->linking = linking;
