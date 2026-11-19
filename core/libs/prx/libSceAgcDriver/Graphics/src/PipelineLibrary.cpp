@@ -50,6 +50,7 @@ struct DeviceLibraries {
     std::array<std::map<Key, bool>, 4> prebuilt;
     std::array<std::map<Key, bool>, 4> prebuiltModules;
     std::array<std::map<Key, bool>, 4> prebuiltShaderKeys;
+    std::array<std::map<Key, bool>, 4> prebuiltShaderLayoutKeys;
     PipelineLibraryCounters counters;
 };
 
@@ -216,6 +217,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     const auto preRasterizationContext = Combined(keys.preRasterizationLayout, attachmentKey);
     const auto fragmentContext = Combined(keys.fragmentLayout, attachmentKey);
     const std::array<const Key*, 4> contextKeys{&none, &preRasterizationContext, &fragmentContext, &keys.renderPass};
+    const std::array<Key, 4> partLayoutKeys{none, keys.preRasterizationLayout, keys.fragmentLayout, none};
     VkPipelineDepthStencilStateCreateInfo dynamicDepth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     static const bool backgroundLinking = std::getenv("APS5_NO_PIPELINE_LTO") == nullptr;
     const bool optimize = backgroundLinking && context.pipelineLinkTimeOptimization;
@@ -310,9 +312,11 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             if (partsOnly) {
                 device.prebuiltModules[part].emplace(*moduleKeys[part], true);
                 device.prebuiltShaderKeys[part].emplace(*partKeys[part], true);
+                device.prebuiltShaderLayoutKeys[part].emplace(Combined(*partKeys[part], partLayoutKeys[part]), true);
             } else if (device.prebuiltModules[part].contains(*moduleKeys[part])) {
                 ++device.counters.drawBuiltWithPrebuiltModules[part];
                 if (device.prebuiltShaderKeys[part].contains(*partKeys[part])) ++device.counters.drawBuiltWithPrebuiltShaderKeys[part];
+                if (device.prebuiltShaderLayoutKeys[part].contains(Combined(*partKeys[part], partLayoutKeys[part]))) ++device.counters.drawBuiltWithPrebuiltShaderLayouts[part];
             }
         }
         ++(partsOnly ? device.counters.builtByPrebuild : device.counters.builtByDraw)[part];
