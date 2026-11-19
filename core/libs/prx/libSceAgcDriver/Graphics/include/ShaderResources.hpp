@@ -878,6 +878,11 @@ private:
     bool stalePlanesRead();
     std::string rangeOwner(std::uint64_t address, std::uint64_t bytes) const;
     void reportVerifiedWork(const ProofWorkTrace& work) const;
+    void dumpSkippedWork(const char* where, const ProofWorkTrace& work) const;
+    std::uint8_t adoptedBy = 0;
+    std::uint32_t exitsSinceFull = 0;
+    std::uint32_t uncoveredSources = 0;
+    std::uint32_t uncoveredSourcesAdopted = 0;
     void reportRangeDisagreement(const ProofWorkTrace& work, const ProofReport& verified) const;
     void reportVerifiedStore(std::uint64_t exitSerial, std::uint64_t startSerial, std::uint64_t endSerial, const GuestMemory::ProofBreakTrace& trace) const;
     bool refreshPerUseCopies();

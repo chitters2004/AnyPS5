@@ -2830,7 +2830,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
-    ProofWorkTrace::Note(ProofWork::StorageUpload);
+    ProofWorkTrace::NoteUpload(descriptor.baseAddress, guestBytes);
     CaptureTrace::Log("refresh image=%llx bytes=%llu generation=%llu dirty=%d keysChanged=%d cpuWrote=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), dirty, keysChanged, cpuWrote);
     // Debug aid: APS5_TRACE_UPLOAD names why a storage image is uploaded again.
     static const bool traceUpload = std::getenv("APS5_TRACE_UPLOAD") != nullptr;
