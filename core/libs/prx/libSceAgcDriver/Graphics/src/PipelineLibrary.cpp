@@ -49,6 +49,7 @@ struct DeviceLibraries {
     std::array<std::map<Key, VkPipeline>, 4> parts;
     std::array<std::map<Key, bool>, 4> prebuilt;
     std::array<std::map<Key, bool>, 4> prebuiltModules;
+    std::array<std::map<Key, bool>, 4> prebuiltShaderKeys;
     PipelineLibraryCounters counters;
 };
 
@@ -306,8 +307,13 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         cache.emplace(key, handle);
         if (partsOnly) device.prebuilt[part].emplace(key, false);
         if (moduleKeys[part] != nullptr && !moduleKeys[part]->empty()) {
-            if (partsOnly) device.prebuiltModules[part].emplace(*moduleKeys[part], true);
-            else if (device.prebuiltModules[part].contains(*moduleKeys[part])) ++device.counters.drawBuiltWithPrebuiltModules[part];
+            if (partsOnly) {
+                device.prebuiltModules[part].emplace(*moduleKeys[part], true);
+                device.prebuiltShaderKeys[part].emplace(*partKeys[part], true);
+            } else if (device.prebuiltModules[part].contains(*moduleKeys[part])) {
+                ++device.counters.drawBuiltWithPrebuiltModules[part];
+                if (device.prebuiltShaderKeys[part].contains(*partKeys[part])) ++device.counters.drawBuiltWithPrebuiltShaderKeys[part];
+            }
         }
         ++(partsOnly ? device.counters.builtByPrebuild : device.counters.builtByDraw)[part];
         if (!partsOnly) device.counters.drawNanoseconds[part] += nanoseconds;

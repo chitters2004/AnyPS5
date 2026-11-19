@@ -67,6 +67,7 @@ struct PipelineLibraryCounters {
     std::array<std::uint64_t, 4> spirvBytes{};
     std::array<std::uint64_t, 4> drawBuiltWithPrebuiltModules{};
     std::array<std::uint64_t, 4> prebuildsSkipped{};
+    std::array<std::uint64_t, 4> drawBuiltWithPrebuiltShaderKeys{};
     std::uint64_t linked = 0;
     std::uint64_t optimized = 0;
 };
