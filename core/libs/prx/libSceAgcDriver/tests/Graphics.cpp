@@ -15022,6 +15022,17 @@ void commandStateTests() {
     statePipelines.clear();
 }
 
+void prebuildGateTests() {
+    using namespace AgcDriver::Graphics;
+    static_assert(PrebuildServesDraws(0u, PrebuildJudgedAfterDrawParts - 1u));
+    static_assert(!PrebuildServesDraws(0u, PrebuildJudgedAfterDrawParts));
+    static_assert(PrebuildServesDraws(16u, 48u));
+    static_assert(!PrebuildServesDraws(15u, 49u));
+    static_assert(PrebuildServesDraws(1000u, 0u));
+    static_assert(!PrebuildServesDraws(10u, 200u));
+    static_assert(PrebuildServesDraws(60u, 180u));
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
@@ -15642,6 +15653,7 @@ int main(int argc, char** argv) {
                 return resets;
             }
         });
+        prebuildGateTests();
         std::cout << "Graphics validation tests passed\n";
         return 0;
     } catch (const std::exception& error) {

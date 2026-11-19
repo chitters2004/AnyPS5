@@ -77,6 +77,11 @@ PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device);
 inline constexpr std::uint64_t PrebuildJudgedAfterDrawParts = 64u;
 inline constexpr std::uint64_t PrebuildMinimumServedPercent = 25u;
 
+constexpr bool PrebuildServesDraws(std::uint64_t served, std::uint64_t drawBuilt) {
+    const auto needed = served + drawBuilt;
+    return needed < PrebuildJudgedAfterDrawParts || served * 100u >= needed * PrebuildMinimumServedPercent;
+}
+
 bool PrebuildStillServesDraws(VkDevice device, std::size_t part);
 
 }

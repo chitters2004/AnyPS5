@@ -470,9 +470,7 @@ bool PrebuildStillServesDraws(VkDevice device, std::size_t part) {
     auto& store = Libraries();
     std::lock_guard lock(store.mutex);
     auto& counters = store.devices[device].counters;
-    const auto served = counters.prebuiltUsedByDraw.at(part);
-    const auto needed = served + counters.builtByDraw.at(part);
-    if (needed < PrebuildJudgedAfterDrawParts || served * 100u >= needed * PrebuildMinimumServedPercent) return true;
+    if (PrebuildServesDraws(counters.prebuiltUsedByDraw.at(part), counters.builtByDraw.at(part))) return true;
     ++counters.prebuildsSkipped.at(part);
     return false;
 }
