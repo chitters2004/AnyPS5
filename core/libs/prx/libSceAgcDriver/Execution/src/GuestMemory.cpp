@@ -1838,6 +1838,42 @@ constexpr unsigned ImportHashThreads = 4;
 
 enum class StampKind : std::uint8_t { Cpu, Driver, ImportWindow, Fresh };
 
+struct StampTraceRange {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+};
+
+const StampTraceRange& stampTraceRange() {
+    static const StampTraceRange range = [] {
+        StampTraceRange parsed;
+        const char* value = std::getenv("APS5_TRACE_STAMPS");
+        if (value == nullptr || value[0] == '\0') return parsed;
+        char* rest = nullptr;
+        parsed.begin = std::strtoull(value, &rest, 0);
+        const auto bytes = rest != nullptr && *rest == '+' ? std::strtoull(rest + 1, nullptr, 0) : 0;
+        parsed.end = bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - parsed.begin ? parsed.begin + bytes : 0;
+        return parsed;
+    }();
+    return range;
+}
+
+thread_local int stampBreakSite = -1;
+
+struct StampBreakSiteScope {
+    int previous;
+    explicit StampBreakSiteScope(int site) : previous(stampBreakSite) { stampBreakSite = site; }
+    ~StampBreakSiteScope() { stampBreakSite = previous; }
+};
+
+}
+
+bool StampTraceCovers(std::uint64_t address, std::uint64_t bytes) {
+    const auto& range = stampTraceRange();
+    return range.end != 0 && address < range.end && range.begin < address + bytes;
+}
+
+namespace {
+
 std::uint64_t HashPage(const std::byte* page) {
     constexpr std::uint64_t prime1 = 0x9E3779B185EBCA87ull;
     constexpr std::uint64_t prime2 = 0xC2B2AE3D27D4EB4Full;
@@ -2503,7 +2539,31 @@ struct WriteTracker {
         return true;
     }
 
-    void stamp(std::uint64_t block, std::uint64_t stampGeneration, StampKind kind) {
+    void traceStamp(std::uint64_t block, std::uint64_t stampGeneration, StampKind kind, const char* function, unsigned line) {
+        const auto& range = stampTraceRange();
+        if (range.end == 0) return;
+        const auto begin = blockBegin(block);
+        if (begin >= range.end || begin + WriteBlockBytes <= range.begin) return;
+        struct Run {
+            std::uint64_t last = 0;
+            std::uint64_t stampGeneration = 0;
+            std::uint32_t line = 0;
+            StampKind kind = StampKind::Cpu;
+            bool open = false;
+        };
+        thread_local Run run;
+        if (run.open && block == run.last + 1 && stampGeneration == run.stampGeneration && line == run.line && kind == run.kind) {
+            run.last = block;
+            return;
+        }
+        run = {block, stampGeneration, line, kind, true};
+        static constexpr std::array<const char*, 4> kinds{"cpu", "driver", "import window", "fresh"};
+        const auto current = generation.load(std::memory_order_relaxed);
+        std::fprintf(stderr, "[stamp] 0x%llx: %s stamp given generation %llu, write generation now %llu%s, proof serial %llu, break site %s, thread %llu, at line %u (%s)\n", static_cast<unsigned long long>(begin), kinds[static_cast<std::size_t>(kind)], static_cast<unsigned long long>(stampGeneration), static_cast<unsigned long long>(current), stampGeneration < current ? " (behind)" : "", static_cast<unsigned long long>(ProofSerial()), stampBreakSite >= 0 ? ProofBreakSiteName(static_cast<ProofBreakSite>(stampBreakSite)) : "none", static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id())), line, function);
+    }
+
+    void stamp(std::uint64_t block, std::uint64_t stampGeneration, StampKind kind, const char* function = __builtin_FUNCTION(), unsigned line = __builtin_LINE()) {
+        traceStamp(block, stampGeneration, kind, function, line);
         const bool cpu = kind == StampKind::Cpu || kind == StampKind::ImportWindow;
         const bool stored = kind != StampKind::ImportWindow;
         auto& leaf = leafFor(block);
@@ -3224,6 +3284,7 @@ void BreakProofs(ProofBreakSite site, std::uint64_t address, std::uint64_t bytes
     const bool ranged = ProofBreakScoped(site) && bounded;
     const std::pair<std::uint64_t, std::uint64_t> range{address, bounded ? address + bytes : address};
     const RangeStampScope stamping;
+    const StampBreakSiteScope traced(static_cast<int>(site));
     stampBreak(logBreak(site, std::span(&range, 1), ranged, bounded, 0), std::span(&range, 1), ranged);
     noteBreak(site);
     if (proofBreakTrace != nullptr) proofBreakTrace->Note({site, address, bytes});
@@ -3235,6 +3296,7 @@ void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_
     const bool ranged = ProofBreakScoped(site) && bounded;
     {
         const RangeStampScope stamping;
+        const StampBreakSiteScope traced(static_cast<int>(site));
         stampBreak(logBreak(site, ranges, ranged, bounded, detail), ranges, ranged);
     }
     if ((site == ProofBreakSite::Packet || site == ProofBreakSite::PacketCovered) && ProofBreakCensusEnabled()) {
@@ -3559,6 +3621,7 @@ void beforeUnwatchUnproven(std::uint64_t address, std::size_t bytes) {
 
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
     if (!tracker.watched) return;
+    if (StampTraceCovers(address, bytes)) std::fprintf(stderr, "[stamp] unwatch 0x%llx+0x%llx: unwatch serial %llu, write generation %llu, thread %llu\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(unwatchSerial.load(std::memory_order_relaxed)), static_cast<unsigned long long>(tracker.generation.load(std::memory_order_relaxed)), static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
 #ifdef _WIN32
     tracker.startHints(address, bytes);
     if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) {

@@ -873,6 +873,22 @@ private:
     void dumpSkippedWork(const char* where, const ProofWorkTrace& work) const;
     std::uint8_t adoptedBy = 0;
     std::uint32_t exitsSinceFull = 0;
+    struct ExitRecord {
+        std::uint8_t kind = 0;
+        std::uint8_t adoptedBy = 0;
+        std::uint32_t passedOnBytes = 0;
+        std::uint32_t passedOnRebase = 0;
+        std::uint64_t writeGeneration = 0;
+        std::uint64_t provedGeneration = 0;
+        std::uint64_t epoch = 0;
+        std::uint64_t proof = 0;
+        std::uint64_t provedUnwatch = 0;
+        std::uint64_t unwatch = 0;
+        std::array<std::uint64_t, 6> rangeGenerations{};
+    };
+    std::vector<ExitRecord> exitHistory;
+    std::size_t exitHistoryNext = 0;
+    void noteExitForDump(std::uint8_t kind);
     std::uint32_t uncoveredSources = 0;
     std::uint32_t uncoveredSourcesAdopted = 0;
     void reportRangeDisagreement(const ProofWorkTrace& work, const ProofReport& verified) const;

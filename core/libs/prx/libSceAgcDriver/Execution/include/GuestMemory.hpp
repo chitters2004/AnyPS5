@@ -239,6 +239,7 @@ void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 enum class ProofBreakSite : std::uint8_t { Other, DriverStore, Written, GpuMutex, WriteBack, WriteBackIfHeld, Packet, CompletionStore, RecordedWork, WrittenBack, KeptDraw, ResourceWriteBack, PacketCovered, GpuLabel, HeldState };
 const char* ProofBreakSiteName(ProofBreakSite site);
+bool StampTraceCovers(std::uint64_t address, std::uint64_t bytes);
 inline constexpr std::size_t ProofBreakSiteCount = static_cast<std::size_t>(ProofBreakSite::HeldState) + 1;
 struct ProofBreakCounts {
     std::array<std::uint64_t, ProofBreakSiteCount> sites{};
