@@ -5602,12 +5602,26 @@ void ShaderResources::reportVerifiedStore(std::uint64_t exitSerial, std::uint64_
     std::fprintf(stderr, "[epoch-proofs] verify: the full proof behind a reused proof broke proofs %llu times (the serial moved %llu times since the exit, %llu before the full proof started): %s\n", static_cast<unsigned long long>(trace.Count()), static_cast<unsigned long long>(endSerial - exitSerial), static_cast<unsigned long long>(startSerial - exitSerial), breaks.c_str());
 }
 
-void ShaderResources::dumpSkippedWork(const char* where, const ProofWorkTrace& work) const {
+namespace {
+bool abortDumpOn() {
     static const bool dump = [] {
         const char* value = std::getenv("APS5_VERIFY_ABORT_ON_FAIL");
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
-    if (!dump) return;
+    return dump;
+}
+}
+
+void ShaderResources::noteExitForDump(std::uint8_t kind) {
+    if (!abortDumpOn()) return;
+    if (exitHistory.empty()) exitHistory.resize(16);
+    auto& record = exitHistory[exitHistoryNext++ % exitHistory.size()];
+    record = {kind, adoptedBy, rangePassedOnBytes, rangePassedOnRebase, GuestMemory::WriteGeneration(), provedGeneration, proved.epoch, proved.proof, proved.unwatch, GuestMemory::UnwatchSerial(), {}};
+    for (std::size_t index = 0; index < record.rangeGenerations.size() && index < proofRangeGenerations.size(); ++index) record.rangeGenerations[index] = proofRangeGenerations[index];
+}
+
+void ShaderResources::dumpSkippedWork(const char* where, const ProofWorkTrace& work) const {
+    if (!abortDumpOn()) return;
     static constexpr std::array<const char*, 6> Paths{"a full proof", "a log exit", "a range-version exit on stamps", "a range-version exit with a byte pass", "a range-version exit with a rebased range", "a range-version exit with a byte pass and a rebased range"};
     std::fprintf(stderr, "[epoch-proofs] skipped work at %s (set %p): the stamp was last adopted by %s, %u exits since the last full proof; storage-sourced views outside every proof range at that adoption %u; %llu CPU write syncs, %llu storage image uploads\n", where, static_cast<const void*>(this), Paths[adoptedBy < Paths.size() ? adoptedBy : 0], exitsSinceFull, uncoveredSourcesAdopted, static_cast<unsigned long long>(work.Count(ProofWork::CpuWriteSync)), static_cast<unsigned long long>(work.Count(ProofWork::StorageUpload)));
     for (std::size_t index = 0; index < work.UploadCount(); ++index) {
@@ -5628,7 +5642,26 @@ void ShaderResources::dumpSkippedWork(const char* where, const ProofWorkTrace& w
         const bool sourceCovered = surface.source != nullptr && std::any_of(proofRanges.begin(), proofRanges.end(), [&](const auto& range) { return range.first <= sourceBegin && sourceBegin + sourceBytes <= range.second; });
         std::fprintf(stderr, "[epoch-proofs]   sampled view %zu: 0x%llx+0x%llx %s (source image 0x%llx+0x%llx, %s), %s, %s; generation %llu, source generation %llu, unchanged since the source generation %d, proved generation %llu\n", index, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), surface.source != nullptr ? "storage-sourced" : "snapshot", static_cast<unsigned long long>(sourceBegin), static_cast<unsigned long long>(sourceBytes), sourceCovered ? "inside a proof range" : "not inside one proof range", covered ? "inside a proof range" : "outside every proof range", snapshot ? "byte snapshot held" : "no byte snapshot", static_cast<unsigned long long>(surface.generation), static_cast<unsigned long long>(sourceGeneration), surface.source != nullptr ? static_cast<int>(GuestMemory::UnchangedSince(address, bytes, sourceGeneration)) : -1, static_cast<unsigned long long>(provedGeneration));
     }
-    for (const auto& [begin, end] : proofRanges) std::fprintf(stderr, "[epoch-proofs]   proof range 0x%llx+0x%llx over %s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), rangeOwner(begin, end - begin).c_str());
+    for (std::size_t index = 0; index < proofRanges.size(); ++index) {
+        const auto [begin, end] = proofRanges[index];
+        const auto rangeGeneration = index < proofRangeGenerations.size() ? proofRangeGenerations[index] : 0;
+        const auto since = std::max(provedGeneration, rangeGeneration);
+        std::fprintf(stderr, "[epoch-proofs]   proof range %zu 0x%llx+0x%llx over %s; rebased generation %llu, since %llu, unchanged since it %d, unchanged since the proved generation %d\n", index, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), rangeOwner(begin, end - begin).c_str(), static_cast<unsigned long long>(rangeGeneration), static_cast<unsigned long long>(since), static_cast<int>(GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(end - begin), since)), static_cast<int>(GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(end - begin), provedGeneration)));
+    }
+    for (std::size_t index = 0; index < validatedTextures.size(); ++index) {
+        const auto* source = validatedTextures[index].source;
+        if (source == nullptr) continue;
+        const auto* sampled = index < textures.size() && textures[index] != nullptr ? textures[index]->StorageSource() : nullptr;
+        std::fprintf(stderr, "[epoch-proofs]   sampled view %zu source image %p (the bound texture's source now %p), generation %llu\n", index, static_cast<const void*>(source), static_cast<const void*>(sampled), static_cast<unsigned long long>(source->GenerationFor(source->Descriptor().baseAddress, source->GuestBytes())));
+    }
+    static constexpr std::array<const char*, 4> kinds{"full proof", "log exit adopted", "range-version exit adopted", "matched epoch exit"};
+    std::fprintf(stderr, "[epoch-proofs]   exit history of the set, oldest first (write generation now %llu):\n", static_cast<unsigned long long>(GuestMemory::WriteGeneration()));
+    for (std::size_t step = 0; step < exitHistory.size() && step < exitHistoryNext; ++step) {
+        const auto& record = exitHistory[(exitHistoryNext - std::min(exitHistoryNext, exitHistory.size()) + step) % exitHistory.size()];
+        std::string generations;
+        for (const auto value : record.rangeGenerations) generations += (generations.empty() ? "" : ",") + std::to_string(value);
+        std::fprintf(stderr, "[epoch-proofs]     %s (adopted by %u): write generation %llu, proved generation %llu, epoch %llu proof %llu, passed on bytes %u, on a rebase %u, unwatch proved %llu now %llu, range generations %s\n", kinds[record.kind < kinds.size() ? record.kind : 0], static_cast<unsigned>(record.adoptedBy), static_cast<unsigned long long>(record.writeGeneration), static_cast<unsigned long long>(record.provedGeneration), static_cast<unsigned long long>(record.epoch), static_cast<unsigned long long>(record.proof), record.passedOnBytes, record.passedOnRebase, static_cast<unsigned long long>(record.provedUnwatch), static_cast<unsigned long long>(record.unwatch), generations.c_str());
+    }
     std::fflush(stderr);
     std::abort();
 }
@@ -5713,6 +5746,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     proved.proof = stamp.proof;
                     adoptedBy = 1;
                     matched = true;
+                    noteExitForDump(1);
                     if (exitMissesCounted()) exitMisses().logExits.Add();
                 }
             }
@@ -5773,6 +5807,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     adoptedBy = static_cast<std::uint8_t>(2 + (rangePassedOnBytes != 0 ? 1 : 0) + (rangePassedOnRebase != 0 ? 2 : 0));
                     uncoveredSourcesAdopted = uncoveredSources;
                     ++exitsSinceFull;
+                    noteExitForDump(2);
                     provedUnrangedProof = unrangedProof;
                     provedUnrangedPending = unrangedPending;
                     noteEpochProof(true, false, false);
@@ -5782,6 +5817,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 adoptedBy = static_cast<std::uint8_t>(2 + (rangePassedOnBytes != 0 ? 1 : 0) + (rangePassedOnRebase != 0 ? 2 : 0));
                 uncoveredSourcesAdopted = uncoveredSources;
                 ++exitsSinceFull;
+                noteExitForDump(2);
                 provedUnrangedProof = unrangedProof;
                 provedUnrangedPending = unrangedPending;
                 if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
@@ -5804,11 +5840,13 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 if (worked) reportVerifiedWork(work);
                 if (worked || stored || !ok) dumpSkippedWork("epoch exit", work);
                 ++exitsSinceFull;
+                noteExitForDump(3);
                 noteEpochProof(true, true, !ok, stored, !stored && endSerial != stamp.proof, worked);
                 return ok;
             }
             if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
             noteEpochProof(true, false, false);
+            noteExitForDump(3);
             if (!certified) epochServed = true;
             return true;
         }
@@ -5887,6 +5925,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         provedRanges = !flushUnscoped;
         if (provedRanges) recordProofRanges();
         if (exitScopeProfiled()) storeExitScope(scopeAtStamp);
+        noteExitForDump(0);
         if (!ok || std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->HasReuseLookup(); })) proved.epoch = 0;
         if (counted) {
             provedAge = stampAge(stamp, currentExitStamp(), flushBreaks, trace->Count());
@@ -5956,6 +5995,7 @@ bool ShaderResources::proofBytesUnchanged(std::size_t index, std::uint64_t begin
     const auto rebase = GuestMemory::SnapshotMatches(snapshot->first, snapshot->second);
     const bool same = rebase != 0;
     if (same && index < proofRangeGenerations.size() && rebase > proofRangeGenerations[index]) {
+        if (GuestMemory::StampTraceCovers(begin, end - begin)) std::fprintf(stderr, "[stamp] set %p rebased proof range %zu 0x%llx+0x%llx: generation %llu -> %llu, proved generation %llu, write generation now %llu\n", static_cast<const void*>(this), index, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(proofRangeGenerations[index]), static_cast<unsigned long long>(rebase), static_cast<unsigned long long>(provedGeneration), static_cast<unsigned long long>(GuestMemory::WriteGeneration()));
         proofRangeGenerations[index] = rebase;
         if (counted) rangeWriteCounts().rebased.Add();
     }

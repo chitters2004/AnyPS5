@@ -2540,6 +2540,24 @@ std::atomic<int> flushFailureFiredForTest{0};
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
+    struct GenerationTrace {
+        const StorageTexture& image;
+        const bool on;
+        const std::uint64_t before;
+        const std::uint64_t oldest;
+        const std::uint64_t newest;
+        const char* path = "returned early";
+        std::uint32_t rewatchAdopted = 0;
+        std::uint32_t advancedUnits = 0;
+        ~GenerationTrace() {
+            if (!on) return;
+            const auto oldestNow = image.layerGeneration.empty() ? 0 : *std::min_element(image.layerGeneration.begin(), image.layerGeneration.end());
+            const auto newestNow = image.layerGeneration.empty() ? 0 : *std::max_element(image.layerGeneration.begin(), image.layerGeneration.end());
+            std::fprintf(stderr, "[stamp] image %p 0x%llx+0x%llx refresh %s (units adopted on a rewatch proof %u, advanced as unstamped %u): generation %llu -> %llu, layer generations %llu..%llu -> %llu..%llu, write generation now %llu\n", static_cast<const void*>(&image), static_cast<unsigned long long>(image.descriptor.baseAddress), static_cast<unsigned long long>(image.guestBytes), path, rewatchAdopted, advancedUnits, static_cast<unsigned long long>(before), static_cast<unsigned long long>(image.generation), static_cast<unsigned long long>(oldest), static_cast<unsigned long long>(newest), static_cast<unsigned long long>(oldestNow), static_cast<unsigned long long>(newestNow), static_cast<unsigned long long>(GuestMemory::WriteGeneration()));
+        }
+    };
+    const bool traced = GuestMemory::StampTraceCovers(descriptor.baseAddress, guestBytes);
+    GenerationTrace generationTrace{*this, traced, generation, traced && !layerGeneration.empty() ? *std::min_element(layerGeneration.begin(), layerGeneration.end()) : 0, traced && !layerGeneration.empty() ? *std::max_element(layerGeneration.begin(), layerGeneration.end()) : 0};
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
@@ -2549,6 +2567,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         EpochProofCounts().storageReuses.Add();
+        generationTrace.path = "held by the epoch proof";
         return true;
     }
     const auto proofBefore = GuestMemory::ProofSerial();
@@ -2566,6 +2585,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         if (profile && keyProof.pendingNote != 0) refreshesProvedPendingKeys.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
+        generationTrace.path = "proved";
         return true;
     }
     refreshProof = {};
@@ -2732,6 +2752,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
                 scanBlocks();
                 for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
                     if (stampedBlocks[unit] == 0) {
+                        ++generationTrace.advancedUnits;
                         layerGeneration[unit] = advanceUnchanged(unit, currentFor(unit));
                         continue;
                     }
@@ -2745,6 +2766,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
                 if (GuestMemory::UnchangedSince(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)), layerGeneration[layer])) continue;
                 if (!keysChanged && rewatchProof(layerBegin(layer), layerBegin(layer) + layerBytes(layer), false) == RewatchProof::Unchanged) {
                     rewatchedConfirms.fetch_add(1, std::memory_order_relaxed);
+                    ++generationTrace.rewatchAdopted;
                     layerGeneration[layer] = currentFor(layer);
                     continue;
                 }
@@ -2821,6 +2843,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     if (scoped) noteLayersBehind(firstLayer, lastLayer, outside);
     else layerBehind.clear();
     if (unchanged) {
+        generationTrace.path = "unchanged adoption";
         ++Profile().storageReused;
         if (const auto hook = refreshUnchangedHookForTest.load(std::memory_order_acquire)) hook(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -2831,6 +2854,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
+    generationTrace.path = "upload";
     ProofWorkTrace::NoteUpload(descriptor.baseAddress, guestBytes);
     CaptureTrace::Log("refresh image=%llx bytes=%llu generation=%llu dirty=%d keysChanged=%d cpuWrote=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), dirty, keysChanged, cpuWrote);
     // Debug aid: APS5_TRACE_UPLOAD names why a storage image is uploaded again.
@@ -5105,6 +5129,7 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
 }
 
 void StorageTexture::Flush(const char* reason) {
+    if (GuestMemory::StampTraceCovers(descriptor.baseAddress, guestBytes)) std::fprintf(stderr, "[stamp] image %p 0x%llx+0x%llx flushed for %s: generation %llu, pending %d, write generation now %llu\n", static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), reason != nullptr ? reason : "unnamed", static_cast<unsigned long long>(generation), layerPending.Any() ? 1 : 0, static_cast<unsigned long long>(GuestMemory::WriteGeneration()));
     for (const auto& source : std::exchange(adoptedSources, {})) source->Flush();
     storeTrappedOverlaps(reason);
     countStorageEviction(reason);
