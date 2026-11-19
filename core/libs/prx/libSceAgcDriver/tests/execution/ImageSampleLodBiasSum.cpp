@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "Recompiler.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
@@ -174,8 +175,9 @@ void Check(const Case& sample, bool llvmpipe) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        const bool tableCounters = argc == 2 && std::string(argv[1]) == "--table-counters";
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         FillTexture();
@@ -205,6 +207,11 @@ int main() {
             Require(!registration || module == firstModule, "image sample LOD bias sum: a registration module changed with the S# LOD bias field " + std::to_string(sample.field));
         }
         Require(!libraries || fragmentParts() == partsBefore + 1u, "image sample LOD bias sum: draws that differ only in S# fields built " + std::to_string(fragmentParts() - partsBefore) + " fragment library parts instead of one");
+        if (tableCounters) {
+            const auto line = ShaderRecompiler::ModuleVariantsLine();
+            const std::string served = "draw lookups " + std::to_string(cases.size()) + " (served by a module a registration built 0, by one an earlier draw built " + std::to_string(cases.size() - 1u) + ", built at the draw 1)";
+            Require(!registration || line.find(served) != std::string::npos, "image sample LOD bias sum: the registration module table did not serve every later draw from the first draw's module: " + line);
+        }
         std::puts("image sample LOD bias sum tests passed");
         return 0;
     } catch (const std::exception& error) {
