@@ -5009,6 +5009,7 @@ void RunDepthExpandPass(const Context& context, const DepthExpandPass& pass) {
         if (address == 0) continue;
         const auto planeFormat = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
         const auto destination = CachedStorageSurface(context, depthPlaneView(address, source.extent, planeFormat));
+        if (destination != nullptr) destination->NoteFirstUse(StorageTexture::FirstUse::Other);
         if (destination == nullptr) throw failure(address, "without a storage image of the write base");
         const ExpandKey key{context.device, address};
         enum class Read { Surface, Clear, GuestBytes } read = Read::Surface;
@@ -5035,6 +5036,7 @@ void RunDepthExpandPass(const Context& context, const DepthExpandPass& pass) {
         if (read == Read::Clear) recordPlaneClear(context, destination, source.clearDepth);
         if (read == Read::GuestBytes) {
             const auto plane = CachedStorageSurface(context, depthPlaneView(stencil ? source.stencilAddress : source.address, source.extent, planeFormat));
+            if (plane != nullptr) plane->NoteFirstUse(StorageTexture::FirstUse::Other);
             if (plane == nullptr) throw failure(address, "without a storage image of the read base");
             recordPlaneCopy(context, plane, destination, source.extent);
         }

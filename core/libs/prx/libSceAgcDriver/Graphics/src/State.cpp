@@ -1580,6 +1580,28 @@ static bool SignedNormalizedFormat(VkFormat format) {
     return format == VK_FORMAT_R8_SNORM || format == VK_FORMAT_R16_SNORM || format == VK_FORMAT_R8G8_SNORM || format == VK_FORMAT_R16G16_SNORM || format == VK_FORMAT_R8G8B8A8_SNORM || format == VK_FORMAT_B8G8R8A8_SNORM || format == VK_FORMAT_R16G16B16A16_SNORM;
 }
 
+static std::uint32_t FormatChannelMask(VkFormat format) {
+    const auto value = static_cast<int>(format);
+    if ((value >= VK_FORMAT_R8_UNORM && value <= VK_FORMAT_R8_SRGB) || (value >= VK_FORMAT_R16_UNORM && value <= VK_FORMAT_R16_SFLOAT) || (value >= VK_FORMAT_R32_UINT && value <= VK_FORMAT_R32_SFLOAT)) return 0x1u;
+    if ((value >= VK_FORMAT_R8G8_UNORM && value <= VK_FORMAT_R8G8_SRGB) || (value >= VK_FORMAT_R16G16_UNORM && value <= VK_FORMAT_R16G16_SFLOAT) || (value >= VK_FORMAT_R32G32_UINT && value <= VK_FORMAT_R32G32_SFLOAT)) return 0x3u;
+    if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) return 0x7u;
+    return 0xfu;
+}
+
+bool FullExtentDraw(const State& state, const ColorTarget& color) {
+    const auto& blend = color.exportIndex < state.blends.size() ? state.blends[color.exportIndex] : state.blend;
+    const auto needed = FormatChannelMask(color.format);
+    if (state.rasterizerDiscard || blend.blendEnable || (blend.colorWriteMask & needed) != needed || color.partialWriteMask != 0 || color.staged || state.colorRop != 0xccu) return false;
+    if (state.depthTest || state.stencilTest || state.alphaToCoverage || state.ditheredAlphaToCoverage) return false;
+    const auto width = static_cast<std::int64_t>(color.extent.width);
+    const auto height = static_cast<std::int64_t>(color.extent.height);
+    if (state.scissor.offset.x > 0 || state.scissor.offset.y > 0 || state.scissor.offset.x + static_cast<std::int64_t>(state.scissor.extent.width) < width || state.scissor.offset.y + static_cast<std::int64_t>(state.scissor.extent.height) < height) return false;
+    const auto& viewport = state.viewport;
+    const auto top = std::min(viewport.y, viewport.y + viewport.height);
+    const auto bottom = std::max(viewport.y, viewport.y + viewport.height);
+    return viewport.x <= 0.0f && viewport.x + viewport.width >= static_cast<float>(width) && top <= 0.0f && bottom >= static_cast<float>(height);
+}
+
 static std::uint32_t NormalizedChannelMask(VkFormat format) {
     switch (format) {
         case VK_FORMAT_R8_SNORM:

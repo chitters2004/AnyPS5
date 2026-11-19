@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -153,6 +154,73 @@ void RequireCensus(const StorageTexture::FormatAliasCensus& base, std::uint64_t 
     Require(counted == uploads && paired == afterWriteBack && bytes == uploads * SurfaceBytes, std::string(what) + ": " + std::to_string(counted) + " aliased uploads (" + std::to_string(bytes) + " bytes), " + std::to_string(paired) + " after a write-back; expected " + std::to_string(uploads) + " and " + std::to_string(afterWriteBack));
 }
 
+void FullExtentRule() {
+    using AgcDriver::Graphics::ColorTarget;
+    using AgcDriver::Graphics::FullExtentDraw;
+    using AgcDriver::Graphics::State;
+    const auto full = [] {
+        State state{};
+        state.blends.resize(1);
+        state.blends[0].colorWriteMask = 0xfu;
+        state.colorRop = 0xccu;
+        state.scissor = {{0, 0}, {64, 32}};
+        state.viewport = {0.0f, 0.0f, 64.0f, 32.0f, 0.0f, 1.0f};
+        return state;
+    };
+    ColorTarget color{};
+    color.extent = {64, 32};
+    color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    int cases = 0;
+    const auto expect = [&](bool expected, const State& state, const ColorTarget& target, const char* what) {
+        Require(FullExtentDraw(state, target) == expected, std::string("full-extent draw rule: ") + what + (expected ? " is not a full-extent draw" : " is a full-extent draw"));
+        ++cases;
+    };
+    expect(true, full(), color, "the full state");
+    auto state = full();
+    state.viewport = {0.0f, 32.0f, 64.0f, -32.0f, 0.0f, 1.0f};
+    expect(true, state, color, "a flipped viewport over the target");
+    state = full();
+    state.blends[0].colorWriteMask = 0x1u;
+    auto narrowColor = color;
+    narrowColor.format = VK_FORMAT_R32_UINT;
+    expect(true, state, narrowColor, "a red-only mask on a one-channel target");
+    expect(false, state, color, "a red-only mask on a four-channel target");
+    state = full();
+    state.blends[0].blendEnable = VK_TRUE;
+    expect(false, state, color, "blending");
+    state = full();
+    state.scissor = {{0, 0}, {64, 31}};
+    expect(false, state, color, "a scissor short of the target");
+    state = full();
+    state.scissor = {{1, 0}, {64, 32}};
+    expect(false, state, color, "a scissor offset into the target");
+    state = full();
+    state.viewport = {0.0f, 0.0f, 63.0f, 32.0f, 0.0f, 1.0f};
+    expect(false, state, color, "a viewport short of the target");
+    state = full();
+    state.viewport = {0.0f, 1.0f, 64.0f, 32.0f, 0.0f, 1.0f};
+    expect(false, state, color, "a viewport offset into the target");
+    state = full();
+    state.depthTest = true;
+    expect(false, state, color, "a depth test");
+    state = full();
+    state.stencilTest = true;
+    expect(false, state, color, "a stencil test");
+    state = full();
+    state.alphaToCoverage = true;
+    expect(false, state, color, "alpha to coverage");
+    state = full();
+    state.colorRop = 0x88u;
+    expect(false, state, color, "a logic operation");
+    state = full();
+    state.rasterizerDiscard = true;
+    expect(false, state, color, "rasterizer discard");
+    auto partial = color;
+    partial.partialWriteMask = 0x3u;
+    expect(false, full(), partial, "a partial packed write");
+    std::printf("full-extent draw rule: %d cases\n", cases);
+}
+
 void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool counted) {
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     const auto surface = AddressOf(texels);
@@ -182,6 +250,9 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool counted) {
     AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
     Require(FloatImage(context, texels) == sampled, "the float lookup made a third image after the CPU write");
     RequireCensus(base, 3 * on, 2 * on, "the float image refreshed after a CPU write");
+    const char* refusal = nullptr;
+    const std::array<std::uint32_t, 4> zero{};
+    Require(sampled->FillClear(std::span<const std::uint32_t, 4>(zero), StorageTexture::WholeImage, refusal), std::string("the float image refused a whole-image clear: ") + (refusal != nullptr ? refusal : "no reason"));
     const auto narrow = FloatImage(context, texels, Format8UNorm);
     Require(narrow != nullptr && narrow != sampled && narrow != written, "the 8-bit lookup did not make a third image over the surface");
     Require(StorageTexture::FormatAliasTotals().uploads - base.uploads == 4 * on, "the 8-bit image's upload was not counted as aliased");
@@ -198,6 +269,7 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        FullExtentRule();
         Run(*device, block.Data(), counted);
         std::printf("storage format alias census tests passed (%s)\n", counted ? "counted" : "not counted");
         return 0;

@@ -514,6 +514,8 @@ public:
     // False, naming why in `refusal`, when the fill must be stored as before.
     static constexpr std::uint32_t WholeImage = ~0u;
     bool FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal, bool allowRegisterClear = false);
+    enum class FirstUse : std::uint8_t { Clear, FullDraw, PartialDraw, SampledRead, StorageRead, StorageWrite, Other, Count };
+    void NoteFirstUse(FirstUse use);
     // The cached, live image whose surface is exactly [address, address + bytes), if any (the newest
     // of several: see ClassifyFill).
     static std::shared_ptr<StorageTexture> FindLive(std::uint64_t address, std::uint64_t bytes);
@@ -748,6 +750,8 @@ private:
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration(std::source_location where = std::source_location::current());
     void noteFormatAliasUpload(std::uint64_t bytes);
+    bool fillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal, bool allowRegisterClear);
+    static void reportFirstUses();
     std::uint64_t advanceUnchanged(std::uint32_t unit, std::uint64_t to);
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
     bool refreshProved();
@@ -948,6 +952,9 @@ private:
     std::atomic<std::uint64_t> aliasUploadBytes{0};
     std::atomic<std::uint64_t> aliasUploads{0};
     std::atomic<std::uint64_t> windowWriteBacks{0};
+    std::atomic<std::uint64_t> firstUseBytes{0};
+    std::atomic<std::uint64_t> firstUseUploads{0};
+    std::atomic<bool> firstUseAfterWriteBack{false};
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
     // Hook skips of this image since FlushPending last listed it (AccessKeptByCpu), the read site

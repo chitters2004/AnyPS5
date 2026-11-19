@@ -258,6 +258,7 @@ struct ReversedBlend {
 ReversedBlend TranslateReversedBlend(std::uint32_t blendControl, std::uint8_t componentMapping, VkFormat format, bool forceDestinationAlphaOne, const std::array<float, 4>& constants);
 std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);
+bool FullExtentDraw(const State& state, const ColorTarget& color);
 GuestTextureResource SurfaceForTarget(const ColorTarget& color);
 GuestTextureResource ArraySurfaceForTarget(const ColorTarget& color);
 

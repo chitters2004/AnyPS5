@@ -3471,6 +3471,7 @@ bool AliasCopy(const Graphics::Context& context, std::uint64_t destination, std:
         resource.baseAddress = destination;
         resource.dccAddress = 0;
         plan.to = Graphics::CachedStorageSurface(context, resource);
+        if (plan.to != nullptr) plan.to->NoteFirstUse(Graphics::StorageTexture::FirstUse::Other);
         copyAliasCreated.fetch_add(1, std::memory_order_relaxed);
     }
     const char* refusal = nullptr;

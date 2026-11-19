@@ -4769,6 +4769,9 @@ void StorageTexture::noteFormatAliasUpload(std::uint64_t bytes) {
         }
         lastAliasUpload = writeBackSequence.load(std::memory_order_relaxed);
     }
+    firstUseBytes.fetch_add(bytes, std::memory_order_relaxed);
+    firstUseUploads.fetch_add(1, std::memory_order_relaxed);
+    if (afterWriteBack) firstUseAfterWriteBack.store(true, std::memory_order_relaxed);
     auto& counts = formatAliasCounts();
     if (otherFormat) {
         counts.uploads.fetch_add(1, std::memory_order_relaxed);
@@ -4789,6 +4792,58 @@ void StorageTexture::noteFormatAliasUpload(std::uint64_t bytes) {
         counts.totalLayoutUploads.fetch_add(1, std::memory_order_relaxed);
         counts.totalLayoutBytes.fetch_add(bytes, std::memory_order_relaxed);
     }
+}
+
+struct FirstUseCounts {
+    std::array<std::array<std::atomic<std::uint64_t>, 2>, static_cast<std::size_t>(StorageTexture::FirstUse::Count)> uploads{};
+    std::array<std::array<std::atomic<std::uint64_t>, 2>, static_cast<std::size_t>(StorageTexture::FirstUse::Count)> bytes{};
+};
+
+FirstUseCounts& firstUseCounts() {
+    static FirstUseCounts counts;
+    return counts;
+}
+
+void StorageTexture::NoteFirstUse(FirstUse use) {
+    if (!formatAliasesCounted()) return;
+    const auto bytes = firstUseBytes.exchange(0, std::memory_order_relaxed);
+    if (bytes == 0) return;
+    const auto uploads = firstUseUploads.exchange(0, std::memory_order_relaxed);
+    const auto after = firstUseAfterWriteBack.exchange(false, std::memory_order_relaxed) ? 1u : 0u;
+    auto& counts = firstUseCounts();
+    counts.uploads[static_cast<std::size_t>(use)][after].fetch_add(uploads, std::memory_order_relaxed);
+    counts.bytes[static_cast<std::size_t>(use)][after].fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void StorageTexture::reportFirstUses() {
+    constexpr std::array<const char*, static_cast<std::size_t>(FirstUse::Count)> names{"clear", "full-extent draw", "partial draw", "sampled read", "storage read", "storage write (extent unknown)", "other"};
+    const auto mib = [](std::uint64_t value) { return static_cast<double>(value) / 1048576.0; };
+    auto& counts = firstUseCounts();
+    std::array<std::string, 2> lists;
+    for (std::size_t after = 0; after < 2; ++after) {
+        for (std::size_t use = 0; use < names.size(); ++use) {
+            char entry[96];
+            const auto uploads = counts.uploads[use][after].exchange(0, std::memory_order_relaxed);
+            const auto bytes = counts.bytes[use][after].exchange(0, std::memory_order_relaxed);
+            std::snprintf(entry, sizeof(entry), "%s%s %llu (%.1f MiB)", use == 0 ? "" : ", ", names[use], static_cast<unsigned long long>(uploads), mib(bytes));
+            lists[after] += entry;
+        }
+    }
+    std::size_t waiting = 0;
+    std::uint64_t waitingUploads = 0;
+    std::uint64_t waitingBytes = 0;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (const auto* texture : live.textures) {
+            const auto bytes = texture->firstUseBytes.load(std::memory_order_relaxed);
+            if (bytes == 0 || texture->released) continue;
+            ++waiting;
+            waitingUploads += texture->firstUseUploads.load(std::memory_order_relaxed);
+            waitingBytes += bytes;
+        }
+    }
+    std::fprintf(stderr, "[textures] first GPU use after an upload (10 s, APS5_PROFILE_DRAW; a full-extent draw has scissor and viewport over the whole target, no blend, every channel of the format written, a copy ROP, no depth, stencil or alpha-to-coverage test, geometry coverage not checked): uploads with no other image's write-back over the range before them: %s; uploads after another image's write-back over the range: %s; awaiting a first use now: %zu images, %llu uploads (%.1f MiB)\n", lists[0].c_str(), lists[1].c_str(), waiting, static_cast<unsigned long long>(waitingUploads), mib(waitingBytes));
 }
 
 StorageTexture::FormatAliasCensus StorageTexture::FormatAliasTotals() {
@@ -4877,6 +4932,7 @@ void StorageTexture::ReportFormatAliases() {
     const auto layoutBytes = counts.layoutBytes.exchange(0, std::memory_order_relaxed);
     const auto mib = [](std::uint64_t value) { return static_cast<double>(value) / 1048576.0; };
     std::fprintf(stderr, "[textures] format aliases (10 s, APS5_PROFILE_DRAW): %zu guest ranges under storage images of different formats now (%zu images, %.1f MiB; %zu ranges with every format the same texel size); %llu uploads of such images (%.1f MiB), %llu of them after another image's write-back over the range (%.1f MiB); same format, other layout: %llu uploads (%.1f MiB); top range 0x%llx+0x%llx formats %s (guest/vk): %.1f MiB uploaded; since start %llu uploads (%.1f MiB), %llu after a write-back (%.1f MiB)\n", ranges, aliasedImages, mib(rangeBytes), compatibleRanges, static_cast<unsigned long long>(uploads), mib(bytes), static_cast<unsigned long long>(afterWriteBack), mib(afterWriteBackBytes), static_cast<unsigned long long>(layoutUploads), mib(layoutBytes), static_cast<unsigned long long>(topBegin), static_cast<unsigned long long>(topEnd - topBegin), topFormats.empty() ? "none" : topFormats.c_str(), mib(topBytes), static_cast<unsigned long long>(counts.totalUploads.load(std::memory_order_relaxed)), mib(counts.totalBytes.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.totalAfterWriteBack.load(std::memory_order_relaxed)), mib(counts.totalAfterWriteBackBytes.load(std::memory_order_relaxed)));
+    reportFirstUses();
     constexpr std::size_t ListedRanges = 8;
     std::sort(listed.begin(), listed.end(), [](const Listed& left, const Listed& right) { return left.uploaded > right.uploaded; });
     if (listed.size() > ListedRanges) listed.resize(ListedRanges);
@@ -6941,6 +6997,12 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
 }
 
 bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal, bool allowRegisterClear) {
+    const bool filled = fillClear(pattern, layer, refusal, allowRegisterClear);
+    if (filled && layer == WholeImage) NoteFirstUse(FirstUse::Clear);
+    return filled;
+}
+
+bool StorageTexture::fillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal, bool allowRegisterClear) {
     // Debug aid (APS5_TRACE_FILL_COVER=1): the first layer covers refused, with the surface, the
     // pattern and the generation the refusal was memoized at (ClassifyFill's layerRefusedGeneration).
     static const bool trace = std::getenv("APS5_TRACE_FILL_COVER") != nullptr;

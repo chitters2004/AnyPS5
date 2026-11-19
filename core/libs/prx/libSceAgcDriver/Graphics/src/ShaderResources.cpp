@@ -642,6 +642,7 @@ private:
 void refreshForView(StorageTexture& source, const GuestTextureResource& resource) {
     if (resource.dimension == TextureDimension::k2D && source.ImageLayers() > 1) source.RefreshLayers(resource.baseArray, 1);
     else source.Refresh();
+    source.NoteFirstUse(StorageTexture::FirstUse::SampledRead);
 }
 
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0, bool written = false, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers = std::nullopt, bool sampledLookup = false, std::source_location where = std::source_location::current());
@@ -732,7 +733,9 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
         }
     }
     try {
-        return cachedStorageTexture(context, {}, resource, 0, guestBytes, false, std::nullopt, true, where);
+        auto source = cachedStorageTexture(context, {}, resource, 0, guestBytes, false, std::nullopt, true, where);
+        if (source != nullptr) source->NoteFirstUse(StorageTexture::FirstUse::SampledRead);
+        return source;
     } catch (const std::exception& error) {
         counters.storageFallbacks.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard lock(failures.mutex);
@@ -4114,6 +4117,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         // The cache's image of the key is this source while it is cached (an entry is replaced
         // only after its image left the cache), so the lookup would refresh and return it.
         source->Refresh();
+        source->NoteFirstUse(StorageTexture::FirstUse::SampledRead);
         overlap.sourceRefreshed = true;
         return OwnRefreshFallback::Count;
     };
@@ -4125,6 +4129,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         if (i >= storageKeys.size() || !StorageImageServesKeys(*image, storageKeys[i])) return OwnRefreshFallback::Keys;
         countOwnRefresh(true);
         image->Refresh();
+        image->NoteFirstUse(i < storageWritten.size() && storageWritten[i] ? StorageTexture::FirstUse::StorageWrite : StorageTexture::FirstUse::StorageRead);
         return OwnRefreshFallback::Count;
     };
     std::size_t textureIndex = 0;
@@ -7869,6 +7874,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, written));
+        if (storageTextures.back() != nullptr) storageTextures.back()->NoteFirstUse(written ? StorageTexture::FirstUse::StorageWrite : StorageTexture::FirstUse::StorageRead);
         storageMips.push_back(mip);
         storageKeys.push_back(resource.dccAddress);
         storageFirstLayer.push_back(firstLayer);
@@ -8432,6 +8438,7 @@ void ShaderResources::resolveImageTables() {
                 const bool uintStorage = element < binding.imageUintStorage.size() && binding.imageUintStorage[element];
                 try {
                     auto texture = cachedStorageTexture(context, words, resource, mip, guestBytes, true);
+                    if (texture != nullptr) texture->NoteFirstUse(StorageTexture::FirstUse::StorageWrite);
                     if (uintStorage && texture != nullptr) texture->StorageView(mip, firstLayer, true);
                     storageTextures.push_back(std::move(texture));
                 } catch (const std::runtime_error& error) {

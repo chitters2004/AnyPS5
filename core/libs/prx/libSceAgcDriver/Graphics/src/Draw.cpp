@@ -2114,7 +2114,10 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         std::lock_guard lock(reportMutex);
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
-    if (resident != nullptr) materializeCmaskClear(context, color, resident);
+    if (resident != nullptr) {
+        materializeCmaskClear(context, color, resident);
+        resident->NoteFirstUse(FullExtentDraw(state, color) ? StorageTexture::FirstUse::FullDraw : StorageTexture::FirstUse::PartialDraw);
+    }
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;
@@ -4679,6 +4682,7 @@ namespace {
 std::shared_ptr<StorageTexture> metadataPassResident(const Context& context, const ColorTarget& color) {
     if (ColorTileModeIsLinear(color.tileMode) || context.detiler == nullptr) return nullptr;
     const auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
+    if (resident != nullptr) resident->NoteFirstUse(StorageTexture::FirstUse::Other);
     return resident != nullptr && resident->GuestBytes() == color.bytes ? resident : nullptr;
 }
 
@@ -4710,6 +4714,7 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
         const auto& destination = pass.targets.front();
         Require(!ColorTileModeIsLinear(destination.tileMode) && context.detiler != nullptr, "CB resolve into a target without a resident image is not implemented");
         const auto resident = CachedStorageSurface(context, SurfaceForTarget(destination));
+        resident->NoteFirstUse(StorageTexture::FirstUse::Other);
         Require(resident->Attachable(), "storage format cannot be a color attachment");
         ResolveMultisampleTarget(context, *pass.source, *resident, resident->AttachmentView(destination.format, destination.mip));
         return;
