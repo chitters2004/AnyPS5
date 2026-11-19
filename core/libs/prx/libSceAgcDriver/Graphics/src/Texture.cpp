@@ -2561,6 +2561,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     };
     const bool traced = GuestMemory::StampTraceCovers(descriptor.baseAddress, guestBytes);
     GenerationTrace generationTrace{*this, traced, generation, traced && !layerGeneration.empty() ? *std::min_element(layerGeneration.begin(), layerGeneration.end()) : 0, traced && !layerGeneration.empty() ? *std::max_element(layerGeneration.begin(), layerGeneration.end()) : 0};
+    const ProofWorkTrace::ObjectScope workObject{this};
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
