@@ -51,6 +51,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_resource_cache_epoch_verify_work PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_resource_cache_epoch_verify_bound_work COMMAND agc_driver_sampled_cache_budget_tests resource-epoch-verify-bound-work)
+    set_tests_properties(agc_driver_resource_cache_epoch_verify_bound_work PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_DRAW_PIPELINE=1;APS5_WRITE_WATCH_IMPORTS=watch" SKIP_RETURN_CODE 77 TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "work on images no binding of set [^\n]* reads was not counted as skipped: 1 storage image uploads, 0 CPU write syncs\n.*verify: 2 reused resource proofs checked, 0 failed, 0 where the full proof stored to guest memory, 0 where only other threads broke proofs meanwhile, 0 where the full proof did work the exit skipped.*did work the exit skipped: 0 CPU write syncs, 1 storage image uploads \\(the set's storage images: 0x.*work on images no binding of set [^\n]* reads was not counted as skipped: 1 storage image uploads, 0 CPU write syncs\n.*did work the exit skipped: 0 CPU write syncs, 1 storage image uploads \\(the set's storage images: none; 1 sampled textures.*verify: 8 reused resource proofs checked, 0 failed, 0 where the full proof stored to guest memory, 0 where only other threads broke proofs meanwhile, 2 where the full proof did work the exit skipped.*bound work \\(sampled view\\): the bound image.*resource cache epoch verify bound work tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:")
+    if(WIN32)
+        set_tests_properties(agc_driver_resource_cache_epoch_verify_bound_work PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_resource_cache_epoch_gpu_label COMMAND agc_driver_sampled_cache_budget_tests resource-epoch-gpu-label)
     set_tests_properties(agc_driver_resource_cache_epoch_gpu_label PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_WRITE_WATCH_IMPORTS=watch" SKIP_RETURN_CODE 77 TIMEOUT 30
         PASS_REGULAR_EXPRESSION "gpu label: a label stored on the GPU over a sampled view of a storage image kept the exit: submit end no, completion no\n.*gpu label: a label stored on the GPU outside the set kept the exit: yes\n.*resource cache epoch GPU label tests passed"
