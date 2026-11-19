@@ -299,7 +299,7 @@ public:
         CreationHandOver& operator=(CreationHandOver&&) = default;
         ~CreationHandOver();
     };
-    static std::shared_ptr<StorageTexture> Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
+    static std::shared_ptr<StorageTexture> Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, const char* creator = __builtin_FUNCTION(), unsigned creatorLine = __builtin_LINE());
     static CreationHandOver PrepareCreation(const Context& context, const GuestTextureResource& descriptor, std::uint64_t guestBytes, std::shared_ptr<StorageTexture> detached, bool& flushed);
     void AdoptHandOver(CreationHandOver handOver);
     ~StorageTexture();

@@ -1763,7 +1763,7 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format) {
     return proxy;
 }
 
-std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) {
+std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, const char* creator, unsigned creatorLine) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     static const bool unwatchHooked = [] {
@@ -1773,6 +1773,7 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     static_cast<void>(unwatchHooked);
     const MapImportGate::PublishHold publication(descriptor.baseAddress, DescribeSurface(descriptor).guestBytes);
     auto texture = std::shared_ptr<StorageTexture>(new StorageTexture(context, detiler, descriptor, mipLevel));
+    if (GuestMemory::StampTraceCovers(descriptor.baseAddress, texture->guestBytes)) std::fprintf(stderr, "[stamp] image %p 0x%llx+0x%llx created by %s (line %u): %ux%u format %u mip %u of %u, tile mode %u, dcc 0x%llx, storage format %d, write generation %llu\n", static_cast<const void*>(texture.get()), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), creator, creatorLine, descriptor.width, descriptor.height, descriptor.format, mipLevel, descriptor.mipCount, static_cast<unsigned>(descriptor.tileMode), static_cast<unsigned long long>(descriptor.dccAddress), static_cast<int>(texture->storageFormat), static_cast<unsigned long long>(GuestMemory::WriteGeneration()));
     uploadReason = "first";
     texture->upload();
     texture->defaultMip = mipLevel;
@@ -2549,11 +2550,13 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         const char* path = "returned early";
         std::uint32_t rewatchAdopted = 0;
         std::uint32_t advancedUnits = 0;
+        bool rescuedOnBytes = false;
+        std::int64_t changedBeforeRescue = -1;
         ~GenerationTrace() {
             if (!on) return;
             const auto oldestNow = image.layerGeneration.empty() ? 0 : *std::min_element(image.layerGeneration.begin(), image.layerGeneration.end());
             const auto newestNow = image.layerGeneration.empty() ? 0 : *std::max_element(image.layerGeneration.begin(), image.layerGeneration.end());
-            std::fprintf(stderr, "[stamp] image %p 0x%llx+0x%llx refresh %s (units adopted on a rewatch proof %u, advanced as unstamped %u): generation %llu -> %llu, layer generations %llu..%llu -> %llu..%llu, write generation now %llu\n", static_cast<const void*>(&image), static_cast<unsigned long long>(image.descriptor.baseAddress), static_cast<unsigned long long>(image.guestBytes), path, rewatchAdopted, advancedUnits, static_cast<unsigned long long>(before), static_cast<unsigned long long>(image.generation), static_cast<unsigned long long>(oldest), static_cast<unsigned long long>(newest), static_cast<unsigned long long>(oldestNow), static_cast<unsigned long long>(newestNow), static_cast<unsigned long long>(GuestMemory::WriteGeneration()));
+            std::fprintf(stderr, "[stamp] image %p 0x%llx+0x%llx refresh %s (units adopted on a rewatch proof %u, advanced as unstamped %u, guest bytes equal the uploaded bytes %d with %lld units changed by stamps before the compare, results pending %d): generation %llu -> %llu, layer generations %llu..%llu -> %llu..%llu, write generation now %llu\n", static_cast<const void*>(&image), static_cast<unsigned long long>(image.descriptor.baseAddress), static_cast<unsigned long long>(image.guestBytes), path, rewatchAdopted, advancedUnits, rescuedOnBytes ? 1 : 0, static_cast<long long>(changedBeforeRescue), image.layerPending.Any() ? 1 : 0, static_cast<unsigned long long>(before), static_cast<unsigned long long>(image.generation), static_cast<unsigned long long>(oldest), static_cast<unsigned long long>(newest), static_cast<unsigned long long>(oldestNow), static_cast<unsigned long long>(newestNow), static_cast<unsigned long long>(GuestMemory::WriteGeneration()));
         }
     };
     const bool traced = GuestMemory::StampTraceCovers(descriptor.baseAddress, guestBytes);
@@ -2804,6 +2807,8 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
             if (changed[layer] && layerPending[layer]) pendingChanged = true;
         }
         if (!orderedSkipped && !unchanged && !keysChanged && !pendingChanged && (scoped ? originalHolds(scopeBegin, scopeBytes) : originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) && equalsOriginal()) {
+            generationTrace.rescuedOnBytes = true;
+            generationTrace.changedBeforeRescue = std::count(changed.begin(), changed.end(), true);
             unchanged = true;
             stamped = false;
             if (!scoped) outside.clear();
