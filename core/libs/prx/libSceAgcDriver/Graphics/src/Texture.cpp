@@ -1763,7 +1763,7 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format) {
     return proxy;
 }
 
-std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) {
+std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, std::source_location where) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     static const bool unwatchHooked = [] {
@@ -1781,6 +1781,15 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
+        if (GuestMemory::StampTraceCovers(descriptor.baseAddress, texture->guestBytes)) {
+            std::fprintf(stderr, "[stamp] image %p 0x%llx+0x%llx created at %s:%u: %ux%u format %u storage format %d, mips %u, tile %d, dimension %d, slices %u..%u, dcc 0x%llx, mip %u, generation %llu, write generation now %llu\n", static_cast<const void*>(texture.get()), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), where.file_name(), static_cast<unsigned>(where.line()), descriptor.width, descriptor.height, descriptor.format, static_cast<int>(texture->storageFormat), descriptor.mipCount, static_cast<int>(descriptor.tileMode), static_cast<int>(descriptor.dimension), descriptor.baseArray, descriptor.depthOrLastArray, static_cast<unsigned long long>(descriptor.dccAddress), mipLevel, static_cast<unsigned long long>(texture->generation), static_cast<unsigned long long>(GuestMemory::WriteGeneration()));
+            for (const auto* other : live.textures) {
+                const auto& seen = other->descriptor;
+                if (seen.baseAddress >= descriptor.baseAddress + texture->guestBytes || descriptor.baseAddress >= seen.baseAddress + other->guestBytes) continue;
+                std::fprintf(stderr, "[stamp]   live image %p over it: 0x%llx+0x%llx %ux%u format %u storage format %d, mips %u, tile %d, dimension %d, slices %u..%u, dcc 0x%llx, cached %d, released %d, generation %llu, created at %s:%u\n", static_cast<const void*>(other), static_cast<unsigned long long>(seen.baseAddress), static_cast<unsigned long long>(other->guestBytes), seen.width, seen.height, seen.format, static_cast<int>(other->storageFormat), seen.mipCount, static_cast<int>(seen.tileMode), static_cast<int>(seen.dimension), seen.baseArray, seen.depthOrLastArray, static_cast<unsigned long long>(seen.dccAddress), other->cached.load(std::memory_order_acquire) ? 1 : 0, other->released ? 1 : 0, static_cast<unsigned long long>(other->generation), other->createdAt.file_name(), static_cast<unsigned>(other->createdAt.line()));
+            }
+        }
+        texture->createdAt = where;
         live.textures.push_back(texture.get());
     }
     if (profile) {
@@ -4689,8 +4698,10 @@ std::uint64_t StorageTexture::advanceUnchanged(std::uint32_t unit, std::uint64_t
     return to;
 }
 
-void StorageTexture::refreshGeneration() {
+void StorageTexture::refreshGeneration(std::source_location where) {
+    const auto before = generation;
     generation = *std::min_element(layerGeneration.begin(), layerGeneration.end());
+    if (generation != before && GuestMemory::StampTraceCovers(descriptor.baseAddress, guestBytes)) std::fprintf(stderr, "[stamp] image %p 0x%llx+0x%llx generation %llu -> %llu at %s:%u, write generation now %llu\n", static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(before), static_cast<unsigned long long>(generation), where.file_name(), static_cast<unsigned>(where.line()), static_cast<unsigned long long>(GuestMemory::WriteGeneration()));
 }
 
 std::uint64_t StorageTexture::GenerationFor(std::uint64_t address, std::uint64_t bytes) const {

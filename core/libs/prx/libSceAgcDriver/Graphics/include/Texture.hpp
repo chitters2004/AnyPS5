@@ -20,6 +20,7 @@
 #include <mutex>
 #include <optional>
 #include <functional>
+#include <source_location>
 #include <span>
 #include <tuple>
 #include <utility>
@@ -300,7 +301,7 @@ public:
         CreationHandOver& operator=(CreationHandOver&&) = default;
         ~CreationHandOver();
     };
-    static std::shared_ptr<StorageTexture> Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
+    static std::shared_ptr<StorageTexture> Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, std::source_location where = std::source_location::current());
     static CreationHandOver PrepareCreation(const Context& context, const GuestTextureResource& descriptor, std::uint64_t guestBytes, std::shared_ptr<StorageTexture> detached, bool& flushed);
     void AdoptHandOver(CreationHandOver handOver);
     ~StorageTexture();
@@ -734,7 +735,7 @@ private:
     bool anyLayerPending() const;
     bool refresh(std::uint32_t firstLayer, std::uint32_t lastLayer);
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
-    void refreshGeneration();
+    void refreshGeneration(std::source_location where = std::source_location::current());
     std::uint64_t advanceUnchanged(std::uint32_t unit, std::uint64_t to);
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
     bool refreshProved();
@@ -929,6 +930,7 @@ private:
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
     std::atomic<bool> cached{false};
+    std::source_location createdAt{};
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
     // Hook skips of this image since FlushPending last listed it (AccessKeptByCpu), the read site

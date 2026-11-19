@@ -50,6 +50,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <source_location>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -640,7 +641,7 @@ void refreshForView(StorageTexture& source, const GuestTextureResource& resource
     else source.Refresh();
 }
 
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0, bool written = false, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers = std::nullopt);
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0, bool written = false, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers = std::nullopt, std::source_location where = std::source_location::current());
 
 std::uint64_t heldBytes(const StorageTexture& image) {
     return image.BudgetBytes();
@@ -712,7 +713,7 @@ StorageFailures& StorageFailed() {
 
 // The cached storage image for a sampled descriptor, or null when it cannot be made (then the
 // snapshot path serves the descriptor, as before). Every null return counts as a fallback.
-std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes) {
+std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes, std::source_location where = std::source_location::current()) {
     auto& counters = TextureCounts();
     auto& failures = StorageFailed();
     const auto surface = std::make_pair(resource.baseAddress, guestBytes);
@@ -728,7 +729,7 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
         }
     }
     try {
-        return cachedStorageTexture(context, {}, resource, 0, guestBytes);
+        return cachedStorageTexture(context, {}, resource, 0, guestBytes, false, std::nullopt, where);
     } catch (const std::exception& error) {
         counters.storageFallbacks.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard lock(failures.mutex);
@@ -1453,6 +1454,7 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
 std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it, ReleaseSite site, bool store = true, const char* reason = "cache eviction") {
     auto texture = it->texture;
+    if (GuestMemory::StampTraceCovers(texture->Descriptor().baseAddress, texture->GuestBytes())) std::fprintf(stderr, "[stamp] image %p 0x%llx+0x%llx leaves the storage cache: release site %d, %s, store %d, holders %ld, write generation now %llu\n", static_cast<const void*>(texture.get()), static_cast<unsigned long long>(texture->Descriptor().baseAddress), static_cast<unsigned long long>(texture->GuestBytes()), static_cast<int>(site), reason, store ? 1 : 0, static_cast<long>(texture.use_count()), static_cast<unsigned long long>(GuestMemory::WriteGeneration()));
     bumpTextureReleases(site);
     GuestMemory::NoteHoldPendingBump();
     it->texture->SetCached(false);
@@ -1541,7 +1543,7 @@ static void claimStoredMultisampleMemory(const Context& context, const GuestText
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, std::uint32_t mip, std::uint64_t guestBytes, bool written, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers) {
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, std::uint32_t mip, std::uint64_t guestBytes, bool written, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers, std::source_location where) {
     const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (viewed.baseAddress != requested.baseAddress) guestBytes = 0;
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
@@ -1603,7 +1605,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             std::shared_ptr<StorageTexture> created;
             {
                 const CacheHold reclaimable(storageCacheReclaimable);
-                created = StorageTexture::Create(context, *context.detiler, resource, mip);
+                created = StorageTexture::Create(context, *context.detiler, resource, mip, where);
             }
             created->AdoptHandOver(std::move(handOver));
             CachedStorageTexture entry{key, mip, std::move(created)};
