@@ -154,6 +154,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     for (std::size_t rank = 0; rank < variants.size(); ++rank) {
                         const auto& variant = variants[rank];
                         if (variant->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variant->registeredViews)) continue;
+                        ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::PushBudget);
                         if (variant->pushOffset != cursor || variant->compiled->pushConstants.size() > pushBudget) continue;
                         if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh && !std::equal(variant->meshIndexDescriptor.begin(), variant->meshIndexDescriptor.end(), programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord)) {
                             if (!anyLayout) outcome = EntryOutcome::Differing;

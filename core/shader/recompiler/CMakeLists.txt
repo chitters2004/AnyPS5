@@ -291,6 +291,7 @@ function(add_shader_recompiler target runtimeTarget)
             SetResultMemoShareGate
             SetResultMemoRotateGate
             NoteResultHolder
+            NoteResultRead
             Recompile
             RecompileCacheKey::ContextHash
             RecompileCacheKey::SealFeatureDigest

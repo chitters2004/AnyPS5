@@ -156,8 +156,14 @@ unsigned BrightestColorByte() {
 void ThirdDrawHitsTheCache(bool libraries) {
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    const auto readsBefore = ShaderRecompiler::ResultMemoReseenCounts().reads;
     const auto counters = Submit(32.0f, {1.0f, 1.0f, 1.0f});
+    const auto readsAfter = ShaderRecompiler::ResultMemoReseenCounts().reads;
     const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const auto readDelta = [&](ShaderRecompiler::ResultRead site) { return readsAfter[static_cast<std::size_t>(site)] - readsBefore[static_cast<std::size_t>(site)]; };
+    const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    Require(readDelta(ShaderRecompiler::ResultRead::DrawHit) == (profiled ? 2u : 0u), mode + ": the draw-cache hit counted " + std::to_string(readDelta(ShaderRecompiler::ResultRead::DrawHit)) + " whole-result reads of its variants, expected " + (profiled ? "2, one per stage" : "none without APS5_PROFILE_DRAW"));
+    Require(profiled ? readDelta(ShaderRecompiler::ResultRead::PushBudget) >= 2u && readDelta(ShaderRecompiler::ResultRead::VariantValidate) >= 2u : readDelta(ShaderRecompiler::ResultRead::PushBudget) == 0u, mode + ": the draw-cache hit's lookup counted " + std::to_string(readDelta(ShaderRecompiler::ResultRead::PushBudget)) + " push-budget and " + std::to_string(readDelta(ShaderRecompiler::ResultRead::VariantValidate)) + " validation reads of its variants");
     const auto layout = counters.misses[static_cast<std::size_t>(DrawMiss::Layout)];
     Require(counters.lookups == 3 && counters.absent == 2, mode + ": the three draws made " + std::to_string(counters.lookups) + " draw-cache lookups (" + std::to_string(counters.absent) + " without an entry), expected 3 lookups with 2 absent");
     Require(counters.inserts == 1, mode + ": the three draws inserted " + std::to_string(counters.inserts) + " draw entries, expected 1: a key is cached the second time it is seen");

@@ -287,6 +287,7 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
                     noteHeld(HeldReason::NullOther);
                     return held;
                 }
+                ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::WritesBeyondTargets);
                 if (const auto reason = writesBeyondTargets(*candidate->compiled)) {
                     noteHeld(*reason);
                     return held;
@@ -294,6 +295,7 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
             }
             continue;
         }
+        ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::WritesBeyondTargets);
         if (const auto reason = writesBeyondTargets(*variant->compiled)) {
             noteHeld(*reason);
             return held;
@@ -984,6 +986,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         if (drawHit) {
 
             programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
+            if (stageData[i].compiled == nullptr) ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::DrawHit);
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             const auto candidate = std::find_if(dataCandidates[i].begin(), dataCandidates[i].end(), [&](const auto& kept) { return kept.first->pushOffset == pushCursorBytes && kept.first->compiled->pushConstants.size() <= pushBudget; });
@@ -993,6 +996,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 matchedRegions[i] = std::move(candidate->second);
                 reused[i] = true;
                 programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
+                if (stageData[i].compiled == nullptr) ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::DrawDataCandidate);
                 memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
             } else {
                 if (!dataCandidates[i].empty() && !verifyDrawDataHits()) decodeVertexInfo(i);

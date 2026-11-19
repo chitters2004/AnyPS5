@@ -49,6 +49,7 @@ void Driver::appendEntryRegions(const DispatchVariant& variant, std::vector<Shad
 }
 
 std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchDataWords(const DispatchVariant& variant, const std::vector<std::uint32_t>& words) {
+    ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::DataHitCopy);
     auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
     auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
     for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
@@ -119,6 +120,7 @@ bool Driver::vouchedValidation() {
 }
 
 EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
+    ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::VariantValidate);
     if (live != nullptr) live->clear();
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();

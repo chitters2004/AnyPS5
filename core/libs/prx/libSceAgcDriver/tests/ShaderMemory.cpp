@@ -642,6 +642,15 @@ void verifyResultMemoHolders(bool profiled) {
         require(tagged.holders.bits.load() == (profiled ? 4u : 0u), "result memo holders: a holder tag was not kept, or was kept without APS5_PROFILE_DRAW");
         require(copy.holders.bits.load() == 0u && assigned.holders.bits.load() == 0u, "result memo holders: a copied result kept the holder tags of its source");
     }
+    {
+        const auto before = ResultMemoReseenCounts().reads;
+        NoteResultRead(ResultRead::ForwardedWords);
+        NoteResultRead(ResultRead::ForwardedWords);
+        NoteResultRead(ResultRead::DataHitCopy);
+        const auto after = ResultMemoReseenCounts().reads;
+        const auto at = [&](ResultRead site) { return after[static_cast<std::size_t>(site)] - before[static_cast<std::size_t>(site)]; };
+        require(at(ResultRead::ForwardedWords) == (profiled ? 2u : 0u) && at(ResultRead::DataHitCopy) == (profiled ? 1u : 0u) && at(ResultRead::DrawHit) == 0u, "result memo holders: variant result reads were counted at the wrong site, or without APS5_PROFILE_DRAW");
+    }
     require(resultMemoPixel(base + 1u, &hit) != nullptr && !hit, "result memo holders: the first compile hit the memo");
     auto first = resultMemoPixel(base + 2u, &hit);
     NoteResultHolder(*first, ResultHolder::DrawVariant);

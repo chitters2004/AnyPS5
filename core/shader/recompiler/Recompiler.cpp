@@ -1936,6 +1936,7 @@ struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, patched{0}, misses{0}, evictions{0}, trimmed{0}, populateNanoseconds{0}, patchNanoseconds{0}, mismatches{0};
     std::atomic<std::uint64_t> evictedReseenPatched{0}, evictedReseenMissed{0}, patchedReseen{0}, patchCopyNanoseconds{0};
     std::atomic<std::uint64_t> totalEvictedReseenPatched{0}, totalEvictedReseenMissed{0}, totalPatchedReseen{0};
+    std::array<std::atomic<std::uint64_t>, ResultReadSites> reads{}, totalReads{};
     std::atomic<std::uint64_t> recycled{0}, spareHeld{0}, totalRecycled{0}, totalSpareHeld{0}, spares{0}, rotated{0}, totalRotated{0};
     std::array<std::atomic<std::uint64_t>, ResultMemoHeldAges> heldAge{}, totalHeldAge{};
     std::array<std::atomic<std::uint64_t>, ResultMemoHeldRefs> heldRefs{}, totalHeldRefs{};
@@ -2197,6 +2198,11 @@ void reportResultMemo() {
     const auto perPatch = [&](std::uint64_t count) { return copies != 0 ? static_cast<double>(count) / static_cast<double>(copies) : 0.0; };
     const auto total = static_cast<double>(hits + patched + misses);
     std::fprintf(stderr, "[recompile] result memo keys (10 s): %llu exact misses were for keys evicted earlier (%llu then patched, %llu populated, of %llu evictions); %llu of %llu patches were for keys patched before (patched results are not kept); patch copy %.2f us, rest %.2f us each; %llu patches reused a spare result in place, %llu copied because the spare was still held (spare kept for under 100 ms %llu, under 1 s %llu, under 10 s %llu, longer %llu; held by 1 other owner %llu, 2 %llu, 3 or more %llu), %llu spares held; %zu sets of %zu ways per source; allocations per patch copy: %.1f the patch rewrites, %.1f untouched binding words, %.1f invariant per variant, %.1f invariant vectors shared by reference instead (%s); held spares by holder, under 1 s/1-10 s/10 s or longer (a spare counts once for each holder that ever kept it): draw variant %llu/%llu/%llu, dispatch variant %llu/%llu/%llu, variant copy %llu/%llu/%llu, parked dispatch %llu/%llu/%llu, none of these %llu/%llu/%llu; %llu held spares replaced by the newer patch (%s)\n", static_cast<unsigned long long>(evictedPatched + evictedMissed), static_cast<unsigned long long>(evictedPatched), static_cast<unsigned long long>(evictedMissed), static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patchedReseen), static_cast<unsigned long long>(patched), patched != 0 ? static_cast<double>(patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, patched != 0 && patching >= patchCopy ? static_cast<double>(patching - patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<unsigned long long>(recycledCount), static_cast<unsigned long long>(spareHeld), static_cast<unsigned long long>(heldAge[0]), static_cast<unsigned long long>(heldAge[1]), static_cast<unsigned long long>(heldAge[2]), static_cast<unsigned long long>(heldAge[3]), static_cast<unsigned long long>(heldRefs[0]), static_cast<unsigned long long>(heldRefs[1]), static_cast<unsigned long long>(heldRefs[2]), static_cast<unsigned long long>(counters.spares.load(std::memory_order_relaxed)), resultMemoSets(), ResultMemoWays, perPatch(copyTouched), perPatch(copyUntouched), perPatch(copyInvariant), perPatch(copyShared), resultMemoShare() ? "shared" : "off, APS5_NO_RESULT_MEMO_SHARE", static_cast<unsigned long long>(heldBy[0][0]), static_cast<unsigned long long>(heldBy[0][1]), static_cast<unsigned long long>(heldBy[0][2]), static_cast<unsigned long long>(heldBy[1][0]), static_cast<unsigned long long>(heldBy[1][1]), static_cast<unsigned long long>(heldBy[1][2]), static_cast<unsigned long long>(heldBy[2][0]), static_cast<unsigned long long>(heldBy[2][1]), static_cast<unsigned long long>(heldBy[2][2]), static_cast<unsigned long long>(heldBy[3][0]), static_cast<unsigned long long>(heldBy[3][1]), static_cast<unsigned long long>(heldBy[3][2]), static_cast<unsigned long long>(heldBy[4][0]), static_cast<unsigned long long>(heldBy[4][1]), static_cast<unsigned long long>(heldBy[4][2]), static_cast<unsigned long long>(rotated), resultMemoRotate() ? "rotate" : "off, APS5_NO_RESULT_MEMO_SPARE_ROTATE");
+    std::array<std::uint64_t, ResultReadSites> reads{};
+    std::uint64_t allReads = 0;
+    for (std::size_t site = 0; site < ResultReadSites; ++site) allReads += reads[site] = counters.reads[site].exchange(0, std::memory_order_relaxed);
+    const auto read = [&](ResultRead site) { return static_cast<unsigned long long>(reads[static_cast<std::size_t>(site)]); };
+    std::fprintf(stderr, "[recompile] variant result reads (10 s, APS5_PROFILE_DRAW): %llu uses; whole result: draw hit %llu, draw data candidate %llu, data-hit copy %llu (then its words), dispatch hit %llu; bindings: variant validate %llu, writes beyond targets %llu; relocation %llu; push constants: push budget %llu; words: capture positions %llu, forwarded words %llu; words and push constants only %llu of %llu\n", static_cast<unsigned long long>(allReads), read(ResultRead::DrawHit), read(ResultRead::DrawDataCandidate), read(ResultRead::DataHitCopy), read(ResultRead::DispatchHit), read(ResultRead::VariantValidate), read(ResultRead::WritesBeyondTargets), read(ResultRead::Relocation), read(ResultRead::PushBudget), read(ResultRead::CapturePositions), read(ResultRead::ForwardedWords), read(ResultRead::PushBudget) + read(ResultRead::CapturePositions) + read(ResultRead::ForwardedWords), static_cast<unsigned long long>(allReads));
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu patched, %llu misses (%.1f%% hits, %.1f%% patched), Populate %.1f us per miss / %.1f ms in total, patch %.1f us each / %.1f ms in total, %llu evictions, %llu patch mismatches, %llu trimmed; %llu results held, %.1f MiB\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(misses), total != 0.0 ? 100.0 * static_cast<double>(hits) / total : 0.0, total != 0.0 ? 100.0 * static_cast<double>(patched) / total : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, patched != 0 ? static_cast<double>(patching) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<double>(patching) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(trimmed), static_cast<unsigned long long>(counters.heldEntries.load(std::memory_order_relaxed)), static_cast<double>(counters.heldBytes.load(std::memory_order_relaxed)) / 1048576.0);
     auto& plans = resourcePlans();
     const auto interval = TakeResourcePlanInterval();
@@ -2854,6 +2860,7 @@ ResultMemoReseen ResultMemoReseenCounts() {
     reseen.copyInvariant = counters.totalCopyInvariant.load(std::memory_order_relaxed);
     reseen.copyShared = counters.totalCopyShared.load(std::memory_order_relaxed);
     reseen.rotated = counters.totalRotated.load(std::memory_order_relaxed);
+    for (std::size_t site = 0; site < ResultReadSites; ++site) reseen.reads[site] = counters.totalReads[site].load(std::memory_order_relaxed);
     return reseen;
 }
 
@@ -2879,6 +2886,14 @@ void RecompileResult::UnshareInvariants() {
         binding.imageSamplers.unshare();
         binding.bufferExtent.unshare();
     }
+}
+
+void NoteResultRead(ResultRead site) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& counters = resultMemoCounters();
+    counters.reads[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+    counters.totalReads[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
 }
 
 void NoteResultHolder(const RecompileResult& result, ResultHolder holder) {

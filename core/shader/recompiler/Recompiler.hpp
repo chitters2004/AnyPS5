@@ -991,6 +991,8 @@ struct ResultKeyMemo {
 
 enum class ResultHolder : std::uint8_t { DrawVariant, DispatchVariant, VariantCopy, ParkedDispatch };
 constexpr std::size_t ResultHolderSites = 4;
+enum class ResultRead : std::uint8_t { DrawHit, DrawDataCandidate, DataHitCopy, DispatchHit, VariantValidate, WritesBeyondTargets, Relocation, PushBudget, CapturePositions, ForwardedWords };
+constexpr std::size_t ResultReadSites = 10;
 
 struct ResultHolders {
     mutable std::atomic<std::uint8_t> bits{0};
@@ -1074,10 +1076,12 @@ struct ResultMemoReseen {
     std::uint64_t copyInvariant = 0;
     std::uint64_t copyShared = 0;
     std::uint64_t rotated = 0;
+    std::array<std::uint64_t, ResultReadSites> reads{};
 };
 [[nodiscard]] ResultMemoReseen ResultMemoReseenCounts();
 void SetResultMemoRecycleGate(bool (*gate)());
 void NoteResultHolder(const RecompileResult& result, ResultHolder holder);
+void NoteResultRead(ResultRead site);
 void SetResultMemoShareGate(bool (*gate)());
 void SetResultMemoRotateGate(bool (*gate)());
 void SetResultMemoClockForTest(std::uint64_t (*clock)());

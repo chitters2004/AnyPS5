@@ -304,6 +304,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 
 void Driver::recordStageDataPositions(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, const std::vector<Graphics::DecodeRead>& decodeReads) {
     const auto& compiled = *variant.compiled;
+    ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::CapturePositions);
     for (std::size_t b = 0; b < compiled.bindings.size(); ++b) {
         if (compiled.bindings[b].role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
         variant.flatBinding = static_cast<std::uint32_t>(b);
@@ -399,6 +400,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             if (verifyHit && matched[i] != nullptr) {
                 const auto& words = stageData[i].compiled != nullptr ? stageData[i].words : matched[i]->words;
                 const auto& compiled = stageData[i].compiled != nullptr ? *stageData[i].compiled : *matched[i]->compiled;
+                ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::ForwardedWords);
                 if (!sameContent(*matched[i], words, *variant) || !sameForwardedWords(compiled, *variant->compiled, programs[i].hiddenUserWords)) {
                     ++mismatches;
                     static std::atomic<std::uint64_t> reports{0};

@@ -82,6 +82,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                         const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
                         PendingView pending;
                         pending.Load();
+                        ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::VariantValidate);
                         same = validateCaptured(address, submission.queue, variant->captured, *variant->compiled, false, pending);
                     }
                     if (same) {
@@ -124,6 +125,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             if (current) {
                 ++counters.variantHitsByRank[rank];
                 compiledResult = variant->compiled;
+                if (!dataHit) ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::DispatchHit);
                 if (dataHit) {
 
                     liveWords = variant->words;

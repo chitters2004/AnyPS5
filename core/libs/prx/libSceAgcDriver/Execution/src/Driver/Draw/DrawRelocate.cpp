@@ -64,6 +64,7 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
 void Driver::tagUserValueWords(DispatchVariant& variant, const DrawProgram& program) {
     if (!drawRelocationEnabled() || variant.compiled == nullptr) return;
     const auto& compiled = *variant.compiled;
+    ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::Relocation);
     const auto& forwarded = compiled.shaderDataUserWords;
     const auto users = std::min<std::size_t>(program.userData.size(), 64);
     const auto bound = [&](std::uint32_t value) {
@@ -356,6 +357,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
 
 void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     if (variant.shaderDataPatches.empty() && variant.descriptorPatches.empty()) return;
+    ShaderRecompiler::NoteResultRead(ShaderRecompiler::ResultRead::Relocation);
     auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
     for (const auto& [slot, value] : variant.shaderDataPatches) patchForwardedWord(*rebased, slot, value);
     for (const auto& [binding, word, value] : variant.descriptorPatches) {
