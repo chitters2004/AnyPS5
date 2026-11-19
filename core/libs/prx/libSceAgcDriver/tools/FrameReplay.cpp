@@ -1360,7 +1360,7 @@ int run(const Options& options) {
     const auto partCounts = [](const std::array<std::uint64_t, 4>& counts) {
         return "{\"vertex_input\":" + std::to_string(counts[0]) + ",\"pre_rasterization\":" + std::to_string(counts[1]) + ",\"fragment\":" + std::to_string(counts[2]) + ",\"fragment_output\":" + std::to_string(counts[3]) + "}";
     };
-    std::array<std::uint64_t, 28> detail{};
+    std::array<std::uint64_t, 32> detail{};
     AgcDriverLibraryPartDetail_nid_postfix(detail.data());
     const auto partValues = [&](std::size_t field, double scale) {
         std::string text = "{";
@@ -1372,7 +1372,7 @@ int run(const Options& options) {
         }
         return text + "}";
     };
-    std::printf("{\"library_part_draw_built_ms\":%s,\"library_part_max_ms\":%s,\"library_part_cache_lock_wait_ms\":%s,\"library_part_builds_in_flight_sum\":%s,\"library_part_specialization_entries\":%s,\"library_part_spirv_kib\":%s,\"library_parts_draw_built_for_prebuilt_modules\":%s}\n", partValues(0, 1.0e6).c_str(), partValues(1, 1.0e6).c_str(), partValues(2, 1.0e6).c_str(), partValues(3, 1.0).c_str(), partValues(4, 1.0).c_str(), partValues(5, 1024.0).c_str(), partValues(6, 1.0).c_str());
+    std::printf("{\"library_part_draw_built_ms\":%s,\"library_part_max_ms\":%s,\"library_part_cache_lock_wait_ms\":%s,\"library_part_builds_in_flight_sum\":%s,\"library_part_specialization_entries\":%s,\"library_part_spirv_kib\":%s,\"library_parts_draw_built_for_prebuilt_modules\":%s,\"library_prebuilds_skipped\":%s}\n", partValues(0, 1.0e6).c_str(), partValues(1, 1.0e6).c_str(), partValues(2, 1.0e6).c_str(), partValues(3, 1.0).c_str(), partValues(4, 1.0).c_str(), partValues(5, 1024.0).c_str(), partValues(6, 1.0).c_str(), partValues(7, 1.0).c_str());
     std::printf("{\"library_parts_built_by_prebuild\":%s,\"library_parts_built_by_draws\":%s,\"library_parts_prebuilt_then_used_by_draws\":%s}\n", partCounts(prebuilt).c_str(), partCounts(drawBuilt).c_str(), partCounts(prebuiltUsed).c_str());
     std::printf("{\"library_parts_built\":{\"vertex_input\":%llu,\"pre_rasterization\":%llu,\"fragment\":%llu,\"fragment_output\":%llu},\"library_part_compile_ms\":{\"vertex_input\":%.3f,\"pre_rasterization\":%.3f,\"fragment\":%.3f,\"fragment_output\":%.3f}}\n", static_cast<unsigned long long>(parts[0]), static_cast<unsigned long long>(parts[1]), static_cast<unsigned long long>(parts[2]), static_cast<unsigned long long>(parts[3]), ms(0), ms(1), ms(2), ms(3));
     std::fflush(stdout);

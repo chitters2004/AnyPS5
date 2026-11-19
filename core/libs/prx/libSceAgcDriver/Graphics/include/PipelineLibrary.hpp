@@ -66,11 +66,17 @@ struct PipelineLibraryCounters {
     std::array<std::uint64_t, 4> specializationEntries{};
     std::array<std::uint64_t, 4> spirvBytes{};
     std::array<std::uint64_t, 4> drawBuiltWithPrebuiltModules{};
+    std::array<std::uint64_t, 4> prebuildsSkipped{};
     std::uint64_t linked = 0;
     std::uint64_t optimized = 0;
 };
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device);
+
+inline constexpr std::uint64_t PrebuildJudgedAfterDrawParts = 64u;
+inline constexpr std::uint64_t PrebuildMinimumServedPercent = 25u;
+
+bool PrebuildStillServesDraws(VkDevice device, std::size_t part);
 
 }
 

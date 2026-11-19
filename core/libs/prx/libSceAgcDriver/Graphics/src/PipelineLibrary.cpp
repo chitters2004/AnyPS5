@@ -460,6 +460,17 @@ unsigned PipelineLibraryWorkers() {
     return runningWorkers.load(std::memory_order_acquire);
 }
 
+bool PrebuildStillServesDraws(VkDevice device, std::size_t part) {
+    auto& store = Libraries();
+    std::lock_guard lock(store.mutex);
+    auto& counters = store.devices[device].counters;
+    const auto served = counters.prebuiltUsedByDraw.at(part);
+    const auto needed = served + counters.builtByDraw.at(part);
+    if (needed < PrebuildJudgedAfterDrawParts || served * 100u >= needed * PrebuildMinimumServedPercent) return true;
+    ++counters.prebuildsSkipped.at(part);
+    return false;
+}
+
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device) {
     auto& store = Libraries();
     std::lock_guard lock(store.mutex);
