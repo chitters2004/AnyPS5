@@ -455,6 +455,16 @@ public:
     // The pending image whose surface starts at `address` and covers at least `bytes` (a mip chain
     // contains a descriptor of its first mips), if any; the caller decides whether the geometry fits
     // (Texture::CanCopyFrom, ResidentPresentable).
+    struct FormatAliasCensus {
+        std::uint64_t uploads = 0;
+        std::uint64_t uploadBytes = 0;
+        std::uint64_t afterWriteBack = 0;
+        std::uint64_t afterWriteBackBytes = 0;
+        std::uint64_t layoutUploads = 0;
+        std::uint64_t layoutUploadBytes = 0;
+    };
+    static FormatAliasCensus FormatAliasTotals();
+    static void ReportFormatAliases();
     static std::shared_ptr<StorageTexture> FindPending(std::uint64_t address, std::uint64_t bytes);
     VkDevice Device() const;
     static std::uint64_t EightBitWrites();
@@ -736,6 +746,7 @@ private:
     bool refresh(std::uint32_t firstLayer, std::uint32_t lastLayer);
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration(std::source_location where = std::source_location::current());
+    void noteFormatAliasUpload(std::uint64_t bytes);
     std::uint64_t advanceUnchanged(std::uint32_t unit, std::uint64_t to);
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
     bool refreshProved();
@@ -931,6 +942,9 @@ private:
     bool released = false;
     std::atomic<bool> cached{false};
     std::source_location createdAt{};
+    std::atomic<std::uint64_t> lastWriteBack{0};
+    std::uint64_t lastAliasUpload = 0;
+    std::atomic<std::uint64_t> aliasUploadBytes{0};
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
     // Hook skips of this image since FlushPending last listed it (AccessKeptByCpu), the read site

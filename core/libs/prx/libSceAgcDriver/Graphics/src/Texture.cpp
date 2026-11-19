@@ -276,6 +276,41 @@ LiveImages& Live() {
     return live;
 }
 
+struct FormatAliasCounts {
+    std::atomic<std::uint64_t> uploads{0};
+    std::atomic<std::uint64_t> bytes{0};
+    std::atomic<std::uint64_t> afterWriteBack{0};
+    std::atomic<std::uint64_t> afterWriteBackBytes{0};
+    std::atomic<std::uint64_t> layoutUploads{0};
+    std::atomic<std::uint64_t> layoutBytes{0};
+    std::atomic<std::uint64_t> totalUploads{0};
+    std::atomic<std::uint64_t> totalBytes{0};
+    std::atomic<std::uint64_t> totalAfterWriteBack{0};
+    std::atomic<std::uint64_t> totalAfterWriteBackBytes{0};
+    std::atomic<std::uint64_t> totalLayoutUploads{0};
+    std::atomic<std::uint64_t> totalLayoutBytes{0};
+};
+
+FormatAliasCounts& formatAliasCounts() {
+    static FormatAliasCounts counts;
+    return counts;
+}
+
+std::atomic<std::uint64_t> writeBackSequence{0};
+
+bool formatAliasesCounted() {
+    static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return counted;
+}
+
+bool sameFormat(const GuestTextureResource& left, VkFormat leftStorage, const GuestTextureResource& right, VkFormat rightStorage) {
+    return left.format == right.format && leftStorage == rightStorage;
+}
+
+bool viewCompatible(const GuestTextureResource& left, const GuestTextureResource& right) {
+    return !IsBlockCompressed(left.format) && !IsBlockCompressed(right.format) && BytesPerElement(left.format) == BytesPerElement(right.format) && BlockWidth(left.format) == BlockWidth(right.format);
+}
+
 // Per-layer validity of array surfaces (see StorageTexture::layerBegin): a fill of one layer clears
 // it on the image and only that layer's guest bytes go stale, so the other layers' fills, uploads
 // and write-backs stay separate. APS5_NO_LAYER_CLEAR=1 tracks every surface as one layer, and a
@@ -3448,6 +3483,14 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
+    if (formatAliasesCounted()) {
+        std::uint64_t uploaded = guestBytes;
+        if (layers != nullptr) {
+            uploaded = 0;
+            for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) uploaded += (*layers)[layer] ? layerBytes(layer) : 0u;
+        }
+        noteFormatAliasUpload(uploaded);
+    }
     GuestMemory::MaterializeKnownZero(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto stampLayers = [&](bool selectedOnly) {
@@ -4696,6 +4739,116 @@ bool StorageTexture::anyLayerPending() const {
 std::uint64_t StorageTexture::advanceUnchanged(std::uint32_t unit, std::uint64_t to) {
     if (unit < unwatchHash.size() && unwatchHash[unit].generation != 0 && unwatchHash[unit].generation == layerGeneration[unit]) unwatchHash[unit].generation = to;
     return to;
+}
+
+void StorageTexture::noteFormatAliasUpload(std::uint64_t bytes) {
+    bool otherFormat = false;
+    bool otherLayout = false;
+    bool afterWriteBack = false;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (const auto* other : live.textures) {
+            if (other == this || other->released || !other->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
+            if (sameFormat(other->descriptor, other->storageFormat, descriptor, storageFormat)) otherLayout = true;
+            else otherFormat = true;
+            const auto wrote = other->lastWriteBack.load(std::memory_order_relaxed);
+            if (wrote > lastAliasUpload) afterWriteBack = true;
+        }
+        lastAliasUpload = writeBackSequence.load(std::memory_order_relaxed);
+    }
+    auto& counts = formatAliasCounts();
+    if (otherFormat) {
+        counts.uploads.fetch_add(1, std::memory_order_relaxed);
+        counts.bytes.fetch_add(bytes, std::memory_order_relaxed);
+        counts.totalUploads.fetch_add(1, std::memory_order_relaxed);
+        counts.totalBytes.fetch_add(bytes, std::memory_order_relaxed);
+        aliasUploadBytes.fetch_add(bytes, std::memory_order_relaxed);
+        if (afterWriteBack) {
+            counts.afterWriteBack.fetch_add(1, std::memory_order_relaxed);
+            counts.afterWriteBackBytes.fetch_add(bytes, std::memory_order_relaxed);
+            counts.totalAfterWriteBack.fetch_add(1, std::memory_order_relaxed);
+            counts.totalAfterWriteBackBytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+    } else if (otherLayout) {
+        counts.layoutUploads.fetch_add(1, std::memory_order_relaxed);
+        counts.layoutBytes.fetch_add(bytes, std::memory_order_relaxed);
+        counts.totalLayoutUploads.fetch_add(1, std::memory_order_relaxed);
+        counts.totalLayoutBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
+StorageTexture::FormatAliasCensus StorageTexture::FormatAliasTotals() {
+    const auto& counts = formatAliasCounts();
+    return {counts.totalUploads.load(std::memory_order_relaxed), counts.totalBytes.load(std::memory_order_relaxed), counts.totalAfterWriteBack.load(std::memory_order_relaxed), counts.totalAfterWriteBackBytes.load(std::memory_order_relaxed), counts.totalLayoutUploads.load(std::memory_order_relaxed), counts.totalLayoutBytes.load(std::memory_order_relaxed)};
+}
+
+void StorageTexture::ReportFormatAliases() {
+    if (!formatAliasesCounted()) return;
+    struct Image {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::uint32_t format;
+        VkFormat storage;
+        GuestTextureResource descriptor;
+        std::uint64_t uploaded;
+    };
+    std::vector<Image> images;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        images.reserve(live.textures.size());
+        for (auto* texture : live.textures) {
+            const auto uploaded = texture->aliasUploadBytes.exchange(0, std::memory_order_relaxed);
+            if (texture->released) continue;
+            images.push_back({texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes, texture->descriptor.format, texture->storageFormat, texture->descriptor, uploaded});
+        }
+    }
+    std::sort(images.begin(), images.end(), [](const Image& left, const Image& right) { return left.begin < right.begin; });
+    std::size_t ranges = 0;
+    std::size_t aliasedImages = 0;
+    std::size_t compatibleRanges = 0;
+    std::uint64_t rangeBytes = 0;
+    std::uint64_t topBytes = 0;
+    std::uint64_t topBegin = 0;
+    std::uint64_t topEnd = 0;
+    std::string topFormats;
+    for (std::size_t first = 0; first < images.size();) {
+        auto last = first + 1;
+        auto end = images[first].end;
+        while (last < images.size() && images[last].begin < end) end = std::max(end, images[last++].end);
+        bool mixed = false;
+        bool compatible = true;
+        std::uint64_t uploaded = 0;
+        for (auto index = first; index < last; ++index) {
+            uploaded += images[index].uploaded;
+            if (!sameFormat(images[index].descriptor, images[index].storage, images[first].descriptor, images[first].storage)) mixed = true;
+            if (!viewCompatible(images[index].descriptor, images[first].descriptor)) compatible = false;
+        }
+        if (mixed) {
+            ++ranges;
+            aliasedImages += last - first;
+            rangeBytes += end - images[first].begin;
+            if (compatible) ++compatibleRanges;
+            if (uploaded > topBytes || topFormats.empty()) {
+                topBytes = uploaded;
+                topBegin = images[first].begin;
+                topEnd = end;
+                topFormats.clear();
+                for (auto index = first; index < last; ++index) topFormats += (topFormats.empty() ? "" : ",") + std::to_string(images[index].format) + "/" + std::to_string(static_cast<int>(images[index].storage));
+            }
+        }
+        first = last;
+    }
+    auto& counts = formatAliasCounts();
+    const auto uploads = counts.uploads.exchange(0, std::memory_order_relaxed);
+    const auto bytes = counts.bytes.exchange(0, std::memory_order_relaxed);
+    const auto afterWriteBack = counts.afterWriteBack.exchange(0, std::memory_order_relaxed);
+    const auto afterWriteBackBytes = counts.afterWriteBackBytes.exchange(0, std::memory_order_relaxed);
+    const auto layoutUploads = counts.layoutUploads.exchange(0, std::memory_order_relaxed);
+    const auto layoutBytes = counts.layoutBytes.exchange(0, std::memory_order_relaxed);
+    const auto mib = [](std::uint64_t value) { return static_cast<double>(value) / 1048576.0; };
+    std::fprintf(stderr, "[textures] format aliases (10 s, APS5_PROFILE_DRAW): %zu guest ranges under storage images of different formats now (%zu images, %.1f MiB; %zu ranges with every format the same texel size); %llu uploads of such images (%.1f MiB), %llu of them after another image's write-back over the range (%.1f MiB); same format, other layout: %llu uploads (%.1f MiB); top range 0x%llx+0x%llx formats %s (guest/vk): %.1f MiB uploaded; since start %llu uploads (%.1f MiB), %llu after a write-back (%.1f MiB)\n", ranges, aliasedImages, mib(rangeBytes), compatibleRanges, static_cast<unsigned long long>(uploads), mib(bytes), static_cast<unsigned long long>(afterWriteBack), mib(afterWriteBackBytes), static_cast<unsigned long long>(layoutUploads), mib(layoutBytes), static_cast<unsigned long long>(topBegin), static_cast<unsigned long long>(topEnd - topBegin), topFormats.empty() ? "none" : topFormats.c_str(), mib(topBytes), static_cast<unsigned long long>(counts.totalUploads.load(std::memory_order_relaxed)), mib(counts.totalBytes.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.totalAfterWriteBack.load(std::memory_order_relaxed)), mib(counts.totalAfterWriteBackBytes.load(std::memory_order_relaxed)));
 }
 
 void StorageTexture::refreshGeneration(std::source_location where) {
@@ -7712,6 +7865,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             }
         }
         refreshGeneration();
+        lastWriteBack.store(writeBackSequence.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         advanceAdjacent(adjacent, now, firstBlock, lastBlock);
         if (!shadowed.empty()) markShadowed(now);
     };
