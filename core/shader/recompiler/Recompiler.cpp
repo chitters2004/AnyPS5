@@ -432,6 +432,7 @@ struct ResultMemoEntry {
     std::uint64_t bytes = 0;
     std::shared_ptr<RecompileResult> spare;
     std::uint64_t spareBytes = 0;
+    std::uint64_t spareSince = 0;
 };
 
 struct EmissionFailure {
@@ -1848,6 +1849,20 @@ ResultMemoEntry* memoSet(const std::unique_ptr<ResultMemoTable>& table, std::uin
     return table->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % (table->size() / ResultMemoWays)) * ResultMemoWays;
 }
 
+std::atomic<std::uint64_t (*)()>& resultMemoClock() {
+    static std::atomic<std::uint64_t (*)()> clock{nullptr};
+    return clock;
+}
+
+std::uint64_t resultMemoNow() {
+    if (const auto clock = resultMemoClock().load(std::memory_order_relaxed)) return clock();
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+std::size_t heldAgeBucket(std::uint64_t milliseconds) {
+    return milliseconds < 100u ? 0u : milliseconds < 1000u ? 1u : milliseconds < 10000u ? 2u : 3u;
+}
+
 std::atomic<bool (*)()>& resultMemoRecycleGate() {
     static std::atomic<bool (*)()> gate{nullptr};
     return gate;
@@ -1890,6 +1905,8 @@ struct ResultMemoCounters {
     std::atomic<std::uint64_t> evictedReseenPatched{0}, evictedReseenMissed{0}, patchedReseen{0}, patchCopyNanoseconds{0};
     std::atomic<std::uint64_t> totalEvictedReseenPatched{0}, totalEvictedReseenMissed{0}, totalPatchedReseen{0};
     std::atomic<std::uint64_t> recycled{0}, spareHeld{0}, totalRecycled{0}, totalSpareHeld{0}, spares{0};
+    std::array<std::atomic<std::uint64_t>, ResultMemoHeldAges> heldAge{}, totalHeldAge{};
+    std::array<std::atomic<std::uint64_t>, ResultMemoHeldRefs> heldRefs{}, totalHeldRefs{};
     MemoKeyGhosts evictedKeys, patchedKeys;
     std::atomic<std::int64_t> lastReport{0};
     std::atomic<std::uint64_t> clock{0}, heldBytes{0}, heldEntries{0};
@@ -2094,8 +2111,12 @@ void reportResultMemo() {
     const auto patchCopy = counters.patchCopyNanoseconds.exchange(0, std::memory_order_relaxed);
     const auto recycledCount = counters.recycled.exchange(0, std::memory_order_relaxed);
     const auto spareHeld = counters.spareHeld.exchange(0, std::memory_order_relaxed);
+    std::array<std::uint64_t, ResultMemoHeldAges> heldAge{};
+    std::array<std::uint64_t, ResultMemoHeldRefs> heldRefs{};
+    for (std::size_t age = 0; age < ResultMemoHeldAges; ++age) heldAge[age] = counters.heldAge[age].exchange(0, std::memory_order_relaxed);
+    for (std::size_t refs = 0; refs < ResultMemoHeldRefs; ++refs) heldRefs[refs] = counters.heldRefs[refs].exchange(0, std::memory_order_relaxed);
     const auto total = static_cast<double>(hits + patched + misses);
-    std::fprintf(stderr, "[recompile] result memo keys (10 s): %llu exact misses were for keys evicted earlier (%llu then patched, %llu populated, of %llu evictions); %llu of %llu patches were for keys patched before (patched results are not kept); patch copy %.2f us, rest %.2f us each; %llu patches reused a spare result in place, %llu copied because the spare was still held, %llu spares held; %zu sets of %zu ways per source\n", static_cast<unsigned long long>(evictedPatched + evictedMissed), static_cast<unsigned long long>(evictedPatched), static_cast<unsigned long long>(evictedMissed), static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patchedReseen), static_cast<unsigned long long>(patched), patched != 0 ? static_cast<double>(patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, patched != 0 && patching >= patchCopy ? static_cast<double>(patching - patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<unsigned long long>(recycledCount), static_cast<unsigned long long>(spareHeld), static_cast<unsigned long long>(counters.spares.load(std::memory_order_relaxed)), resultMemoSets(), ResultMemoWays);
+    std::fprintf(stderr, "[recompile] result memo keys (10 s): %llu exact misses were for keys evicted earlier (%llu then patched, %llu populated, of %llu evictions); %llu of %llu patches were for keys patched before (patched results are not kept); patch copy %.2f us, rest %.2f us each; %llu patches reused a spare result in place, %llu copied because the spare was still held (spare kept for under 100 ms %llu, under 1 s %llu, under 10 s %llu, longer %llu; held by 1 other owner %llu, 2 %llu, 3 or more %llu), %llu spares held; %zu sets of %zu ways per source\n", static_cast<unsigned long long>(evictedPatched + evictedMissed), static_cast<unsigned long long>(evictedPatched), static_cast<unsigned long long>(evictedMissed), static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patchedReseen), static_cast<unsigned long long>(patched), patched != 0 ? static_cast<double>(patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, patched != 0 && patching >= patchCopy ? static_cast<double>(patching - patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<unsigned long long>(recycledCount), static_cast<unsigned long long>(spareHeld), static_cast<unsigned long long>(heldAge[0]), static_cast<unsigned long long>(heldAge[1]), static_cast<unsigned long long>(heldAge[2]), static_cast<unsigned long long>(heldAge[3]), static_cast<unsigned long long>(heldRefs[0]), static_cast<unsigned long long>(heldRefs[1]), static_cast<unsigned long long>(heldRefs[2]), static_cast<unsigned long long>(counters.spares.load(std::memory_order_relaxed)), resultMemoSets(), ResultMemoWays);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu patched, %llu misses (%.1f%% hits, %.1f%% patched), Populate %.1f us per miss / %.1f ms in total, patch %.1f us each / %.1f ms in total, %llu evictions, %llu patch mismatches, %llu trimmed; %llu results held, %.1f MiB\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(misses), total != 0.0 ? 100.0 * static_cast<double>(hits) / total : 0.0, total != 0.0 ? 100.0 * static_cast<double>(patched) / total : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, patched != 0 ? static_cast<double>(patching) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<double>(patching) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(trimmed), static_cast<unsigned long long>(counters.heldEntries.load(std::memory_order_relaxed)), static_cast<double>(counters.heldBytes.load(std::memory_order_relaxed)) / 1048576.0);
     auto& plans = resourcePlans();
     const auto interval = TakeResourcePlanInterval();
@@ -2314,6 +2335,13 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
                 } else {
                     counters.spareHeld.fetch_add(1, std::memory_order_relaxed);
                     counters.totalSpareHeld.fetch_add(1, std::memory_order_relaxed);
+                    const auto now = resultMemoNow();
+                    const auto age = heldAgeBucket(now >= entry->spareSince ? now - entry->spareSince : 0u);
+                    const auto refs = std::min<std::size_t>(static_cast<std::size_t>(entry->spare.use_count()) - 2u, ResultMemoHeldRefs - 1u);
+                    counters.heldAge[age].fetch_add(1, std::memory_order_relaxed);
+                    counters.totalHeldAge[age].fetch_add(1, std::memory_order_relaxed);
+                    counters.heldRefs[refs].fetch_add(1, std::memory_order_relaxed);
+                    counters.totalHeldRefs[refs].fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
@@ -2366,6 +2394,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
                 if (entry != nullptr && entry->result == donor && entry->spare == nullptr) {
                     entry->spare = result;
                     entry->spareBytes = recycledBytes;
+                    entry->spareSince = resultMemoNow();
                     entry->bytes += recycledBytes;
                     counters.heldBytes.fetch_add(recycledBytes, std::memory_order_relaxed);
                     counters.spares.fetch_add(1, std::memory_order_relaxed);
@@ -2701,7 +2730,14 @@ std::uint64_t ResultMemoBytes() {
 
 ResultMemoReseen ResultMemoReseenCounts() {
     auto& counters = resultMemoCounters();
-    return {counters.totalEvictedReseenPatched.load(std::memory_order_relaxed), counters.totalEvictedReseenMissed.load(std::memory_order_relaxed), counters.totalPatchedReseen.load(std::memory_order_relaxed), counters.totalRecycled.load(std::memory_order_relaxed), counters.totalSpareHeld.load(std::memory_order_relaxed), counters.spares.load(std::memory_order_relaxed)};
+    ResultMemoReseen reseen{counters.totalEvictedReseenPatched.load(std::memory_order_relaxed), counters.totalEvictedReseenMissed.load(std::memory_order_relaxed), counters.totalPatchedReseen.load(std::memory_order_relaxed), counters.totalRecycled.load(std::memory_order_relaxed), counters.totalSpareHeld.load(std::memory_order_relaxed), counters.spares.load(std::memory_order_relaxed)};
+    for (std::size_t age = 0; age < ResultMemoHeldAges; ++age) reseen.heldAge[age] = counters.totalHeldAge[age].load(std::memory_order_relaxed);
+    for (std::size_t refs = 0; refs < ResultMemoHeldRefs; ++refs) reseen.heldRefs[refs] = counters.totalHeldRefs[refs].load(std::memory_order_relaxed);
+    return reseen;
+}
+
+void SetResultMemoClockForTest(std::uint64_t (*clock)()) {
+    resultMemoClock().store(clock, std::memory_order_relaxed);
 }
 
 void SetResultMemoRecycleGate(bool (*gate)()) {

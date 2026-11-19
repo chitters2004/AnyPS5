@@ -1040,6 +1040,8 @@ struct ResourceCapture;
 [[nodiscard]] std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit = nullptr);
 void SetResultMemoBudget(std::uint64_t bytes);
 [[nodiscard]] std::uint64_t ResultMemoBytes();
+constexpr std::size_t ResultMemoHeldAges = 4;
+constexpr std::size_t ResultMemoHeldRefs = 3;
 struct ResultMemoReseen {
     std::uint64_t evictedThenPatched = 0;
     std::uint64_t evictedThenPopulated = 0;
@@ -1047,9 +1049,12 @@ struct ResultMemoReseen {
     std::uint64_t recycled = 0;
     std::uint64_t spareHeld = 0;
     std::uint64_t spares = 0;
+    std::array<std::uint64_t, ResultMemoHeldAges> heldAge{};
+    std::array<std::uint64_t, ResultMemoHeldRefs> heldRefs{};
 };
 [[nodiscard]] ResultMemoReseen ResultMemoReseenCounts();
 void SetResultMemoRecycleGate(bool (*gate)());
+void SetResultMemoClockForTest(std::uint64_t (*clock)());
 void SetResultMemoTrimHook(std::function<void()> hook);
 struct ResourcePlanCounters {
     std::uint64_t heldBytes = 0;

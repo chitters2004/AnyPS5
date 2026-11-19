@@ -535,10 +535,18 @@ bool recycleOff() {
     return false;
 }
 
+std::uint64_t resultMemoTestNow = 0;
+
+std::uint64_t resultMemoTestClock() {
+    return resultMemoTestNow;
+}
+
 void verifyResultMemoRecycle() {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t base = 0x51a7e000u;
     bool hit = true;
+    SetResultMemoClockForTest(&resultMemoTestClock);
+    resultMemoTestNow = 1000u;
     require(resultMemoPixel(base + 1u, &hit) != nullptr && !hit, "result memo recycle: the first compile hit the memo");
     const auto populated = ResultMemoBytes();
     const ShaderRecompiler::RecompileResult* dropped = nullptr;
@@ -556,8 +564,30 @@ void verifyResultMemoRecycle() {
     require(reused.get() == dropped && afterReuse.recycled == before.recycled + 1u, "result memo recycle: a patch with the spare free did not reuse it");
     require(resultHoldsWord(*reused, base + 3u) && !resultHoldsWord(*reused, base + 2u), "result memo recycle: the reused spare kept the words of its last patch");
     require(reused->drawKeyMemo.words.load() == nullptr, "result memo recycle: the reused spare kept the draw key of its last patch");
+    resultMemoTestNow += 150u;
     auto held = resultMemoPixel(base + 4u, &hit);
     const auto afterHeld = ResultMemoReseenCounts();
+    const auto heldDelta = [](const ResultMemoReseen& from, const ResultMemoReseen& to) {
+        std::string text;
+        for (std::size_t age = 0; age < ResultMemoHeldAges; ++age) text += std::to_string(to.heldAge[age] - from.heldAge[age]);
+        text += "/";
+        for (std::size_t refs = 0; refs < ResultMemoHeldRefs; ++refs) text += std::to_string(to.heldRefs[refs] - from.heldRefs[refs]);
+        return text;
+    };
+    require(heldDelta(afterReuse, afterHeld) == "0100/100", (std::string("result memo recycle: a spare held 150 ms by one caller was bucketed as ") + heldDelta(afterReuse, afterHeld)).c_str());
+    {
+        const auto second = reused;
+        resultMemoTestNow += 20000u;
+        const auto before = ResultMemoReseenCounts();
+        const auto copied = resultMemoPixel(base + 7u, &hit);
+        const auto after = ResultMemoReseenCounts();
+        require(copied.get() != reused.get() && heldDelta(before, after) == "0001/010", (std::string("result memo recycle: a spare held 20 s by two callers was bucketed as ") + heldDelta(before, after)).c_str());
+        const auto third = reused;
+        resultMemoTestNow += 50u;
+        const auto beforeThree = ResultMemoReseenCounts();
+        static_cast<void>(resultMemoPixel(base + 8u, &hit));
+        require(heldDelta(beforeThree, ResultMemoReseenCounts()) == "0001/001", (std::string("result memo recycle: a spare held by three callers was bucketed as ") + heldDelta(beforeThree, ResultMemoReseenCounts())).c_str());
+    }
     require(held.get() != reused.get() && afterHeld.recycled == afterReuse.recycled && afterHeld.spareHeld == afterReuse.spareHeld + 1u, "result memo recycle: a patch reused a spare still held by its caller");
     require(resultHoldsWord(*reused, base + 3u) && !resultHoldsWord(*reused, base + 4u), "result memo recycle: a patch changed a result its caller still holds");
     require(resultHoldsWord(*held, base + 4u), "result memo recycle: the copied patch does not hold its own user word");
@@ -577,6 +607,7 @@ void verifyResultMemoRecycle() {
     SetResultMemoBudget(1u);
     require(ResultMemoBytes() == 0u && ResultMemoReseenCounts().spares == 0u, "result memo recycle: a trim left a spare");
     SetResultMemoBudget(0u);
+    SetResultMemoClockForTest(nullptr);
 }
 
 void verifyResultMemoBudgetThreads() {
