@@ -4436,6 +4436,9 @@ struct RangeWriteCounts {
     ProfileCounter takeCopyNanos;
     ProfileCounter takeObserveNanos;
     ProfileCounter takeCompareNanos;
+    ProfileCounter takesOutsideArena;
+    ProfileCounter takesHostRegion;
+    ProfileCounter takesOwnedFailed;
     ProfileCounter compareNanos;
     ProfileCounter rebaseNanos;
     std::array<ProfileCounter, static_cast<std::size_t>(RangeWriteOwner::Count)> unwatchedOwners;
@@ -4495,6 +4498,13 @@ bool countedSnapshot(std::uint64_t begin, std::span<std::byte> out, std::uint64_
     const bool copied = GuestMemory::CopyMapped(begin, out) == GuestMemory::Compare::Equal;
     auto now = std::chrono::steady_clock::now();
     counts.takeCopyNanos.Add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()));
+    switch (GuestMemory::MappedCopyRoute(begin, out.size())) {
+        case GuestMemory::CopyRoute::OutsideArena: counts.takesOutsideArena.Add(); break;
+        case GuestMemory::CopyRoute::HostRegion: counts.takesHostRegion.Add(); break;
+        case GuestMemory::CopyRoute::Owned:
+            if (!copied) counts.takesOwnedFailed.Add();
+            break;
+    }
     if (!copied) return false;
     start = now;
     const bool unchanged = GuestMemory::Observe(begin, out.size()).status == GuestMemory::Observation::Status::Complete && GuestMemory::UnchangedSince(begin, out.size(), generation);
@@ -4562,6 +4572,9 @@ std::string takeRangeWriteLine() {
     const auto takeCopyNanos = counts.takeCopyNanos.Take();
     const auto takeObserveNanos = counts.takeObserveNanos.Take();
     const auto takeCompareNanos = counts.takeCompareNanos.Take();
+    const auto takesOutsideArena = counts.takesOutsideArena.Take();
+    const auto takesHostRegion = counts.takesHostRegion.Take();
+    const auto takesOwnedFailed = counts.takesOwnedFailed.Take();
     const auto compareNanos = counts.compareNanos.Take();
     const auto rebaseNanos = counts.rebaseNanos.Take();
     const auto perCall = [](std::uint64_t nanos, std::uint64_t calls) { return calls == 0 ? std::string("n/a") : std::to_string(nanos / calls) + " ns"; };
@@ -4580,7 +4593,7 @@ std::string takeRangeWriteLine() {
     const auto heldBytes = snapshotBytesHeldTotal.load(std::memory_order_relaxed);
     const auto peakBytes = snapshotBytesHeldPeak.exchange(heldBytes, std::memory_order_relaxed);
     const auto unwatchedSizes = list(counts.unwatchedSizes, RangeWriteSizes);
-    bytes += "; exits passed on matching bytes " + std::to_string(byteExits) + " (ranges " + std::to_string(byteRanges) + "); ranges rebased after a byte pass " + std::to_string(rebased) + ", exits with a range passing on its rebased generation " + std::to_string(rebaseExits) + " (ranges " + std::to_string(rebaseRanges) + "); byte compares " + std::to_string(calls) + " of " + std::to_string(compareBytes) + " bytes, differed " + std::to_string(differed) + "; written ranges without a snapshot " + std::to_string(noSnapshot) + "; snapshots kept " + std::to_string(taken) + ", dropped as written during the proof " + std::to_string(dropped) + ", skipped as never seen written " + std::to_string(skippedCold) + "; ranges marked written (later proofs snapshot them) " + std::to_string(markedVolatile) + "; time: snapshot takes " + std::to_string(takeNanos / 1000) + " us over " + std::to_string(taken + dropped) + " (" + perCall(takeNanos, taken + dropped) + " each), compares " + std::to_string(compareNanos / 1000) + " us (" + perCall(compareNanos, calls) + " each), rebases " + std::to_string(rebaseNanos / 1000) + " us (" + perCall(rebaseNanos, rebased) + " each); snapshot takes split: new ranges " + std::to_string(takesNew) + ", changed ranges " + std::to_string(takesChanged) + ", bytes " + std::to_string(takeBytes) + ", allocation " + std::to_string(takeAllocNanos / 1000) + " us, copy " + std::to_string(takeCopyNanos / 1000) + " us, observe and stamp check " + std::to_string(takeObserveNanos / 1000) + " us, compares that found a changed range " + std::to_string(takeCompareNanos / 1000) + " us; collect over unwatched memory by owner " + unwatchedOwners + "; by size " + unwatchedSizes + "; by host import: inside an import left unwatched " + std::to_string(unwatchedImported) + ", inside a watched import " + std::to_string(watchedImported) + ", in no import " + std::to_string(notImported) + "; ranged proof breaks: break log too short " + std::to_string(logShort) + ", no logged break over the range (a break elsewhere in its 64 KiB block) " + std::to_string(blockShared) + ", an unranged break in the window " + std::to_string(rangedUnranged) + ", by the overlapping break's site " + rangedSites + "; by the range's owner " + rangedOwners + "; by size " + rangedSizes + "; snapshots held now: sets " + std::to_string(snapshotSetsHeld.load(std::memory_order_relaxed)) + ", ranges " + std::to_string(snapshotRangesHeld.load(std::memory_order_relaxed)) + ", bytes " + std::to_string(heldBytes) + " (peak in the window " + std::to_string(std::max(peakBytes, heldBytes)) + ")";
+    bytes += "; exits passed on matching bytes " + std::to_string(byteExits) + " (ranges " + std::to_string(byteRanges) + "); ranges rebased after a byte pass " + std::to_string(rebased) + ", exits with a range passing on its rebased generation " + std::to_string(rebaseExits) + " (ranges " + std::to_string(rebaseRanges) + "); byte compares " + std::to_string(calls) + " of " + std::to_string(compareBytes) + " bytes, differed " + std::to_string(differed) + "; written ranges without a snapshot " + std::to_string(noSnapshot) + "; snapshots kept " + std::to_string(taken) + ", dropped as written during the proof " + std::to_string(dropped) + ", skipped as never seen written " + std::to_string(skippedCold) + "; ranges marked written (later proofs snapshot them) " + std::to_string(markedVolatile) + "; time: snapshot takes " + std::to_string(takeNanos / 1000) + " us over " + std::to_string(taken + dropped) + " (" + perCall(takeNanos, taken + dropped) + " each), compares " + std::to_string(compareNanos / 1000) + " us (" + perCall(compareNanos, calls) + " each), rebases " + std::to_string(rebaseNanos / 1000) + " us (" + perCall(rebaseNanos, rebased) + " each); snapshot takes split: new ranges " + std::to_string(takesNew) + ", changed ranges " + std::to_string(takesChanged) + ", bytes " + std::to_string(takeBytes) + ", allocation " + std::to_string(takeAllocNanos / 1000) + " us, copy " + std::to_string(takeCopyNanos / 1000) + " us, observe and stamp check " + std::to_string(takeObserveNanos / 1000) + " us, compares that found a changed range " + std::to_string(takeCompareNanos / 1000) + " us, takes the guarded arena copy refuses: outside the arena " + std::to_string(takesOutsideArena) + ", over a host region " + std::to_string(takesHostRegion) + ", in the arena but not copied " + std::to_string(takesOwnedFailed) + "; collect over unwatched memory by owner " + unwatchedOwners + "; by size " + unwatchedSizes + "; by host import: inside an import left unwatched " + std::to_string(unwatchedImported) + ", inside a watched import " + std::to_string(watchedImported) + ", in no import " + std::to_string(notImported) + "; ranged proof breaks: break log too short " + std::to_string(logShort) + ", no logged break over the range (a break elsewhere in its 64 KiB block) " + std::to_string(blockShared) + ", an unranged break in the window " + std::to_string(rangedUnranged) + ", by the overlapping break's site " + rangedSites + "; by the range's owner " + rangedOwners + "; by size " + rangedSizes + "; snapshots held now: sets " + std::to_string(snapshotSetsHeld.load(std::memory_order_relaxed)) + ", ranges " + std::to_string(snapshotRangesHeld.load(std::memory_order_relaxed)) + ", bytes " + std::to_string(heldBytes) + " (peak in the window " + std::to_string(std::max(peakBytes, heldBytes)) + ")";
     return "range written: write evidence " + sources + "; only coarse units straddling the range edge " + std::to_string(straddles) + "; written share of the range " + shares + "; range size " + sizes + "; first written owner " + owners + " (table spans holding their compared bytes " + std::to_string(same) + "); no write found " + std::to_string(undescribed) + "; sub-page ranges whose bytes match the proof's: " + (bytes.empty() ? "none compared" : bytes);
 }
 
