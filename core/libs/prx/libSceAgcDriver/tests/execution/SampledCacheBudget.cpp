@@ -1210,6 +1210,14 @@ void rangeVersionTests(Context context) {
     WatchedSurface surface(context);
     ClearCachedTextures(context.device);
     Require(ShaderResources::EpochProofs(), "the range-version fixture needs epoch proofs on");
+#ifdef _WIN32
+    Require(AgcDriver::GuestMemory::MappedCopyRoute(surface.Address(), SurfaceBytes) == AgcDriver::GuestMemory::CopyRoute::Owned, "an arena surface was not routed to the guarded arena copy");
+#endif
+    std::uintptr_t arenaBase = 0;
+    std::size_t arenaBytes = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+    Require(arenaBase <= 4096 || AgcDriver::GuestMemory::MappedCopyRoute(arenaBase - 4096, 4096) == AgcDriver::GuestMemory::CopyRoute::OutsideArena, "a page below the arena was routed to the guarded arena copy");
+    Require(arenaBytes == 0 || AgcDriver::GuestMemory::MappedCopyRoute(arenaBase + arenaBytes - 4096, 8192) == AgcDriver::GuestMemory::CopyRoute::OutsideArena, "a range past the arena end was routed to the guarded arena copy");
     RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, true);
     RuntimeSwitches::Assign(RuntimeSwitch::NoScopedProofs, true);
     struct Switches {

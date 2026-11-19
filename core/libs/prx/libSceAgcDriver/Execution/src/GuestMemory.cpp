@@ -5172,6 +5172,17 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
 #endif
 }
 
+CopyRoute MappedCopyRoute(std::uint64_t address, std::size_t bytes) {
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    if (address < base || bytes > size || address - base > size - bytes) return CopyRoute::OutsideArena;
+#ifdef _WIN32
+    if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes)) return CopyRoute::HostRegion;
+#endif
+    return CopyRoute::Owned;
+}
+
 void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     if (Accessible(reinterpret_cast<const void*>(address), current.size(), true)) {
