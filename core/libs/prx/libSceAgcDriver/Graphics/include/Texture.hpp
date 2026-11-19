@@ -569,6 +569,7 @@ public:
     DccKeys UploadedKeys() const { return uploadedKeys; }
     DccKeys FilledKeys() const { return filledKeys; }
     static void ReportKeysUploads();
+    static void ReportKeysOnlySkips();
     bool GuestSnapshotValid() const { return originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); }
     DccKeyProof& KeyProof() const { return keyProof; }
     DccRangeProof& TargetKeyProof() const { return targetKeyProof; }
@@ -889,6 +890,10 @@ private:
     mutable DccKeys filledKeys = DccKeys::Uncompressed;
     std::uint64_t keysUploadHash = 0;
     std::uint64_t keysUploadVersion = 0;
+    std::uint64_t uploadVersion = 0;
+    std::optional<DccKeys> clearUploadKeys;
+    bool keysOnlySkip(DccKeys keys, bool cpuWrote, bool moved);
+    std::vector<std::byte> readImageTiled(std::span<const std::byte> seed);
     void noteKeysUpload(DccKeys previous, bool cleared, bool whole);
     mutable DccKeyProof keyProof;
     mutable DccRangeProof targetKeyProof;

@@ -2947,10 +2947,14 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         }
         refreshGeneration();
     }
-    if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
+    const bool anyChanged = std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; });
+    if (anyChanged && keysChanged && keysOnlySkip(keys, cpuWrote, pendingResults || anyStored || dropped || anyBorrowed)) {
+        uploadedKeys = keys;
+    } else if (anyChanged) {
         NoteRefreshWork();
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
         upload(&changed);
+        uploadVersion = version;
     } else {
         uploadedKeys = keys;
     }
@@ -3506,6 +3510,116 @@ void StorageTexture::noteKeysUpload(DccKeys previous, bool cleared, bool whole) 
     counts.sameDecodeBytes[from][to][path].fetch_add(guestBytes, std::memory_order_relaxed);
 }
 
+namespace {
+
+constexpr std::array<const char*, 5> KeysSkipDeclines{"new keys not a clear code", "last upload not a GPU clear under the same keys", "results pending, stored, dropped or borrowed", "image written since its last upload", "guest bytes changed since"};
+
+struct KeysSkipCounts {
+    std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::uint64_t> skippedBytes{0};
+    std::array<std::atomic<std::uint64_t>, KeysSkipDeclines.size()> declined{};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> mismatched{0};
+};
+
+KeysSkipCounts& keysSkipCounts() {
+    static KeysSkipCounts counts;
+    return counts;
+}
+
+}
+
+bool StorageTexture::keysOnlySkip(DccKeys keys, bool cpuWrote, bool moved) {
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoKeysOnlySkip)) return false;
+    auto& counts = keysSkipCounts();
+    const auto decline = [&](std::size_t reason) {
+        counts.declined[reason].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (!IsDccClear(keys)) return decline(0);
+    if (clearUploadKeys != keys) return decline(1);
+    if (moved) return decline(2);
+    if (uploadVersion == 0 || version != uploadVersion) return decline(3);
+    if (cpuWrote || generation == 0 || !GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation)) return decline(4);
+    static const bool verify = std::getenv("APS5_VERIFY_KEYS_ONLY_SKIP") != nullptr;
+    if (verify) {
+        counts.verified.fetch_add(1, std::memory_order_relaxed);
+        std::vector<std::byte> cleared(static_cast<std::size_t>(guestBytes));
+        ReadTextureSurface(descriptor, keys, cleared);
+        if (readImageTiled(cleared) != cleared) {
+            static std::atomic<int> reports{0};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[keys-only-skip] verify: storage image 0x%llx+0x%llx does not hold the texels of %s keys; uploading\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), DccKeysName(keys));
+            counts.mismatched.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    counts.skipped.fetch_add(1, std::memory_order_relaxed);
+    counts.skippedBytes.fetch_add(guestBytes, std::memory_order_relaxed);
+    return true;
+}
+
+std::vector<std::byte> StorageTexture::readImageTiled(std::span<const std::byte> seed) {
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Submit();
+    const auto elementBytes = BytesPerElement(descriptor.format);
+    DeviceBuffer linear(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    DeviceBuffer tiled(context, seed.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer host(context, seed.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::memcpy(host.Bytes().data(), seed.data(), seed.size());
+    detiler.BeginBatch();
+    CommandBatch batch(context);
+    const auto commands = batch.Handle();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, host.Handle(), 0, tiled.Handle(), 0, seed.size());
+    VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toSource.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSource.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSource.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSource.image = image;
+    toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, VK_REMAINING_ARRAY_LAYERS};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+    const auto regions = CopyRegions();
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear.Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+    const VkBufferMemoryBarrier toShader[] = {WholeBufferBarrier(linear.Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT), WholeBufferBarrier(tiled.Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 2, toShader, 0, nullptr);
+    for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+        for (std::uint32_t level = 0; level < mips.size(); ++level) {
+            if (!geometry.HasLayer(level, layer)) continue;
+            const auto& mip = mips[level];
+            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear.Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiled.Handle(), geometry.GuestOffset(layer, mip), mip, true, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
+        }
+    }
+    const auto toCopy = WholeBufferBarrier(tiled.Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkImageMemoryBarrier backToGeneral = toSource;
+    backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    backToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    backToGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    backToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 1, &toCopy, 1, &backToGeneral);
+    CopyBuffer(context, commands, tiled.Handle(), 0, host.Handle(), 0, seed.size());
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    batch.SubmitAndWait();
+    const auto read = host.Bytes();
+    return {read.begin(), read.begin() + static_cast<std::ptrdiff_t>(seed.size())};
+}
+
+void StorageTexture::ReportKeysOnlySkips() {
+    auto& counts = keysSkipCounts();
+    std::string declines;
+    for (std::size_t reason = 0; reason < KeysSkipDeclines.size(); ++reason) {
+        char cell[96];
+        std::snprintf(cell, sizeof(cell), "%s%s %llu", declines.empty() ? "" : ", ", KeysSkipDeclines[reason], static_cast<unsigned long long>(counts.declined[reason].exchange(0, std::memory_order_relaxed)));
+        declines += cell;
+    }
+    const auto skipped = counts.skipped.exchange(0, std::memory_order_relaxed);
+    const auto bytes = counts.skippedBytes.exchange(0, std::memory_order_relaxed);
+    const auto verified = counts.verified.exchange(0, std::memory_order_relaxed);
+    const auto mismatched = counts.mismatched.exchange(0, std::memory_order_relaxed);
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] keys-only uploads skipped (10 s, %s): %llu (%.1f MiB) whose image still held the GPU clear of its last upload under the same clear keys; declined: %s; APS5_VERIFY_KEYS_ONLY_SKIP checked %llu, mismatched %llu\n", RuntimeSwitches::Set(RuntimeSwitch::NoKeysOnlySkip) ? "off, APS5_NO_KEYS_ONLY_SKIP" : "on", static_cast<unsigned long long>(skipped), static_cast<double>(bytes) / 1048576.0, declines.c_str(), static_cast<unsigned long long>(verified), static_cast<unsigned long long>(mismatched));
+}
+
 void StorageTexture::ReportKeysUploads() {
     if (!KeysUploadsProfiled()) return;
     const auto mib = [](std::uint64_t value) { return static_cast<double>(value) / 1048576.0; };
@@ -3568,6 +3682,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const bool fastClear = IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle;
     const bool clearedOnGpu = fastClear && (ClearColorFor(storageFormat, uploadedKeys, clearValue) || SingleKeyColorFor(descriptor, guestBytes, now, singleProof, storageFormat, uploadedKeys, clearValue));
     if (descriptor.dccAddress != 0 && KeysUploadsProfiled()) noteKeysUpload(previousKeys, clearedOnGpu, layers == nullptr);
+    clearUploadKeys = clearedOnGpu ? std::optional<DccKeys>(uploadedKeys) : std::nullopt;
     if (clearedOnGpu) {
         // A fast-cleared surface is cleared on the GPU; its texel memory is neither read nor filled.
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
