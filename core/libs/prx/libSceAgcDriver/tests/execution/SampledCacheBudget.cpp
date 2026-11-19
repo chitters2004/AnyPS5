@@ -301,11 +301,19 @@ private:
 
 class WatchedSurface {
 public:
-    explicit WatchedSurface(const Context& context, std::size_t bytes = SurfaceBytes) : context(context), span(bytes) {
+    explicit WatchedSurface(const Context& context, std::size_t bytes = SurfaceBytes, bool shared = false) : context(context), span(bytes) {
 #ifdef _WIN32
         memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
-        if (memory != nullptr) GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+        if (memory != nullptr && shared) {
+            const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+            Require(section != nullptr, "cannot create the shared watched surface");
+            GuestArena::GuestArenaMap_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
+            CloseHandle(section);
+        } else if (memory != nullptr) {
+            GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+        }
 #else
+        static_cast<void>(shared);
         constexpr std::uintptr_t alignment = 65536;
         void* mapped = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
@@ -1482,7 +1490,7 @@ bool rangeVersionPendingTests(Context context) {
         std::puts("range versions with other results pending: skipped, host imports are unavailable");
         return false;
     }
-    WatchedSurface surface(context, 2u * SurfaceBytes);
+    WatchedSurface surface(context, 2u * SurfaceBytes, true);
     ClearCachedTextures(context.device);
     const auto address = surface.Address();
     if (HostImportFor(context, address, SurfaceBytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
