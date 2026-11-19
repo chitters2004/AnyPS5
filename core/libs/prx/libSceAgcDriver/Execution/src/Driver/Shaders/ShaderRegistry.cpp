@@ -1655,17 +1655,64 @@ bool LibraryPrebuildDisabled() {
     return disabled;
 }
 
+namespace {
+
+struct RegistrationPrebuildCounters {
+    std::atomic<std::uint64_t> materializations{0}, materializeNanoseconds{0}, submits{0}, submitNanoseconds{0}, rejectedJobs{0}, rejectedJobNanoseconds{0};
+};
+
+RegistrationPrebuildCounters& registrationPrebuildCounters() {
+    static RegistrationPrebuildCounters counters;
+    return counters;
+}
+
+bool ProfilingRegistrationPrebuilds() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+std::uint64_t NanosecondsSince(std::chrono::steady_clock::time_point started) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeRegistration(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle& handle) {
+    if (!ProfilingRegistrationPrebuilds()) return ShaderRecompiler::RegistrationResult(request, handle);
+    const auto started = std::chrono::steady_clock::now();
+    auto result = ShaderRecompiler::RegistrationResult(request, handle);
+    auto& counters = registrationPrebuildCounters();
+    if (result != nullptr) counters.materializations.fetch_add(1, std::memory_order_relaxed);
+    counters.materializeNanoseconds.fetch_add(NanosecondsSince(started), std::memory_order_relaxed);
+    return result;
+}
+
+}
+
 void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Graphics::ShaderStages& stages, ShaderRecompiler::ShaderStage stage, std::shared_ptr<const ShaderRecompiler::RecompileResult> result, std::uint32_t pushOffset, std::uint64_t program) {
     if (LibraryPrebuildDisabled() || result == nullptr || (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment)) return;
-    SubmitLibraryPrebuild([device, stages, stage, result = std::move(result), pushOffset] {
+    const bool profile = ProfilingRegistrationPrebuilds();
+    const auto submitted = std::chrono::steady_clock::now();
+    SubmitLibraryPrebuild([device, stages, stage, result = std::move(result), pushOffset, profile] {
+        const auto started = std::chrono::steady_clock::now();
         const std::array<Graphics::CompiledShader, 1> shaders{{{stage, result.get(), pushOffset}}};
-        if (!Graphics::PrebuildStillServesDraws(device->Device(), stage == ShaderRecompiler::ShaderStage::Fragment ? 2u : 1u, device->PipelineJournalHoldsPipelines())) return;
+        if (!Graphics::PrebuildStillServesDraws(device->Device(), stage == ShaderRecompiler::ShaderStage::Fragment ? 2u : 1u, device->PipelineJournalHoldsPipelines())) {
+            if (profile) {
+                auto& counters = registrationPrebuildCounters();
+                counters.rejectedJobs.fetch_add(1, std::memory_order_relaxed);
+                counters.rejectedJobNanoseconds.fetch_add(NanosecondsSince(started), std::memory_order_relaxed);
+            }
+            return;
+        }
         try {
             static_cast<void>(device->PrebuildGraphicsLibraries(stages, shaders));
         } catch (const std::exception& error) {
             APS5_LOG_OUT("shader library prebuild skipped: %s", error.what());
         }
     }, program);
+    if (profile) {
+        auto& counters = registrationPrebuildCounters();
+        counters.submits.fetch_add(1, std::memory_order_relaxed);
+        counters.submitNanoseconds.fetch_add(NanosecondsSince(submitted), std::memory_order_relaxed);
+    }
 }
 
 std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& plan) {
@@ -1679,7 +1726,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
     append();
     if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && !LibraryPrebuildDisabled() && Graphics::PrebuildStillServesDraws(plan.prebuildDevice->Device(), 2u, plan.prebuildDevice->PipelineJournalHoldsPipelines())) {
         try {
-            PrebuildStageLibrary(plan.prebuildDevice, {Graphics::ShaderPath::Vertex, 0u, 32u, request.context.waveSize, {}, {}}, request.shader.stage, ShaderRecompiler::RegistrationResult(request, *entries.front().handle), request.layout.pushConstantOffsetBytes, plan.program);
+            PrebuildStageLibrary(plan.prebuildDevice, {Graphics::ShaderPath::Vertex, 0u, 32u, request.context.waveSize, {}, {}}, request.shader.stage, MaterializeRegistration(request, *entries.front().handle), request.layout.pushConstantOffsetBytes, plan.program);
         } catch (const std::exception& error) {
             APS5_LOG_OUT("shader library prebuild skipped: %s", error.what());
         }
@@ -1843,6 +1890,7 @@ public:
             std::lock_guard lifecycle(Lifecycle());
             auto* created = new RegistrationPreparePool(Closing() ? 0u : std::max(2u, std::thread::hardware_concurrency() / 2u));
             PreparationSlot().store(created);
+            Graphics::SetBusyWorkerProbe(&RegistrationPreparePool::BusyWorkers);
             return created;
         }();
         return *pool;
@@ -1858,6 +1906,7 @@ public:
             std::lock_guard lifecycle(Lifecycle());
             auto* created = new RegistrationPreparePool(Closing() ? 0u : text != nullptr ? std::max(1u, static_cast<unsigned>(std::strtoul(text, nullptr, 10))) : std::max(2u, std::thread::hardware_concurrency() / 2u));
             PrebuildSlot().store(created);
+            Graphics::SetBusyWorkerProbe(&RegistrationPreparePool::BusyWorkers);
             return created;
         }();
         return *pool;
@@ -1865,6 +1914,10 @@ public:
 
     static RegistrationPreparePool* ExistingPrebuild() {
         return PrebuildSlot().load();
+    }
+
+    static unsigned BusyWorkers() {
+        return busyWorkers.load(std::memory_order_relaxed);
     }
 
     static unsigned LiveWorkers() {
@@ -2102,6 +2155,7 @@ private:
                     if (task.program != 0) pool.waitingPrograms.fetch_sub(1, std::memory_order_relaxed);
                 }
                 ++pool.running;
+                busyWorkers.fetch_add(1, std::memory_order_relaxed);
                 if (task.budgeted) ++pool.budgetedRunning;
             }
             const auto sequence = task.sequence;
@@ -2113,6 +2167,7 @@ private:
             {
                 std::lock_guard lock(pool.mutex);
                 --pool.running;
+                busyWorkers.fetch_sub(1, std::memory_order_relaxed);
                 if (budgeted) --pool.budgetedRunning;
                 pool.unfinished.erase(sequence);
                 pool.disown(prepared, sequence);
@@ -2145,6 +2200,7 @@ private:
     std::vector<Worker> workers;
     unsigned threads = 0;
     inline static std::atomic<unsigned> liveWorkers{0};
+    inline static std::atomic<unsigned> busyWorkers{0};
     unsigned running = 0;
     unsigned budgetedRunning = 0;
     unsigned budgetedLimit = 1;
@@ -2243,6 +2299,11 @@ void AwaitReferencedPreparations(const ShaderRegistry& registry, std::span<const
             if (auto* pool = RegistrationPreparePool::Existing()) pool->AwaitOwned(prepared);
         }
     }
+}
+
+RegistrationPrebuildCost RegistrationPrebuildCosts() {
+    const auto& counters = registrationPrebuildCounters();
+    return {counters.materializations.load(std::memory_order_relaxed), counters.materializeNanoseconds.load(std::memory_order_relaxed), counters.submits.load(std::memory_order_relaxed), counters.submitNanoseconds.load(std::memory_order_relaxed), counters.rejectedJobs.load(std::memory_order_relaxed), counters.rejectedJobNanoseconds.load(std::memory_order_relaxed)};
 }
 
 void SubmitLibraryPrebuild(std::function<void()> task, std::uint64_t program) {
@@ -2360,7 +2421,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         std::shared_ptr<const ShaderRecompiler::RecompileResult> registration;
         if (registrationResults && target.registrationModules && !LibraryPrebuildDisabled()) {
             try {
-                registration = ShaderRecompiler::RegistrationResult(request, *handle);
+                registration = MaterializeRegistration(request, *handle);
             } catch (const std::exception& error) {
                 APS5_LOG_OUT("shader library prebuild skipped: %s", error.what());
             }

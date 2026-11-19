@@ -344,6 +344,15 @@ void PrioritizeRegistrationPreparation(PreparedShaders& prepared);
 void AwaitRegistrationPreparation();
 void AwaitReferencedPreparations(const ShaderRegistry& registry, std::span<const std::uint64_t> addresses);
 void SubmitLibraryPrebuild(std::function<void()> task, std::uint64_t program = 0);
+struct RegistrationPrebuildCost {
+    std::uint64_t materializations = 0;
+    std::uint64_t materializeNanoseconds = 0;
+    std::uint64_t submits = 0;
+    std::uint64_t submitNanoseconds = 0;
+    std::uint64_t rejectedJobs = 0;
+    std::uint64_t rejectedJobNanoseconds = 0;
+};
+RegistrationPrebuildCost RegistrationPrebuildCosts();
 bool LibraryPrebuildsWaiting();
 void PrioritizeLibraryPrebuilds(std::span<const std::uint64_t> programs);
 void SubmitComputePrebuild(std::function<void()> task);

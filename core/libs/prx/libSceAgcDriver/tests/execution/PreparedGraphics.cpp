@@ -153,7 +153,9 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
         Require(stages.front().registration == nullptr && !GetPreparedArtifact(*stages.front().entry.handle).registrationModule, "registration modules: the vertex stage was prepared in registration form");
         const auto pixelOnly = prebuild(stages, {1u});
         Require(pixelOnly.second == 1u, "registration modules: the pixel stage alone did not build its fragment library");
+        const auto materializedBefore = RegistrationPrebuildCosts().materializations;
         const auto again = PrepareGraphicsStages(prepared, target);
+        Require(std::getenv("APS5_PROFILE_DRAW") == nullptr || RegistrationPrebuildCosts().materializations == materializedBefore + 1u, "registration modules: a profiled preparation did not count its one registration materialization");
         Require(again.back().registration != stages.back().registration, "registration modules: the second preparation reused the first result object");
         const auto withoutRegistration = PrepareGraphicsStages(prepared, target, false, false);
         Require(std::ranges::all_of(withoutRegistration, [](const auto& stage) { return stage.registration == nullptr && stage.entry.handle != nullptr; }), "registration modules: a preparation that asked for no registration results built one");

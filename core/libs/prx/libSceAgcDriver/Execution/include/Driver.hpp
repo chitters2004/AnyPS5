@@ -37,6 +37,7 @@ extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std
 extern "C" void AgcDriverBuiltLibraryParts_nid_postfix(std::uint64_t* parts, std::uint64_t* nanoseconds);
 extern "C" void AgcDriverLibraryPartOrigins_nid_postfix(std::uint64_t* prebuilt, std::uint64_t* drawBuilt, std::uint64_t* prebuiltUsed);
 extern "C" void AgcDriverLibraryPartDetail_nid_postfix(std::uint64_t* fields);
+extern "C" void AgcDriverRegistrationPrebuildCost_nid_postfix(std::uint64_t* fields);
 extern "C" bool AgcDriverHoldSettled_nid_postfix(std::int64_t milliseconds);
 extern "C" void AgcDriverReleaseSettled_nid_postfix();
 extern "C" bool AgcDriverSettledHeld_nid_postfix();

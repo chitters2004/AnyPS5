@@ -70,11 +70,14 @@ struct PipelineLibraryCounters {
     std::array<std::uint64_t, 4> drawBuiltWithPrebuiltShaderKeys{};
     std::array<std::uint64_t, 4> drawBuiltWithPrebuiltShaderLayouts{};
     std::array<std::uint64_t, 4> prebuildsSkippedForJournal{};
+    std::array<std::uint64_t, 4> busyWorkersSum{};
+    std::array<std::uint64_t, 4> busyWorkersMax{};
     std::uint64_t linked = 0;
     std::uint64_t optimized = 0;
 };
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device);
+void SetBusyWorkerProbe(unsigned (*probe)());
 
 inline constexpr std::uint64_t PrebuildJudgedAfterDrawParts = 64u;
 inline constexpr std::uint64_t PrebuildMinimumServedPercent = 25u;

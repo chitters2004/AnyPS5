@@ -20,6 +20,13 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
+std::atomic<unsigned (*)()> busyWorkerProbe{nullptr};
+
+bool profiling() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
 constexpr std::array<VkDynamicState, 15> dynamicStates{
     VK_DYNAMIC_STATE_VIEWPORT,
     VK_DYNAMIC_STATE_SCISSOR,
@@ -286,6 +293,10 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             if (create.pStages[stage].pSpecializationInfo != nullptr) specialization += create.pStages[stage].pSpecializationInfo->mapEntryCount;
             spirv += ModuleBytes(create.pStages[stage].module);
         }
+        unsigned busy = 0;
+        if (!partsOnly && profiling()) {
+            if (const auto probe = busyWorkerProbe.load(std::memory_order_acquire)) busy = probe();
+        }
         {
             const auto asked = std::chrono::steady_clock::now();
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
@@ -320,7 +331,11 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             }
         }
         ++(partsOnly ? device.counters.builtByPrebuild : device.counters.builtByDraw)[part];
-        if (!partsOnly) device.counters.drawNanoseconds[part] += nanoseconds;
+        if (!partsOnly) {
+            device.counters.drawNanoseconds[part] += nanoseconds;
+            device.counters.busyWorkersSum[part] += busy;
+            device.counters.busyWorkersMax[part] = std::max<std::uint64_t>(device.counters.busyWorkersMax[part], busy);
+        }
         device.counters.maxNanoseconds[part] = std::max(device.counters.maxNanoseconds[part], nanoseconds);
         device.counters.waitNanoseconds[part] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count());
         device.counters.concurrentBuilds[part] += concurrent;
@@ -481,6 +496,10 @@ bool PrebuildStillServesDraws(VkDevice device, std::size_t part, bool journalHol
     if (PrebuildServesDraws(counters.prebuiltUsedByDraw.at(part), counters.builtByDraw.at(part))) return true;
     ++counters.prebuildsSkipped.at(part);
     return false;
+}
+
+void SetBusyWorkerProbe(unsigned (*probe)()) {
+    busyWorkerProbe.store(probe, std::memory_order_release);
 }
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device) {
