@@ -155,6 +155,8 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
         Require(pixelOnly.second == 1u, "registration modules: the pixel stage alone did not build its fragment library");
         const auto again = PrepareGraphicsStages(prepared, target);
         Require(again.back().registration != stages.back().registration, "registration modules: the second preparation reused the first result object");
+        const auto withoutRegistration = PrepareGraphicsStages(prepared, target, false, false);
+        Require(std::ranges::all_of(withoutRegistration, [](const auto& stage) { return stage.registration == nullptr && stage.entry.handle != nullptr; }), "registration modules: a preparation that asked for no registration results built one");
         const auto repeated = prebuild(again, {1u});
         Require(repeated.first == 0u && repeated.second == 0u, "registration modules: another materialization of the same stage did not find the prebuilt library");
     }

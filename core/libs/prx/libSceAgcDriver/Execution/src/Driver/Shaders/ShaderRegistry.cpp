@@ -1677,7 +1677,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
         entries.push_back({plan.codeOffset, PrepareShaderWithDiagnostics(request, &preparation)});
     };
     append();
-    if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && !LibraryPrebuildDisabled()) {
+    if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && !LibraryPrebuildDisabled() && Graphics::PrebuildStillServesDraws(plan.prebuildDevice->Device(), 2u, plan.prebuildDevice->PipelineJournalHoldsPipelines())) {
         try {
             PrebuildStageLibrary(plan.prebuildDevice, {Graphics::ShaderPath::Vertex, 0u, 32u, request.context.waveSize, {}, {}}, request.shader.stage, ShaderRecompiler::RegistrationResult(request, *entries.front().handle), request.layout.pushConstantOffsetBytes, plan.program);
         } catch (const std::exception& error) {
@@ -2278,7 +2278,7 @@ std::optional<std::size_t> RegistrationPreparationsPending() {
     return RegistrationPreparePool::Pending();
 }
 
-std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decoded, const ShaderRecompiler::SpirvTarget& target, bool deferUnprepared) {
+std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decoded, const ShaderRecompiler::SpirvTarget& target, bool deferUnprepared, bool registrationResults) {
     ShaderPreparationTransaction transaction;
     require(decoded.programs.size() == decoded.roles.size(), "graphics ABI program roles are incomplete");
     for (const auto& program : decoded.programs) require(program.snapshot != nullptr, "graphics ABI has no registered shader snapshot");
@@ -2358,7 +2358,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         const auto bytes = handle->artifact->bindings.pushConstantSizeBytes;
         require(bytes <= room, "prepared graphics stages exceed the push constant block");
         std::shared_ptr<const ShaderRecompiler::RecompileResult> registration;
-        if (target.registrationModules && !LibraryPrebuildDisabled()) {
+        if (registrationResults && target.registrationModules && !LibraryPrebuildDisabled()) {
             try {
                 registration = ShaderRecompiler::RegistrationResult(request, *handle);
             } catch (const std::exception& error) {
@@ -2457,9 +2457,11 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
         transaction.Commit();
         return;
     }
-    auto prepared = PrepareGraphicsStages(decoded, localDevice->Target(), true);
+    const bool journalHeld = localDevice->PipelineJournalHoldsPipelines();
+    auto prepared = PrepareGraphicsStages(decoded, localDevice->Target(), true, !journalHeld);
     if (decoded.state.stages.path == Graphics::ShaderPath::Vertex) {
         for (const auto& stage : prepared) {
+            if (journalHeld && stage.entry.handle != nullptr && (stage.stage == ShaderRecompiler::ShaderStage::Vertex || stage.stage == ShaderRecompiler::ShaderStage::Fragment)) static_cast<void>(Graphics::PrebuildStillServesDraws(localDevice->Device(), stage.stage == ShaderRecompiler::ShaderStage::Fragment ? 2u : 1u, true));
             if (stage.registration != nullptr) PrebuildStageLibrary(localDevice, decoded.state.stages, stage.stage, stage.registration, stage.pushOffset, stage.snapshot->codeAddress + stage.entry.codeOffset * sizeof(std::uint32_t));
         }
     }
