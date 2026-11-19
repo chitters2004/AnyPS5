@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -27,6 +28,25 @@ public:
     ProofWorkTrace& operator=(const ProofWorkTrace&) = delete;
     static bool Active();
     static void Note(ProofWork work);
+    class ObjectScope {
+    public:
+        explicit ObjectScope(const void* object);
+        ~ObjectScope();
+        ObjectScope(const ObjectScope&) = delete;
+        ObjectScope& operator=(const ObjectScope&) = delete;
+
+    private:
+        const void* previous;
+    };
+    template <typename Referenced> void KeepReferenced(Referenced&& referenced) {
+        for (const auto& [object, work] : objectWork) {
+            if (referenced(object)) continue;
+            --counts[static_cast<std::size_t>(work)];
+            ++unreferenced[static_cast<std::size_t>(work)];
+        }
+        objectWork.clear();
+    }
+    std::uint64_t Unreferenced(ProofWork work) const { return unreferenced[static_cast<std::size_t>(work)]; }
     static void NoteUpload(std::uint64_t address, std::uint64_t bytes);
     std::uint64_t Count(ProofWork work) const { return counts[static_cast<std::size_t>(work)]; }
     std::uint64_t Total() const;
@@ -35,6 +55,8 @@ public:
 
 private:
     std::array<std::uint64_t, static_cast<std::size_t>(ProofWork::Count)> counts{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ProofWork::Count)> unreferenced{};
+    std::vector<std::pair<const void*, ProofWork>> objectWork;
     std::array<std::pair<std::uint64_t, std::uint64_t>, 4> uploads{};
     std::size_t uploadCount = 0;
     ProofWorkTrace* previous = nullptr;
