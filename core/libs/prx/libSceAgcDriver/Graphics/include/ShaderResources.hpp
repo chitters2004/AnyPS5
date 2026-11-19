@@ -434,6 +434,7 @@ public:
     static void SetRangeWriteSnapshotBytesForTest(std::uint64_t bytes);
     static void SetRangeSnapshotsEagerForTest(bool eager);
     static std::uint64_t ImageTableThrowsForTest();
+    static std::uint64_t RangeSnapshotCopiesForTest();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
@@ -865,7 +866,12 @@ private:
     bool flushUnscoped = true;
     std::uint64_t planesClean = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> proofRanges;
-    std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> proofRangeBytes;
+    struct RangeSnapshot {
+        std::uint64_t begin = 0;
+        std::vector<std::byte> bytes;
+        bool compared = false;
+    };
+    std::vector<RangeSnapshot> proofRangeBytes;
     bool provedRanges = false;
     void recordFlushRanges();
     void recordProofRanges();

@@ -1286,6 +1286,22 @@ void rangeVersionTests(Context context) {
     std::fprintf(stderr, "range versions: lazy snapshots: a rewrite of the same bytes into a range never seen written: the exit %s; the same rewrite after that range was seen written: the exit %s\n", coldTaken ? "was taken" : "was refused", warmTaken ? "was taken" : "was refused");
     Require(!coldTaken, "a range never seen written was snapshotted");
     Require(warmTaken, "a range seen written was not snapshotted by the next full proof");
+    AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+    const auto copiesBefore = ShaderResources::RangeSnapshotCopiesForTest();
+    Require(!exitTaken(), "an unranged break did not force the full proof before the snapshot reuse check");
+    const auto copiesUnwritten = ShaderResources::RangeSnapshotCopiesForTest() - copiesBefore;
+    rewrite();
+    const bool keptTaken = exitTaken();
+    std::fprintf(stderr, "range versions: a full proof with the snapshotted range unwritten copied %llu snapshots; a later rewrite of the same bytes: the exit %s\n", static_cast<unsigned long long>(copiesUnwritten), keptTaken ? "was taken" : "was refused");
+    Require(copiesUnwritten == 0, "a full proof copied a snapshot whose range was not written since the last one");
+    Require(keptTaken, "a snapshot kept from the previous proof did not pass the same bytes");
+    std::memset(reinterpret_cast<void*>(address + 8192u), 0x3d, 64u);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto copiesBeforeWritten = ShaderResources::RangeSnapshotCopiesForTest();
+    Require(!exitTaken(), "new bytes in the snapshotted range passed the byte compare");
+    const auto copiesWritten = ShaderResources::RangeSnapshotCopiesForTest() - copiesBeforeWritten;
+    std::fprintf(stderr, "range versions: a full proof after new bytes in the snapshotted range copied %llu snapshots\n", static_cast<unsigned long long>(copiesWritten));
+    Require(copiesWritten != 0, "a full proof kept a snapshot whose bytes differ from the range");
     if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
     std::fprintf(stderr, "range versions: exits matched the producers\n");
 }
