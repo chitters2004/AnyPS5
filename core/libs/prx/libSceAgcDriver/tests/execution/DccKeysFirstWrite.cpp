@@ -397,6 +397,29 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     image->MarkDirty();
     device.WaitIdle();
     RequireKeys(keys, 0x40, "a write marked after a 0001 key fill over a cleared image, before a refresh saw the fill");
+    image->Refresh();
+    device.WaitIdle();
+    std::vector<std::byte> clearTexels(SurfaceBytes);
+    AgcDriver::Graphics::ReadTextureSurface(image->Descriptor(), DccKeys::Clear1111, clearTexels);
+    std::memcpy(texels, clearTexels.data(), SurfaceBytes);
+    image->Refresh();
+    device.WaitIdle();
+    std::memset(keys, 0xc0, KeyBytes);
+    image->Refresh();
+    device.WaitIdle();
+    std::snprintf(message, sizeof(message), "a refresh after the CPU stored 1111 keys uploaded the image under %s keys", AgcDriver::Graphics::DccKeysName(image->UploadedKeys()));
+    Require(image->UploadedKeys() == DccKeys::Clear1111, message);
+    std::memset(keys, 0xff, KeyBytes);
+    image->Refresh();
+    device.WaitIdle();
+    std::snprintf(message, sizeof(message), "a refresh after the CPU stored uncompressed keys over texels that hold the 1111 colour uploaded the image under %s keys", AgcDriver::Graphics::DccKeysName(image->UploadedKeys()));
+    Require(image->UploadedKeys() == DccKeys::Uncompressed, message);
+    std::memset(keys, 0x00, KeyBytes);
+    image->Refresh();
+    device.WaitIdle();
+    std::snprintf(message, sizeof(message), "a refresh after the CPU stored 0000 keys over texels that hold the 1111 colour uploaded the image under %s keys", AgcDriver::Graphics::DccKeysName(image->UploadedKeys()));
+    Require(image->UploadedKeys() == DccKeys::Clear0000, message);
+    StorageTexture::ReportKeysUploads();
 }
 
 void RunReusedKeys(AgcDriver::VulkanDevice& device, std::uint8_t* block) {

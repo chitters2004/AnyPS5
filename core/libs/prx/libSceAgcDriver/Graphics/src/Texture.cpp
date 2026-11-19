@@ -3446,6 +3446,91 @@ std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units
     return selected;
 }
 
+namespace {
+
+bool KeysUploadsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_KEYS_UPLOADS") != nullptr;
+    return profiled;
+}
+
+constexpr std::size_t DccKeyStates = 9;
+constexpr std::array<const char*, 3> KeysUploadPaths{"GPU clear", "texel transfer", "other decode"};
+
+struct KeysUploadCounts {
+    using Cells = std::array<std::array<std::array<std::atomic<std::uint64_t>, KeysUploadPaths.size()>, DccKeyStates>, DccKeyStates>;
+    Cells uploads{};
+    Cells bytes{};
+    Cells unchanged{};
+    Cells unchangedUnwritten{};
+    Cells unchangedBytes{};
+    Cells sameDecode{};
+    Cells sameDecodeBytes{};
+};
+
+KeysUploadCounts& keysUploadCounts() {
+    static KeysUploadCounts counts;
+    return counts;
+}
+
+}
+
+void StorageTexture::noteKeysUpload(DccKeys previous, bool cleared, bool whole) {
+    const bool gpuWrote = keysUploadVersion == 0 || version != keysUploadVersion;
+    keysUploadVersion = version + 1;
+    std::uint64_t hash = 0;
+    if (whole && guestBytesSettled()) {
+        std::vector<std::byte> bytes(static_cast<std::size_t>(guestBytes));
+        GuestMemory::ReadCommitted(descriptor.baseAddress, bytes);
+        hash = ShaderRecompiler::HashBytes(bytes, 0x6b657973u) | 1u;
+    }
+    const bool unchanged = hash != 0 && hash == keysUploadHash;
+    keysUploadHash = hash;
+    if (std::strcmp(uploadReason, "keys") != 0) return;
+    const auto from = std::min<std::size_t>(static_cast<std::size_t>(previous), DccKeyStates - 1);
+    const auto to = std::min<std::size_t>(static_cast<std::size_t>(uploadedKeys), DccKeyStates - 1);
+    const auto path = cleared ? 0u : uploadedKeys == DccKeys::Uncompressed ? 1u : 2u;
+    auto& counts = keysUploadCounts();
+    counts.uploads[from][to][path].fetch_add(1, std::memory_order_relaxed);
+    counts.bytes[from][to][path].fetch_add(guestBytes, std::memory_order_relaxed);
+    if (!unchanged) return;
+    counts.unchanged[from][to][path].fetch_add(1, std::memory_order_relaxed);
+    counts.unchangedBytes[from][to][path].fetch_add(guestBytes, std::memory_order_relaxed);
+    if (gpuWrote) return;
+    counts.unchangedUnwritten[from][to][path].fetch_add(1, std::memory_order_relaxed);
+    std::vector<std::byte> before(static_cast<std::size_t>(guestBytes));
+    std::vector<std::byte> after(static_cast<std::size_t>(guestBytes));
+    ReadTextureSurface(descriptor, previous, before);
+    ReadTextureSurface(descriptor, uploadedKeys, after);
+    if (before != after) return;
+    counts.sameDecode[from][to][path].fetch_add(1, std::memory_order_relaxed);
+    counts.sameDecodeBytes[from][to][path].fetch_add(guestBytes, std::memory_order_relaxed);
+}
+
+void StorageTexture::ReportKeysUploads() {
+    if (!KeysUploadsProfiled()) return;
+    const auto mib = [](std::uint64_t value) { return static_cast<double>(value) / 1048576.0; };
+    auto& counts = keysUploadCounts();
+    std::string cells;
+    for (std::size_t from = 0; from < DccKeyStates; ++from) {
+        for (std::size_t to = 0; to < DccKeyStates; ++to) {
+            for (std::size_t path = 0; path < KeysUploadPaths.size(); ++path) {
+                const auto uploads = counts.uploads[from][to][path].exchange(0, std::memory_order_relaxed);
+                const auto bytes = counts.bytes[from][to][path].exchange(0, std::memory_order_relaxed);
+                const auto unchanged = counts.unchanged[from][to][path].exchange(0, std::memory_order_relaxed);
+                const auto unchangedBytes = counts.unchangedBytes[from][to][path].exchange(0, std::memory_order_relaxed);
+                const auto unwritten = counts.unchangedUnwritten[from][to][path].exchange(0, std::memory_order_relaxed);
+                const auto same = counts.sameDecode[from][to][path].exchange(0, std::memory_order_relaxed);
+                const auto sameBytes = counts.sameDecodeBytes[from][to][path].exchange(0, std::memory_order_relaxed);
+                if (uploads == 0) continue;
+                char cell[288];
+                std::snprintf(cell, sizeof(cell), "%s%s -> %s by %s %llu (%.1f MiB), unchanged guest bytes %llu (%.1f MiB), then image not written since %llu, then both keys decode the same texels %llu (%.1f MiB)", cells.empty() ? "" : "; ", DccKeysName(static_cast<DccKeys>(from)), DccKeysName(static_cast<DccKeys>(to)), KeysUploadPaths[path], static_cast<unsigned long long>(uploads), mib(bytes), static_cast<unsigned long long>(unchanged), mib(unchangedBytes), static_cast<unsigned long long>(unwritten), static_cast<unsigned long long>(same), mib(sameBytes));
+                cells += cell;
+            }
+        }
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] keys-reason uploads by key change and path (10 s, APS5_PROFILE_KEYS_UPLOADS; keys of the last upload -> keys now; a GPU clear neither reads nor fills texel memory; unchanged: the guest bytes hash as at the image's last upload; the last column is what skipping the upload would keep exact): %s\n", cells.empty() ? "none" : cells.c_str());
+}
+
 void StorageTexture::upload(const std::vector<bool>* layers) {
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3476,11 +3561,14 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         }
         refreshGeneration();
     };
+    const auto previousKeys = uploadedKeys;
     uploadedKeys = ProvedClearKeys(descriptor, guestBytes, keyProof);
     filledKeys = DccKeys::Uncompressed;
     VkClearColorValue clearValue{};
     const bool fastClear = IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle;
-    if (fastClear && (ClearColorFor(storageFormat, uploadedKeys, clearValue) || SingleKeyColorFor(descriptor, guestBytes, now, singleProof, storageFormat, uploadedKeys, clearValue))) {
+    const bool clearedOnGpu = fastClear && (ClearColorFor(storageFormat, uploadedKeys, clearValue) || SingleKeyColorFor(descriptor, guestBytes, now, singleProof, storageFormat, uploadedKeys, clearValue));
+    if (descriptor.dccAddress != 0 && KeysUploadsProfiled()) noteKeysUpload(previousKeys, clearedOnGpu, layers == nullptr);
+    if (clearedOnGpu) {
         // A fast-cleared surface is cleared on the GPU; its texel memory is neither read nor filled.
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
