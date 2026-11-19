@@ -568,6 +568,7 @@ public:
     // GuestMemory::GpuMutex only, as Refresh is; never from a build's stage A.
     DccKeys UploadedKeys() const { return uploadedKeys; }
     DccKeys FilledKeys() const { return filledKeys; }
+    static void ReportKeysUploads();
     bool GuestSnapshotValid() const { return originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); }
     DccKeyProof& KeyProof() const { return keyProof; }
     DccRangeProof& TargetKeyProof() const { return targetKeyProof; }
@@ -886,6 +887,9 @@ private:
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     mutable DccKeys filledKeys = DccKeys::Uncompressed;
+    std::uint64_t keysUploadHash = 0;
+    std::uint64_t keysUploadVersion = 0;
+    void noteKeysUpload(DccKeys previous, bool cleared, bool whole);
     mutable DccKeyProof keyProof;
     mutable DccRangeProof targetKeyProof;
     DccSingleProof singleProof;

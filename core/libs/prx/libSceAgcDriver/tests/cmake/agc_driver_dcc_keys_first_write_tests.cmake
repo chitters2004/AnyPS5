@@ -1,4 +1,8 @@
 if(BUILD_TESTING)
+    add_test(NAME agc_driver_dcc_keys_upload_census COMMAND agc_driver_dcc_keys_first_write_tests)
+    set_tests_properties(agc_driver_dcc_keys_upload_census PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_KEYS_UPLOADS=1" TIMEOUT 60 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            PASS_REGULAR_EXPRESSION "PLACEHOLDER")
     add_test(NAME agc_driver_dcc_keys_rewrite_after_memo COMMAND agc_driver_dcc_keys_first_write_tests --rewrite-after-memo)
     add_test(NAME agc_driver_dcc_keys_rewrite_after_refresh_proof COMMAND agc_driver_dcc_keys_first_write_tests --rewrite-after-refresh-proof)
     add_test(NAME agc_driver_dcc_keys_rewrite_after_epoch_proof COMMAND agc_driver_dcc_keys_first_write_tests --rewrite-after-epoch-proof)
