@@ -1164,14 +1164,29 @@ struct RegistrationModuleEntry {
     std::once_flag ready;
     std::exception_ptr failure;
     std::shared_ptr<const SpecializedModule> module;
+    bool builtAtRegistration = false;
 };
+
+struct RegistrationModuleTable {
+    std::atomic<std::uint64_t> registrationLookups{0};
+    std::atomic<std::uint64_t> registrationBuilds{0};
+    std::atomic<std::uint64_t> drawLookups{0};
+    std::atomic<std::uint64_t> drawServedFromRegistration{0};
+    std::atomic<std::uint64_t> drawServedFromDraw{0};
+    std::atomic<std::uint64_t> drawBuilds{0};
+};
+
+RegistrationModuleTable& registrationModuleTable() {
+    static RegistrationModuleTable table;
+    return table;
+}
 
 SharedSpirv lockedWords(const SpecializedModule& module) {
     std::lock_guard lock(module.mutex);
     return module.spirv.Lock();
 }
 
-SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<SpecializedSpirv()>& specialize) {
+SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, bool atRegistration, const std::function<SpecializedSpirv()>& specialize) {
     std::vector<std::uint64_t> key{variantId};
     key.insert(key.end(), moduleKey.begin(), moduleKey.end());
     static PrimedSharedMutex mutex;
@@ -1187,7 +1202,13 @@ SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std
         entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<RegistrationModuleEntry>()).first->second;
     }
     SharedSpirv built;
+    auto& table = registrationModuleTable();
+    ++(atRegistration ? table.registrationLookups : table.drawLookups);
+    bool compiled = false;
     std::call_once(entry->ready, [&] {
+        compiled = true;
+        entry->builtAtRegistration = atRegistration;
+        ++(atRegistration ? table.registrationBuilds : table.drawBuilds);
         try {
             auto specialized = specialize();
             entry->module = std::move(specialized.module);
@@ -1196,6 +1217,7 @@ SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std
             entry->failure = std::current_exception();
         }
     });
+    if (!compiled && !atRegistration) ++(entry->builtAtRegistration ? table.drawServedFromRegistration : table.drawServedFromDraw);
     if (entry->failure) std::rethrow_exception(entry->failure);
     if (built.empty()) built = lockedWords(*entry->module);
     if (built.empty()) built = specialize().spirv;
@@ -1408,7 +1430,16 @@ struct ModuleVariantTally {
     std::uint64_t shape = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ModuleField::Count)> firstDiffering{};
     std::array<std::uint64_t, DescriptorClassNames.size()> descriptorClasses{};
+    std::uint64_t servedWithOtherDescriptorValues = 0;
 };
+
+TaggedModuleKey WithoutDescriptorValues(const TaggedModuleKey& key) {
+    TaggedModuleKey stripped;
+    for (const auto& entry : key) {
+        if (entry.first != ModuleField::DescriptorValues) stripped.push_back(entry);
+    }
+    return stripped;
+}
 
 ModuleVariantTally& moduleVariants() {
     static ModuleVariantTally tally;
@@ -1458,6 +1489,10 @@ void noteModuleVariant(const RecompileRequest& request, const CompiledVariant& v
     if (modules.registration.contains(key)) {
         ++tally.equal;
         return;
+    }
+    if (request.target.registrationModules) {
+        const auto stripped = WithoutDescriptorValues(key);
+        if (std::ranges::any_of(modules.registration, [&](const TaggedModuleKey& registered) { return WithoutDescriptorValues(registered) == stripped; })) ++tally.servedWithOtherDescriptorValues;
     }
     std::size_t best = 0;
     std::optional<ModuleField> field;
@@ -1637,7 +1672,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
-            return artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
+            return artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, registrationDefaults, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
         };
         SharedSpirv built;
         const auto prepare = [&] {
@@ -2671,6 +2706,9 @@ std::string ModuleVariantsLine() {
     for (std::size_t field = 0; field < ModuleFieldNames.size(); ++field) text += std::string(field == 0 ? " " : ", ") + ModuleFieldNames[field] + " " + number(tally.firstDiffering[field]);
     text += ", other key shape " + number(tally.shape) + "; differing descriptor values by class:";
     for (std::size_t index = 0; index < DescriptorClassNames.size(); ++index) text += std::string(index == 0 ? " " : ", ") + DescriptorClassNames[index] + " " + number(tally.descriptorClasses[index]);
+    const auto& table = registrationModuleTable();
+    text += "; of the differing, the registration module key without descriptor values matches " + number(tally.servedWithOtherDescriptorValues);
+    text += "; registration module table: registration lookups " + number(table.registrationLookups) + " (built " + number(table.registrationBuilds) + "), draw lookups " + number(table.drawLookups) + " (served by a module a registration built " + number(table.drawServedFromRegistration) + ", by one an earlier draw built " + number(table.drawServedFromDraw) + ", built at the draw " + number(table.drawBuilds) + ")";
     text += "; variants drawn " + std::to_string(drawnVariants) + ", with more than one draw module " + std::to_string(splitVariants) + ", most draw modules for one variant " + std::to_string(most);
     return text;
 }
