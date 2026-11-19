@@ -360,6 +360,17 @@ double ReportAllocations(const Shape& shape, std::size_t draws) {
     // move the subtraction by hundreds of allocations, so it finishes first, and the warm-up then runs the
     // optimized pipeline the measured draws bind.
     auto& driver = AgcDriver::DriverDetail::Driver::Get();
+    // LAB-ONLY REPRODUCTION ARM (never pushed): APS5_LAB_NO_SETTLE runs the census exactly as before the fix.
+    if (std::getenv("APS5_LAB_NO_SETTLE") != nullptr) {
+        for (int warm = 0; warm < 3; ++warm) Submit(repeated);
+        const auto base = Measure(empty, submits);
+        const auto many = Measure(repeated, submits);
+        const auto perDraw = PerDraw(many.count, base.count, draws);
+        std::printf("draw allocations [%s] UNSETTLED per draw: %.3f (base %llu, many %llu)\n", shape.name, perDraw, static_cast<unsigned long long>(base.count), static_cast<unsigned long long>(many.count));
+        const auto& ceiling = std::getenv("APS5_DRAW_PIPELINE") != nullptr ? shape.pipelined : shape.plain;
+        Require(perDraw <= ceiling.allocations, std::string("draw allocations [") + shape.name + "]: UNSETTLED " + std::to_string(perDraw) + " allocations per warmed draw, more than the limit " + std::to_string(ceiling.allocations));
+        return perDraw;
+    }
     Submit(repeated);
     (void)driver.SettledPipelineLibraryWork();
     for (int warm = 0; warm < 3; ++warm) Submit(repeated);

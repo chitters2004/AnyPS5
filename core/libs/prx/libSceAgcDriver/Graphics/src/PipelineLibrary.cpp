@@ -309,6 +309,8 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             create.flags = VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
             create.layout = libraryLayout;
             VkPipeline result = VK_NULL_HANDLE;
+            // LAB-ONLY REPRODUCTION MUTANT (never pushed): stretch the relink so it lands in a census window.
+            if (const char* labDelay = std::getenv("APS5_LAB_RELINK_DELAY_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(labDelay)));
             const auto pipelineCreationResult = [&] {
                 auto pipelineCacheLock = cacheSynchronization != nullptr ? cacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
                 return createPipelines(slot->device, cache, 1, &create, nullptr, &result);
