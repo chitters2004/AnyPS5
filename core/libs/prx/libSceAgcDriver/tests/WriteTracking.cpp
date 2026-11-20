@@ -1148,9 +1148,18 @@ void CheckComparedSharingGenerations() {
         fixture.Share();
         const auto neighbour = fixture.Collect(fixture.base + Block);
         Require(neighbour != 0, "shared direct memory that never left the watch was not collected");
+        const auto writable = [&] {
+            for (auto* alias : {fixture.memory, fixture.memory + ComparedSharing::bytes}) {
+                MEMORY_BASIC_INFORMATION info{};
+                if (VirtualQuery(alias, &info, sizeof(info)) != sizeof(info) || (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) return false;
+            }
+            return true;
+        };
+        Require(writable(), "shared compared memory is write-protected before the refused collect");
         fixture.memory[Block + 8] = 0x47;
         BumpCollectEpoch();
         Require(CollectWrites(fixture.base, 2 * Block) == 0, "a collect over compared memory and its neighbour was not refused");
+        Require(writable(), "a refused collect armed write tracking on compared memory");
         const std::array<std::uint64_t, 2> generations{neighbour, neighbour};
         std::array<std::uint8_t, 2> changed{};
         std::array<std::uint8_t, 2> cpu{};
@@ -1909,25 +1918,33 @@ void CheckWidenedCollectBesideUncommittedPages() {
     Require(ChangedBlocks(base, Block, generations, changed, cpu) && changed[0] == BlockWritten && cpu[0] == 1, "a refused collect left a CPU-written block reading as unchanged");
 }
 
-void CheckRefusedCollectBesideInaccessibleView() {
+void CheckRefusedCollectBesideInaccessibleView(bool shared) {
     constexpr std::size_t bytes = 4 * Block;
     constexpr std::size_t viewBytes = 16384;
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
     Require(section != nullptr, "cannot create the inaccessible view backing");
-    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * bytes, Block));
     Require(memory != nullptr, "cannot allocate the inaccessible view address");
     struct Cleanup {
         std::uint8_t* memory;
         HANDLE section;
         ~Cleanup() {
             GuestArena::GuestArenaSetProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(memory) + Block, viewBytes, PAGE_READWRITE);
-            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
-            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+            GuestArena::GuestArenaReset_nid_postfix(memory, 2 * bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, 2 * bytes);
             GuestArena::GuestArenaForgetSection_nid_postfix(section);
             CloseHandle(section);
         }
     } cleanup{memory, section};
-    GuestArena::GuestArenaMap_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
+    if (shared) {
+        GuestArena::GuestArenaForgetSection_nid_postfix(section);
+        GuestArena::GuestArenaMapDirect_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
+        GuestArena::GuestArenaMapDirect_nid_postfix(memory + bytes, bytes, section, 0, PAGE_READWRITE);
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(memory, &info, sizeof(info)) == sizeof(info) && info.Type == MEM_MAPPED, "a second mapping kept the inaccessible view resident");
+    } else {
+        GuestArena::GuestArenaMap_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
+    }
     const auto base = reinterpret_cast<std::uint64_t>(memory);
     auto* view = static_cast<volatile std::uint8_t*>(memory);
     BumpCollectEpoch();
@@ -2811,7 +2828,8 @@ int main(int argc, char** argv) {
         CheckCollectBoundaries();
 #ifdef _WIN32
         CheckWidenedCollectBesideUncommittedPages();
-        CheckRefusedCollectBesideInaccessibleView();
+        CheckRefusedCollectBesideInaccessibleView(false);
+        CheckRefusedCollectBesideInaccessibleView(true);
 #endif
         CheckImportWindow();
         CheckImportWindowZeroPages();
