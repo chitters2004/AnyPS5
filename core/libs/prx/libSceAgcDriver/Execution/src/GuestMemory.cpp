@@ -3820,6 +3820,32 @@ void SetCompareMappedHook(void (*hook)(std::uint64_t address, std::size_t bytes)
 Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return Compare::Equal;
     if (address == 0 || bytes.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
+#ifdef _WIN32
+    std::uintptr_t arenaBase = 0;
+    std::size_t arenaBytes = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+    if (address >= arenaBase && bytes.size() <= arenaBytes && address - arenaBase <= arenaBytes - bytes.size() && !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes.size())) {
+        if (compareMappedHook != nullptr) compareMappedHook(address, bytes.size());
+        bool same = false;
+        if (!GuestArena::GuestArenaCompareOwned_nid_no_patch(address, bytes.data(), bytes.size(), &same)) return Compare::Unmapped;
+        return same ? Compare::Equal : Compare::Differs;
+    }
+#elif defined(__linux__) || defined(__APPLE__)
+    if (compareMappedHook != nullptr) compareMappedHook(address, bytes.size());
+    constexpr std::size_t ChunkBytes = 64 * PageBytes;
+    struct CompareMappedChunk {};
+    auto& chunk = HostThreadLocal<std::vector<std::byte>, CompareMappedChunk>();
+    if (chunk.size() < std::min(ChunkBytes, bytes.size())) chunk.resize(std::min(ChunkBytes, bytes.size()));
+    const int savedErrno = errno;
+    auto compared = Compare::Equal;
+    for (std::size_t done = 0; done < bytes.size() && compared == Compare::Equal; done += ChunkBytes) {
+        const auto count = std::min(ChunkBytes, bytes.size() - done);
+        if (!GuestCopyInUnsynced_nid_no_patch(chunk.data(), reinterpret_cast<const void*>(address + done), count)) compared = Compare::Unmapped;
+        else if (std::memcmp(chunk.data(), bytes.data() + done, count) != 0) compared = Compare::Differs;
+    }
+    errno = savedErrno;
+    return compared;
+#endif
     auto outcome = Compare::Equal;
     // Each run's page state is consulted right before its bytes are compared.
     const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes.size(), [&](const PageRun& run) {
