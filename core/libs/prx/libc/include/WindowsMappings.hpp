@@ -698,11 +698,6 @@ public:
                         }
                     }
                 }
-                if (skipRefused && view.page->comparedWhenShared) {
-                    flushClean();
-                    cursor = stop;
-                    continue;
-                }
                 if (view.protection == PAGE_NOACCESS && !skipRefused) {
                     flushClean();
                     return false;
