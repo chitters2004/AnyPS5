@@ -108,6 +108,15 @@ void Check(std::string_view mode) {
         Require(CompareMapped(range.Address() + Unit - 128u, expected) == Compare::Equal, "equal bytes across two committed units compared unequal");
         return;
     }
+    if (mode == "compare-prefix") {
+        GuestArena::GuestArenaReset_nid_postfix(range.Data() + Unit, Unit);
+        std::array<std::byte, 256> expected{};
+        expected.fill(std::byte{0x5b});
+        Require(CompareMapped(range.Address() + Unit - 128u, expected) == Compare::Unmapped, "an equal prefix before a reset unit was not reported unmapped");
+        expected.front() = std::byte{0x5c};
+        Require(CompareMapped(range.Address() + Unit - 128u, expected) == Compare::Differs, "a difference before a reset unit was reported unmapped");
+        return;
+    }
     if (mode == "reset") {
         GuestArena::GuestArenaReset_nid_postfix(range.Data(), 2 * Unit);
         errno = E2BIG;
