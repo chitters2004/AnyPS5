@@ -703,7 +703,7 @@ public:
                     cursor = stop;
                     continue;
                 }
-                if (view.protection == PAGE_NOACCESS && !skipRefused) {
+                if (view.protection == PAGE_NOACCESS) {
                     flushClean();
                     return false;
                 }
