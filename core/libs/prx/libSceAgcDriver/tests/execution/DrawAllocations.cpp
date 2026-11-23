@@ -14,6 +14,7 @@ int main() {
 #include "prx/libc/include/GuestArena.hpp"
 #include "VulkanTestDevice.hpp"
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -227,6 +228,8 @@ struct Site {
     std::atomic<std::uintptr_t> caller{0};
     std::atomic<std::uint64_t> count{0};
     std::atomic<std::uint64_t> bytes{0};
+    void* frames[10]{};
+    int depth = 0;
 };
 
 struct ThreadCount {
@@ -246,7 +249,10 @@ void Observe(std::size_t bytes, const void* caller) noexcept {
     for (std::size_t probe = 0; probe < SiteSlots; ++probe, slot = (slot + 1) % SiteSlots) {
         auto& site = sites[slot];
         auto current = site.caller.load(std::memory_order_relaxed);
-        if (current == 0 && site.caller.compare_exchange_strong(current, address)) current = address;
+        if (current == 0 && site.caller.compare_exchange_strong(current, address)) {
+            current = address;
+            site.depth = backtrace(site.frames, 10);
+        }
         if (current != address) continue;
         site.count.fetch_add(1, std::memory_order_relaxed);
         site.bytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -383,6 +389,24 @@ double ReportAllocations(const Shape& shape, std::size_t draws) {
         everyDraw += static_cast<std::uint64_t>(std::max(0.0, std::floor(sitePerDraw + 0.02)));
         if (sitePerDraw < 0.05) continue;
         std::printf("  site %s: %.3f per draw, %.1f bytes per draw\n", Location(site.caller).c_str(), sitePerDraw, PerDraw(site.bytes, baseBytes, draws));
+        for (const auto& probeSite : sites) {
+            if (probeSite.caller.load() != site.caller) continue;
+            for (int frame = 2; frame < probeSite.depth; ++frame) {
+                Dl_info info{};
+                const auto at = reinterpret_cast<std::uintptr_t>(probeSite.frames[frame]);
+                if (dladdr(probeSite.frames[frame], &info) == 0 || info.dli_fname == nullptr) continue;
+                char command[1024];
+                std::snprintf(command, sizeof(command), "addr2line -f -C -i -e '%s' 0x%llx 2>/dev/null | paste -sd'|' | cut -c1-400", info.dli_fname, static_cast<unsigned long long>(at - 1 - reinterpret_cast<std::uintptr_t>(info.dli_fbase)));
+                std::string line;
+                if (FILE* pipe = popen(command, "r")) {
+                    char buffer[512];
+                    while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) line += buffer;
+                    pclose(pipe);
+                }
+                if (!line.empty() && line.back() == '\n') line.pop_back();
+                std::printf("      #%d %s %s\n", frame, Location(at).c_str(), line.c_str());
+            }
+        }
     }
     std::printf("draw allocations [%s]: %llu allocations made on every draw, counted per call site\n", shape.name, static_cast<unsigned long long>(everyDraw));
     const auto perDrawBytes = PerDraw(many.bytes, base.bytes, draws);

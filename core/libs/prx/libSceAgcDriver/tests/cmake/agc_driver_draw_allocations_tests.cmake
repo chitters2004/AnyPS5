@@ -1,4 +1,7 @@
 if(BUILD_TESTING)
     agc_add_draw_pipeline_test(agc_driver_draw_allocations)
     set_property(TEST agc_driver_draw_allocations agc_driver_draw_allocations_draw_pipeline agc_driver_draw_allocations_plan_verify APPEND PROPERTY ENVIRONMENT_MODIFICATION "VK_INSTANCE_LAYERS=unset:")
+    add_test(NAME agc_driver_draw_allocations_inline_dispatch COMMAND agc_driver_draw_allocations_tests)
+    set_tests_properties(agc_driver_draw_allocations_inline_dispatch PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_PIPELINE_DISPATCH=1;APS5_DRAW_ALLOCATIONS_SHAPE=dispatch" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_property(TEST agc_driver_draw_allocations_inline_dispatch APPEND PROPERTY ENVIRONMENT_MODIFICATION "VK_INSTANCE_LAYERS=unset:")
 endif()
