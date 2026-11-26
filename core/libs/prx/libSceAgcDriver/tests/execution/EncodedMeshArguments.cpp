@@ -22,6 +22,11 @@ int main() {
         if (!device) return VulkanTestSkipped;
         using namespace AgcDriver::Graphics;
         const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+        if (!context.meshShader) {
+            std::printf("skipped, the device has no mesh shader support
+");
+            return VulkanTestSkipped;
+        }
         auto* recorder = Recorder::Active();
         Require(recorder != nullptr, "the device has no active recorder");
         if (!recorder->Encodes()) {
