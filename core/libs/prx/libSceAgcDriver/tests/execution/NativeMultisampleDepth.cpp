@@ -1467,7 +1467,7 @@ void CheckDepthPublication(Context context, std::uint32_t samples, PublicationWr
         if (importedAlias) Require(!MultisampleColorTargetOver(alias.address, aliasBytes).has_value(), "a publication over a colour target the depth surface had taken in kept that colour target resident");
         if (write == PublicationWrite::Pages || write == PublicationWrite::Queued || (write >= PublicationWrite::DriverSameDepth && write <= PublicationWrite::DriverSameHtile)) {
             const auto before = DepthSurfacesSerial();
-            Require(DepthSurfaceView(context, target) != view && DepthSurfacesSerial() == before + 1u, "a published native D32S8 owner whose planes the guest wrote since was not imported again");
+            Require(DepthSurfaceView(context, target) != view && DepthSurfacesSerial() == before + 2u, "a published native D32S8 owner whose planes the guest wrote since was not retired and imported again");
         }
         else if (unmap == PublicationUnmap::None) Require(DepthSurfaceView(context, target) == view, "a published native D32S8 owner was not reused");
         protectedHoles.Restore();
@@ -4578,7 +4578,7 @@ void CheckOtherIdentity(Context context, std::uint32_t samples, OtherIdentity mo
         return;
     }
     const auto boundView = DepthSurfaceViewWithStencilWriteIntent(context, bound, true, true, true, reference);
-    Require(boundView != VK_NULL_HANDLE && boundView != view && DepthSurfacesSerial() == imported + 1u && DepthSurfaceAt(bound.address), "a depth target of another identity over a written owner's planes did not import");
+    Require(boundView != VK_NULL_HANDLE && boundView != view && DepthSurfacesSerial() == imported + 2u && DepthSurfaceAt(bound.address), "a depth target of another identity over a written owner's planes did not retire the owner and import");
     guestHolds("a depth target of another identity did not find the first identity's samples in guest memory");
     Require(DepthSurfacesReleased() == released + (mode == OtherIdentity::HeldView ? 0u : 1u), mode == OtherIdentity::HeldView ? "a retired owner whose sampled view is held was released" : "the owner of another identity was not retired and released");
     if (mode == OtherIdentity::HeldView) {
