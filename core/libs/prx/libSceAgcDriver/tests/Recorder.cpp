@@ -15102,9 +15102,17 @@ bool encodedSegmentTests(const Device& device) {
     if (!recorder.Encodes()) return false;
     struct Restore {
         bool adaptive = RuntimeSwitches::Set(RuntimeSwitch::NoAdaptiveEncoder);
-        ~Restore() { RuntimeSwitches::Assign(RuntimeSwitch::NoAdaptiveEncoder, adaptive); }
+        bool record = RuntimeSwitches::Set(RuntimeSwitch::NoRecordEncoder);
+        bool segments = RuntimeSwitches::Set(RuntimeSwitch::QuiescedSegments);
+        ~Restore() {
+            RuntimeSwitches::Assign(RuntimeSwitch::NoAdaptiveEncoder, adaptive);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoRecordEncoder, record);
+            RuntimeSwitches::Assign(RuntimeSwitch::QuiescedSegments, segments);
+        }
     } restore;
     RuntimeSwitches::Assign(RuntimeSwitch::NoAdaptiveEncoder, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoRecordEncoder, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::QuiescedSegments, false);
     recorder.CountSamples();
     const auto base = recorder.SamplesTotal();
     const auto before = Recorder::SampleDumpCounts().segments;
