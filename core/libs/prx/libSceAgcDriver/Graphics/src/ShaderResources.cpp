@@ -4437,7 +4437,7 @@ void printExitVerification() {
 }
 
 void noteEpochProof(bool reused, bool verified, bool failed, bool stored = false, bool concurrent = false, bool worked = false) {
-    if (!failed) (reused ? EpochProofCounts().resourceReuses : EpochProofCounts().resourceProofs).Add();
+    (reused ? EpochProofCounts().resourceReuses : EpochProofCounts().resourceProofs).Add();
     if (!verified) return;
     auto& verification = exitVerification();
     if (failed) verification.failures.fetch_add(1, std::memory_order_relaxed);
@@ -4916,12 +4916,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         return false;
     }
     if (EpochProofs()) {
-        static const bool noFastRevalidate = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
         const auto stamp = currentExitStamp();
         const auto mappings = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const bool remapped = proved.epoch != 0 && imagesRemapped(mappings);
         const bool stalePlanes = proved.epoch != 0 && stalePlanesRead();
-        const bool matched = stamp.epoch != 0 && proved == stamp && !remapped && !stalePlanes && !noFastRevalidate;
+        const bool matched = stamp.epoch != 0 && proved == stamp && !remapped && !stalePlanes;
         const bool copies = matched && !refreshPerUseCopies();
         if (matched && !copies) {
             if (verifyingExits()) {
@@ -4942,12 +4941,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return true;
         }
         const bool counted = exitMissesCounted();
-        if (proved.epoch != 0 && !noFastRevalidate && (verifyingExits() || counted)) noteExitMiss(proved, stamp, remapped, stalePlanes, copies, provedAge);
+        if (proved.epoch != 0 && (verifyingExits() || counted)) noteExitMiss(proved, stamp, remapped, stalePlanes, copies, provedAge);
         std::optional<GuestMemory::ProofBreakTrace> trace;
         if (counted) trace.emplace();
         std::uint64_t flushBreaks = 0;
         const bool ok = revalidateFull(shaders, report, counted ? &flushBreaks : nullptr, counted ? &*trace : nullptr);
-        noteEpochProof(false, false, !ok);
+        noteEpochProof(false, false, false);
         proved = stamp;
         mappingsClean = mappings;
         recordFlushRanges();
