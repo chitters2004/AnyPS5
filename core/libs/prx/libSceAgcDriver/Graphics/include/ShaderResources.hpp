@@ -223,7 +223,6 @@ public:
         std::uint64_t releases = 0;
         std::uint64_t unwatch = 0;
         std::uint64_t importSet = 0;
-        std::uint64_t allocations = 0;
         std::uint64_t retired = 0;
         std::uint64_t surfaces = 0;
         bool operator==(const ExitStamp&) const = default;
@@ -838,7 +837,7 @@ private:
     std::uint64_t mappingsClean = 0;
     void recordFlushRanges();
     bool stalePlanesRead();
-    bool imagesRemapped(std::uint64_t generation);
+    bool rangesRemapped(std::uint64_t generation);
     std::string rangeOwner(std::uint64_t address, std::uint64_t bytes) const;
     void reportVerifiedWork(const ProofWorkTrace& work) const;
     void reportVerifiedStore(std::uint64_t exitSerial, std::uint64_t startSerial, std::uint64_t endSerial, const GuestMemory::ProofBreakTrace& trace) const;

@@ -4320,7 +4320,7 @@ bool EpochProofCountsProfiled() {
 
 namespace {
 
-constexpr std::array<const char*, 12> ExitInputs{"epoch", "proof", "pending", "releases", "unwatch", "imports", "allocations", "remapped images", "retired imports", "surfaces", "stale planes", "per-use copies"};
+constexpr std::array<const char*, 11> ExitInputs{"epoch", "proof", "pending", "releases", "unwatch", "imports", "remapped ranges", "retired imports", "surfaces", "stale planes", "per-use copies"};
 
 constexpr std::size_t StampAges = static_cast<std::size_t>(ShaderResources::StampAge::Count);
 
@@ -4448,7 +4448,7 @@ void noteEpochProof(bool reused, bool verified, bool failed, bool stored = false
 }
 
 void noteExitMiss(const ShaderResources::ExitStamp& proved, const ShaderResources::ExitStamp& current, bool remapped, bool stalePlanes, bool copies, ShaderResources::StampAge age) {
-    const std::array<bool, ExitInputs.size()> moved{proved.epoch != current.epoch, proved.proof != current.proof, proved.pending != current.pending, proved.releases != current.releases, proved.unwatch != current.unwatch, proved.importSet != current.importSet, proved.allocations != current.allocations, remapped, proved.retired != current.retired, proved.surfaces != current.surfaces, stalePlanes, copies};
+    const std::array<bool, ExitInputs.size()> moved{proved.epoch != current.epoch, proved.proof != current.proof, proved.pending != current.pending, proved.releases != current.releases, proved.unwatch != current.unwatch, proved.importSet != current.importSet, remapped, proved.retired != current.retired, proved.surfaces != current.surfaces, stalePlanes, copies};
     const bool alone = std::ranges::count(moved, true) == 1;
     if (exitMissesCounted()) {
         auto& misses = exitMisses();
@@ -4792,8 +4792,7 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
 }
 
 ShaderResources::ExitStamp ShaderResources::currentExitStamp() const {
-    const bool imported = !directRegions.empty();
-    return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), textureReleases.load(std::memory_order_acquire), GuestMemory::UnwatchSerial(), imported ? HostImportSetGeneration() : 0, imported ? GuestAllocations::GuestAllocationsGeneration_nid_postfix() : 0, RetiredImportSerial(), DepthSurfacesSerial()};
+    return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), textureReleases.load(std::memory_order_acquire), GuestMemory::UnwatchSerial(), directRegions.empty() ? 0 : HostImportSetGeneration(), RetiredImportSerial(), DepthSurfacesSerial()};
 }
 
 void ShaderResources::recordFlushRanges() {
@@ -4826,8 +4825,8 @@ bool ShaderResources::stalePlanesRead() {
     return false;
 }
 
-bool ShaderResources::imagesRemapped(std::uint64_t generation) {
-    if (generation == mappingsClean || !directRegions.empty()) return false;
+bool ShaderResources::rangesRemapped(std::uint64_t generation) {
+    if (generation == mappingsClean) return false;
     if (flushUnscoped) return true;
     struct ChangedTag {};
     auto& changed = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ChangedTag>();
@@ -4836,6 +4835,7 @@ bool ShaderResources::imagesRemapped(std::uint64_t generation) {
     if (!GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(mappingsClean, changed, logged)) return true;
     for (const auto& [begin, end] : changed) {
         if (std::any_of(flushRanges.begin(), flushRanges.end(), [&](const auto& range) { return begin < range.second && range.first < end; })) return true;
+        if (std::any_of(directRegions.begin(), directRegions.end(), [&](const DirectRegion& region) { return begin < std::max(region.end, region.regionEnd) && region.begin < end; })) return true;
     }
     mappingsClean = logged;
     return false;
@@ -4918,7 +4918,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (EpochProofs()) {
         const auto stamp = currentExitStamp();
         const auto mappings = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        const bool remapped = proved.epoch != 0 && imagesRemapped(mappings);
+        const bool remapped = proved.epoch != 0 && rangesRemapped(mappings);
         const bool stalePlanes = proved.epoch != 0 && stalePlanesRead();
         const bool matched = stamp.epoch != 0 && proved == stamp && !remapped && !stalePlanes;
         const bool copies = matched && !refreshPerUseCopies();
