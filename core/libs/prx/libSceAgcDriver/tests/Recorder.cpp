@@ -2035,8 +2035,15 @@ void encoderFailureFollowsTheBatchTests(const Device& device, Recorder& recorder
     if (!recorder.Encodes()) return;
     struct AlwaysHandOff {
         bool adaptive = RuntimeSwitches::Set(RuntimeSwitch::NoAdaptiveEncoder);
-        AlwaysHandOff() { RuntimeSwitches::Assign(RuntimeSwitch::NoAdaptiveEncoder, true); }
-        ~AlwaysHandOff() { RuntimeSwitches::Assign(RuntimeSwitch::NoAdaptiveEncoder, adaptive); }
+        bool record = RuntimeSwitches::Set(RuntimeSwitch::NoRecordEncoder);
+        AlwaysHandOff() {
+            RuntimeSwitches::Assign(RuntimeSwitch::NoAdaptiveEncoder, true);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoRecordEncoder, false);
+        }
+        ~AlwaysHandOff() {
+            RuntimeSwitches::Assign(RuntimeSwitch::NoAdaptiveEncoder, adaptive);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoRecordEncoder, record);
+        }
     } always;
     const auto& context = device.GetContext();
     std::atomic<int> failures{0};
