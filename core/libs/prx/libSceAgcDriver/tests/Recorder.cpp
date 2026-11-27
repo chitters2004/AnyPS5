@@ -20511,6 +20511,7 @@ void dataRunAccessTests(const Device& device, Recorder& recorder) {
 }
 
 int main(int argc, char** argv) {
+    const auto processStart = std::chrono::steady_clock::now();
     const bool recordedInline = RuntimeSwitches::Set(RuntimeSwitch::NoRecordEncoder);
     _ZSt13set_terminatePFvvE_nid_postfix([] {
         std::fflush(nullptr);
@@ -21256,137 +21257,138 @@ int main(int argc, char** argv) {
             return 0;
         }
 #endif
-        readTrackingTests(device, recorder);
-        readListTests(device, recorder);
-        overlappedRangeTests(recorder);
-        spaceWriteSyncTests(device, recorder);
-        changedCopyTests(device, recorder);
-        writeSettledTests(device, recorder);
-        completionCountTests(device, recorder);
-        writtenBackRunTests(device, recorder);
-        afterRecordedWorkTests(device, recorder);
-        directCompletionLabelTests(recorder);
-        batchStampTests(recorder);
-        labelTests(recorder);
-        lateLabelTests(recorder);
-        largeLabelTests(recorder);
-        storedBytesTests(recorder);
-        unlandedOwnLabelTests(recorder);
-        unlandedOwnStoreWaitTests(recorder);
-        unchangedSinceTests();
-        closeRaceTests(device, recorder);
-        keyProofTests(device, recorder);
-        targetKeyProofTests(device, recorder);
-        refreshProofTests(device, recorder);
-        resourceReadTests(device, recorder);
-        readWrittenStagingTests(device, recorder);
-        bdaStagingTests(device, recorder);
-        depthSurfaceProofTests(device, recorder);
-        multisampleGuestAccessTests(device, recorder);
-        multisampleTargetOverPendingStorageTests(device, recorder);
-        repeatStorageGuardTests(device, recorder);
-        oneFragmentFmaskGuardTests(device);
-        tiledResolveTests(device, recorder);
-        msaaClearPassTests(device, recorder, ColorMetadataPass::Mode::FmaskDecompress);
-        msaaClearPassTests(device, recorder, ColorMetadataPass::Mode::EliminateFastClear);
-        metadataPassOverMultisampleMemoryTests(device, recorder);
-        misalignedSnapshotTests(device, recorder);
-        misalignedRegionTests(device, recorder);
-        pendingUploadGpuCopyTests(device, recorder);
-        pendingUploadGpuCopyBytesTests(device, recorder);
-        drawSnapshotReuseTests(device, recorder);
-        drawDescriptorWriteTests(device, recorder);
-        drawSnapshotTableSetTests(device, recorder);
-        imageTableFirstLayerRevalidateTests(device, recorder);
-        drawSnapshotCapTests(device, recorder);
-        drawSnapshotEvictionTests(device);
-        paddedVertexSnapshotTests(device);
-        growingVertexCopyTests(device);
-        grownVertexCopyShadowTests(device);
-        containingSnapshotTests(device);
-        unwrittenSnapshotTests(device);
-        drawSnapshotUploadTests(device, recorder);
-        drawInputReuseTests(device, recorder);
-        drawInputMirrorTests(device);
-        if (AgcDriver::GuestMemory::WriteWatched()) vertexWindowSeriesTests(device, recorder);
-        vertexWindowMirrorTests(device);
-        drawInputInPlaceTests(device, recorder);
-        RunResidentPresentTests(device.GetContext());
-        sliceDirtyTests(device, recorder);
-        storeRunTests(device, recorder);
-        queuedWriteGroupTests();
-        remappedImportTests(device);
+        std::cout << "[scenario-ms] setup " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - processStart).count() << std::endl;
+        { const auto scenarioStart = std::chrono::steady_clock::now(); readTrackingTests(device, recorder); std::cout << "[scenario-ms] readTrackingTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); readListTests(device, recorder); std::cout << "[scenario-ms] readListTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); overlappedRangeTests(recorder); std::cout << "[scenario-ms] overlappedRangeTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); spaceWriteSyncTests(device, recorder); std::cout << "[scenario-ms] spaceWriteSyncTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); changedCopyTests(device, recorder); std::cout << "[scenario-ms] changedCopyTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); writeSettledTests(device, recorder); std::cout << "[scenario-ms] writeSettledTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); completionCountTests(device, recorder); std::cout << "[scenario-ms] completionCountTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); writtenBackRunTests(device, recorder); std::cout << "[scenario-ms] writtenBackRunTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); afterRecordedWorkTests(device, recorder); std::cout << "[scenario-ms] afterRecordedWorkTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); directCompletionLabelTests(recorder); std::cout << "[scenario-ms] directCompletionLabelTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); batchStampTests(recorder); std::cout << "[scenario-ms] batchStampTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); labelTests(recorder); std::cout << "[scenario-ms] labelTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); lateLabelTests(recorder); std::cout << "[scenario-ms] lateLabelTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); largeLabelTests(recorder); std::cout << "[scenario-ms] largeLabelTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); storedBytesTests(recorder); std::cout << "[scenario-ms] storedBytesTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); unlandedOwnLabelTests(recorder); std::cout << "[scenario-ms] unlandedOwnLabelTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); unlandedOwnStoreWaitTests(recorder); std::cout << "[scenario-ms] unlandedOwnStoreWaitTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); unchangedSinceTests(); std::cout << "[scenario-ms] unchangedSinceTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); closeRaceTests(device, recorder); std::cout << "[scenario-ms] closeRaceTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); keyProofTests(device, recorder); std::cout << "[scenario-ms] keyProofTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); targetKeyProofTests(device, recorder); std::cout << "[scenario-ms] targetKeyProofTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); refreshProofTests(device, recorder); std::cout << "[scenario-ms] refreshProofTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); resourceReadTests(device, recorder); std::cout << "[scenario-ms] resourceReadTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); readWrittenStagingTests(device, recorder); std::cout << "[scenario-ms] readWrittenStagingTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); bdaStagingTests(device, recorder); std::cout << "[scenario-ms] bdaStagingTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); depthSurfaceProofTests(device, recorder); std::cout << "[scenario-ms] depthSurfaceProofTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); multisampleGuestAccessTests(device, recorder); std::cout << "[scenario-ms] multisampleGuestAccessTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); multisampleTargetOverPendingStorageTests(device, recorder); std::cout << "[scenario-ms] multisampleTargetOverPendingStorageTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); repeatStorageGuardTests(device, recorder); std::cout << "[scenario-ms] repeatStorageGuardTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); oneFragmentFmaskGuardTests(device); std::cout << "[scenario-ms] oneFragmentFmaskGuardTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); tiledResolveTests(device, recorder); std::cout << "[scenario-ms] tiledResolveTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); msaaClearPassTests(device, recorder, ColorMetadataPass::Mode::FmaskDecompress); std::cout << "[scenario-ms] msaaClearPassTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); msaaClearPassTests(device, recorder, ColorMetadataPass::Mode::EliminateFastClear); std::cout << "[scenario-ms] msaaClearPassTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); metadataPassOverMultisampleMemoryTests(device, recorder); std::cout << "[scenario-ms] metadataPassOverMultisampleMemoryTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); misalignedSnapshotTests(device, recorder); std::cout << "[scenario-ms] misalignedSnapshotTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); misalignedRegionTests(device, recorder); std::cout << "[scenario-ms] misalignedRegionTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); pendingUploadGpuCopyTests(device, recorder); std::cout << "[scenario-ms] pendingUploadGpuCopyTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); pendingUploadGpuCopyBytesTests(device, recorder); std::cout << "[scenario-ms] pendingUploadGpuCopyBytesTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); drawSnapshotReuseTests(device, recorder); std::cout << "[scenario-ms] drawSnapshotReuseTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); drawDescriptorWriteTests(device, recorder); std::cout << "[scenario-ms] drawDescriptorWriteTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); drawSnapshotTableSetTests(device, recorder); std::cout << "[scenario-ms] drawSnapshotTableSetTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); imageTableFirstLayerRevalidateTests(device, recorder); std::cout << "[scenario-ms] imageTableFirstLayerRevalidateTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); drawSnapshotCapTests(device, recorder); std::cout << "[scenario-ms] drawSnapshotCapTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); drawSnapshotEvictionTests(device); std::cout << "[scenario-ms] drawSnapshotEvictionTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); paddedVertexSnapshotTests(device); std::cout << "[scenario-ms] paddedVertexSnapshotTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); growingVertexCopyTests(device); std::cout << "[scenario-ms] growingVertexCopyTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); grownVertexCopyShadowTests(device); std::cout << "[scenario-ms] grownVertexCopyShadowTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); containingSnapshotTests(device); std::cout << "[scenario-ms] containingSnapshotTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); unwrittenSnapshotTests(device); std::cout << "[scenario-ms] unwrittenSnapshotTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); drawSnapshotUploadTests(device, recorder); std::cout << "[scenario-ms] drawSnapshotUploadTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); drawInputReuseTests(device, recorder); std::cout << "[scenario-ms] drawInputReuseTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); drawInputMirrorTests(device); std::cout << "[scenario-ms] drawInputMirrorTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); if (AgcDriver::GuestMemory::WriteWatched()) vertexWindowSeriesTests(device, recorder); std::cout << "[scenario-ms] vertexWindowSeriesTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); vertexWindowMirrorTests(device); std::cout << "[scenario-ms] vertexWindowMirrorTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); drawInputInPlaceTests(device, recorder); std::cout << "[scenario-ms] drawInputInPlaceTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); RunResidentPresentTests(device.GetContext()); std::cout << "[scenario-ms] RunResidentPresentTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); sliceDirtyTests(device, recorder); std::cout << "[scenario-ms] sliceDirtyTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); storeRunTests(device, recorder); std::cout << "[scenario-ms] storeRunTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); queuedWriteGroupTests(); std::cout << "[scenario-ms] queuedWriteGroupTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); remappedImportTests(device); std::cout << "[scenario-ms] remappedImportTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
 #ifdef _WIN32
-        secondMappingImportTests(device);
+        { const auto scenarioStart = std::chrono::steady_clock::now(); secondMappingImportTests(device); std::cout << "[scenario-ms] secondMappingImportTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
 #endif
-        movedMetadataTests(device, recorder);
-        viewPastLastMipTests(device, recorder);
-        keysFillTests(device, recorder);
-        clearHandOverTests(device, recorder, false);
-        clearHandOverTests(device, recorder, true);
-        integerClearTests(device);
-        denormalClearTests(device, recorder);
-        unitShadowTests(device, recorder);
-        storageRefreshTests(device, recorder, false);
-        storageRefreshTests(device, recorder, true);
-        static_cast<void>(writtenBufferOrderTests(device, recorder));
-        writeBackPaddingTests(device, recorder, false);
-        writeBackPaddingTests(device, recorder, true);
-        splitWriteBackTests(device, recorder);
-        writeBackBlockTests(device, recorder);
-        dccMipWriteBackTests(device, recorder);
-        importSegmentMemoTests(device, recorder);
-        flushWaitMipChainTests(device, recorder);
-        uploadBlockTests(device, recorder);
-        uploadShadowedSegmentTests(device, recorder);
-        singlePassTests(device, recorder, false);
-        singlePassTests(device, recorder, true);
-        unchangedCpuStampTests(device, recorder);
-        rewrittenBlockTests(device, recorder);
-        rewrittenStaleUnitTests(device, recorder);
-        repeatedNeighbourStoreTests(device, recorder);
-        keptUnitSettleTests(device, recorder);
-        settledBaselineTests(device, recorder);
-        importWatchTests(device);
-        staleGenerationTests(device, recorder);
-        pendingAfterLeavingWatchTests(device, recorder);
-        pendingUnmappedTests(device, recorder);
-        pendingPartialUnmapTests(device, recorder);
-        pendingUnitPartUnmapTests(device, recorder);
-        importWindowTests(device, recorder);
-        dataWordPositionsTests();
-        dataRefreshTests(device, recorder);
-        dataRunAccessTests(device, recorder);
-        imageMemoTests(device, recorder);
-        minLodTests(device, recorder);
-        uploadScratchReuseTests(device, recorder);
-        firstLayerViewTests(device, recorder);
-        sampledStorageBaseLevelUsageTests(device, recorder);
-        singleCubeTests(device, recorder);
-        cubeExtraSliceTests(device, recorder);
-        atomicViewTests(device, recorder);
-        metadataPassTests(device, recorder);
-        cmaskPassTests(device, recorder);
-        pendingKeyStoreTests(device, recorder);
-        shadowedKeyStoreTests(device, recorder);
-        sampleDumpTests(device, recorder);
-        discardActionTests(device);
-        discardedSampleTests(device);
-        copiedDirectOrderingTests(device, recorder);
-        copiedWriteBackTests(device, recorder);
+        { const auto scenarioStart = std::chrono::steady_clock::now(); movedMetadataTests(device, recorder); std::cout << "[scenario-ms] movedMetadataTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); viewPastLastMipTests(device, recorder); std::cout << "[scenario-ms] viewPastLastMipTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); keysFillTests(device, recorder); std::cout << "[scenario-ms] keysFillTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); clearHandOverTests(device, recorder, false); std::cout << "[scenario-ms] clearHandOverTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); clearHandOverTests(device, recorder, true); std::cout << "[scenario-ms] clearHandOverTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); integerClearTests(device); std::cout << "[scenario-ms] integerClearTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); denormalClearTests(device, recorder); std::cout << "[scenario-ms] denormalClearTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); unitShadowTests(device, recorder); std::cout << "[scenario-ms] unitShadowTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); storageRefreshTests(device, recorder, false); std::cout << "[scenario-ms] storageRefreshTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); storageRefreshTests(device, recorder, true); std::cout << "[scenario-ms] storageRefreshTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); static_cast<void>(writtenBufferOrderTests(device, recorder)); std::cout << "[scenario-ms] cast:writtenBufferOrderTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); writeBackPaddingTests(device, recorder, false); std::cout << "[scenario-ms] writeBackPaddingTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); writeBackPaddingTests(device, recorder, true); std::cout << "[scenario-ms] writeBackPaddingTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); splitWriteBackTests(device, recorder); std::cout << "[scenario-ms] splitWriteBackTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); writeBackBlockTests(device, recorder); std::cout << "[scenario-ms] writeBackBlockTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); dccMipWriteBackTests(device, recorder); std::cout << "[scenario-ms] dccMipWriteBackTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); importSegmentMemoTests(device, recorder); std::cout << "[scenario-ms] importSegmentMemoTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); flushWaitMipChainTests(device, recorder); std::cout << "[scenario-ms] flushWaitMipChainTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); uploadBlockTests(device, recorder); std::cout << "[scenario-ms] uploadBlockTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); uploadShadowedSegmentTests(device, recorder); std::cout << "[scenario-ms] uploadShadowedSegmentTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); singlePassTests(device, recorder, false); std::cout << "[scenario-ms] singlePassTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); singlePassTests(device, recorder, true); std::cout << "[scenario-ms] singlePassTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); unchangedCpuStampTests(device, recorder); std::cout << "[scenario-ms] unchangedCpuStampTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); rewrittenBlockTests(device, recorder); std::cout << "[scenario-ms] rewrittenBlockTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); rewrittenStaleUnitTests(device, recorder); std::cout << "[scenario-ms] rewrittenStaleUnitTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); repeatedNeighbourStoreTests(device, recorder); std::cout << "[scenario-ms] repeatedNeighbourStoreTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); keptUnitSettleTests(device, recorder); std::cout << "[scenario-ms] keptUnitSettleTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); settledBaselineTests(device, recorder); std::cout << "[scenario-ms] settledBaselineTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); importWatchTests(device); std::cout << "[scenario-ms] importWatchTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); staleGenerationTests(device, recorder); std::cout << "[scenario-ms] staleGenerationTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); pendingAfterLeavingWatchTests(device, recorder); std::cout << "[scenario-ms] pendingAfterLeavingWatchTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); pendingUnmappedTests(device, recorder); std::cout << "[scenario-ms] pendingUnmappedTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); pendingPartialUnmapTests(device, recorder); std::cout << "[scenario-ms] pendingPartialUnmapTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); pendingUnitPartUnmapTests(device, recorder); std::cout << "[scenario-ms] pendingUnitPartUnmapTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); importWindowTests(device, recorder); std::cout << "[scenario-ms] importWindowTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); dataWordPositionsTests(); std::cout << "[scenario-ms] dataWordPositionsTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); dataRefreshTests(device, recorder); std::cout << "[scenario-ms] dataRefreshTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); dataRunAccessTests(device, recorder); std::cout << "[scenario-ms] dataRunAccessTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); imageMemoTests(device, recorder); std::cout << "[scenario-ms] imageMemoTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); minLodTests(device, recorder); std::cout << "[scenario-ms] minLodTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); uploadScratchReuseTests(device, recorder); std::cout << "[scenario-ms] uploadScratchReuseTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); firstLayerViewTests(device, recorder); std::cout << "[scenario-ms] firstLayerViewTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); sampledStorageBaseLevelUsageTests(device, recorder); std::cout << "[scenario-ms] sampledStorageBaseLevelUsageTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); singleCubeTests(device, recorder); std::cout << "[scenario-ms] singleCubeTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); cubeExtraSliceTests(device, recorder); std::cout << "[scenario-ms] cubeExtraSliceTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); atomicViewTests(device, recorder); std::cout << "[scenario-ms] atomicViewTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); metadataPassTests(device, recorder); std::cout << "[scenario-ms] metadataPassTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); cmaskPassTests(device, recorder); std::cout << "[scenario-ms] cmaskPassTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); pendingKeyStoreTests(device, recorder); std::cout << "[scenario-ms] pendingKeyStoreTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); shadowedKeyStoreTests(device, recorder); std::cout << "[scenario-ms] shadowedKeyStoreTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); sampleDumpTests(device, recorder); std::cout << "[scenario-ms] sampleDumpTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); discardActionTests(device); std::cout << "[scenario-ms] discardActionTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); discardedSampleTests(device); std::cout << "[scenario-ms] discardedSampleTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); copiedDirectOrderingTests(device, recorder); std::cout << "[scenario-ms] copiedDirectOrderingTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); copiedWriteBackTests(device, recorder); std::cout << "[scenario-ms] copiedWriteBackTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
         gpu.unlock();
-        hostImportUnmapTests(device, recorder);
-        drawSnapshotPatchTests(device);
-        drawSnapshotEpochTests(device);
+        { const auto scenarioStart = std::chrono::steady_clock::now(); hostImportUnmapTests(device, recorder); std::cout << "[scenario-ms] hostImportUnmapTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); drawSnapshotPatchTests(device); std::cout << "[scenario-ms] drawSnapshotPatchTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); drawSnapshotEpochTests(device); std::cout << "[scenario-ms] drawSnapshotEpochTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
         gpu.lock();
-        encoderFailureFollowsTheBatchTests(device, recorder, gpu);
-        encoderPassEndSiteTests(device);
-        encoderPoolConstructionFailureTests(device);
-        encoderSegmentQueryTests(device);
-        encoderAdaptiveSegmentWaitTests(device);
-        encoderFailedSegmentTests(device);
-        encoderRuntimeSwitchTests(device, recorder);
-        encoderSlotFallbackTests(device);
+        { const auto scenarioStart = std::chrono::steady_clock::now(); encoderFailureFollowsTheBatchTests(device, recorder, gpu); std::cout << "[scenario-ms] encoderFailureFollowsTheBatchTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); encoderPassEndSiteTests(device); std::cout << "[scenario-ms] encoderPassEndSiteTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); encoderPoolConstructionFailureTests(device); std::cout << "[scenario-ms] encoderPoolConstructionFailureTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); encoderSegmentQueryTests(device); std::cout << "[scenario-ms] encoderSegmentQueryTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); encoderAdaptiveSegmentWaitTests(device); std::cout << "[scenario-ms] encoderAdaptiveSegmentWaitTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); encoderFailedSegmentTests(device); std::cout << "[scenario-ms] encoderFailedSegmentTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); encoderRuntimeSwitchTests(device, recorder); std::cout << "[scenario-ms] encoderRuntimeSwitchTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
+        { const auto scenarioStart = std::chrono::steady_clock::now(); encoderSlotFallbackTests(device); std::cout << "[scenario-ms] encoderSlotFallbackTests " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scenarioStart).count() << std::endl; }
         recorder.Activate();
         const auto commandsBefore = recorder.EncoderCounts().commands;
         const bool drew = vertexTargetRangeTests(device, recorder, false);
