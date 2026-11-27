@@ -1,0 +1,5 @@
+# libSceAgcDriver
+
+## add Functional
+
+- [New single-sample depth surfaces without HTILE](../../../core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp) (libSceAgcDriver) - D16 surfaces, and D32 surfaces in tilings other than 64KB_Z_X, still start at `DB_DEPTH_CLEAR` when created with no HTILE and nothing to inherit: their planes are not kept coherent with guest memory, so plane bytes the CPU wrote before the first bind are not seen. Only a new D32 surface in 64KB_Z_X tiling starts from its plane in guest memory. On any surface, CPU writes made after a bind to plane pages that are not write-watched (compared host imports, unwatched pages) are not seen at later binds, because `WrittenUnits` only learns of writes through write tracking.

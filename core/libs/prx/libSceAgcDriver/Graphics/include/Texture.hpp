@@ -81,6 +81,7 @@ struct OwnedImage {
     Context context;
     VkImage image;
     VkDeviceMemory memory;
+    VkImageView view = VK_NULL_HANDLE;
     VkDeviceSize memoryBytes = 0;
     std::uint32_t memoryType = 0;
     ImageAllocation allocation;
