@@ -3376,7 +3376,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (drawBindings == nullptr) resources.PrepareDrawUse(drawUse.get());
     for (const auto& [reference, pipeline] : record.stencilReplay) recorder->Keep(pipeline);
     if (parallelThis) {
-        if (!continued) recordPassOpen(recording, true);
         auto& pool = DeviceRecordingPool(context);
         const auto depthFormat = record.pipeline->DepthFormat();
         const RecordingPool::Inheritance inheritance{depthFormat, HasStencil(depthFormat) ? depthFormat : VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT, record.pipeline->ColorSlotCount()};
@@ -3391,8 +3390,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         });
         auto result = assembly.Take(sequence);
         if (result.error != nullptr) std::rethrow_exception(result.error);
-        if (notes.sampled) recorder->NoteSampledDraw(recording.Commands());
-        recorder->ExecuteSecondary(result.commands, std::move(result.release));
+        if (!continued) recordPassOpen(recording, true);
+        try {
+            if (notes.sampled) recorder->NoteSampledDraw(recording.Commands());
+            recorder->ExecuteSecondary(result.commands, std::move(result.release));
+        } catch (...) {
+            if (!continued) EndRenderPass(context, recording.Commands());
+            throw;
+        }
         if (notes.guestWork) NoteGuestWorkIn(context, recording.Commands());
     } else {
         recordPassOpen(recording, false);
