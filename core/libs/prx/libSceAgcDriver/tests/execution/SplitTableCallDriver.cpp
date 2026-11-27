@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -11,6 +12,8 @@
 #include <windows.h>
 #endif
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +21,7 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -100,7 +104,7 @@ void SetRegister(std::vector<std::uint32_t>& words, std::uint32_t offset, std::u
     words.push_back(value);
 }
 
-void Dispatch(std::uint64_t code, const std::vector<std::uint32_t>& userData) {
+void SubmitDispatch(std::uint64_t code, const std::vector<std::uint32_t>& userData) {
     std::vector<std::uint32_t> packet;
     SetRegister(packet, 0x20c, static_cast<std::uint32_t>(code >> 8u));
     SetRegister(packet, 0x20d, static_cast<std::uint32_t>(code >> 40u) & 0xffu);
@@ -113,6 +117,29 @@ void Dispatch(std::uint64_t code, const std::vector<std::uint32_t>& userData) {
     packet.insert(packet.end(), {0xc0000000u | (3u << 16u) | (DispatchDirect << 8u), Groups, 1u, 1u, 0x41u});
     Packet submission{packet.data(), static_cast<std::uint32_t>(packet.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&submission) == 0, "split table call driver: the dispatch submission failed");
+}
+
+void Dispatch(std::uint64_t code, const std::vector<std::uint32_t>& userData) {
+    SubmitDispatch(code, userData);
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void DispatchBehindHeldCommitter(std::uint64_t code, const std::vector<std::uint32_t>& userData) {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    std::atomic<bool> released{false};
+    struct Release {
+        std::atomic<bool>& flag;
+        ~Release() { flag.store(true, std::memory_order_release); }
+    } release{released};
+    const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(DispatchDirect);
+    DrawPipeline::Queue0().Enqueue([&released] {
+        while (!released.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }, {});
+    SubmitDispatch(code, userData);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (DrawPipeline::DrainRequestsByOpcode(DispatchDirect) == drainsBefore && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Require(DrawPipeline::DrainRequestsByOpcode(DispatchDirect) != drainsBefore, "split table call driver: the split dispatch recorded without draining the draw pipeline queued ahead of it");
+    released.store(true, std::memory_order_release);
     AgcDriverWaitIdle_nid_postfix();
 }
 
@@ -120,9 +147,12 @@ void Dispatch(std::uint64_t code, const std::vector<std::uint32_t>& userData) {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc <= 2 && (argc == 1 || std::string_view(argv[1]) == "--cpu-rounds"), "usage: [--cpu-rounds]");
+        const std::string_view mode = argc == 2 ? argv[1] : "";
+        Require(argc <= 2 && (argc == 1 || mode == "--cpu-rounds" || mode == "--queued"), "usage: [--cpu-rounds|--queued]");
+        const bool queued = mode == "--queued";
         setenv("APS5_SPLIT_TABLE_CALLS", "1", 1);
-        if (argc == 2) setenv("APS5_SPLIT_CPU_ROUNDS", "1", 1);
+        if (mode == "--cpu-rounds") setenv("APS5_SPLIT_CPU_ROUNDS", "1", 1);
+        if (queued) setenv("APS5_PIPELINED_DRAWS", "1", 1);
         if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
         auto* block = NewBlock();
         const auto caller = LoopCaller();
@@ -151,7 +181,8 @@ int main(int argc, char** argv) {
         const auto userBlock = Address(block + UserBlockOffset);
         userData[12] = static_cast<std::uint32_t>(userBlock);
         userData[13] = static_cast<std::uint32_t>(userBlock >> 32u);
-        Dispatch(Address(block + CallerOffset), userData);
+        if (queued) DispatchBehindHeldCommitter(Address(block + CallerOffset), userData);
+        else Dispatch(Address(block + CallerOffset), userData);
         AgcDriver::GuestMemory::Read(Address(output), std::as_writable_bytes(std::span(output, Lanes * Groups)));
         for (std::uint32_t index = 0; index < Lanes * Groups; ++index) {
             if (output[index] != Expected(input[index], index)) {
