@@ -5649,6 +5649,20 @@ void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
     if (batch->completionStoreCount != 0) completionStores.fetch_sub(batch->completionStoreCount, std::memory_order_acq_rel);
     if (batch->writeBackCompletionCount != 0) writeBackCompletions.fetch_sub(batch->writeBackCompletionCount, std::memory_order_acq_rel);
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    if (!batch->kept.empty() && !inFlight.empty()) {
+        auto& last = *inFlight.back();
+        try {
+            last.kept.insert(last.kept.end(), std::make_move_iterator(batch->kept.begin()), std::make_move_iterator(batch->kept.end()));
+            last.keptBytes += batch->keptBytes;
+            inFlightKeptBytes += batch->keptBytes;
+        } catch (...) {
+            try {
+                static_cast<void>(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device));
+            } catch (...) {
+            }
+        }
+        batch->kept.clear();
+    }
     release(*batch);
     try {
         publishPendingWrites();
