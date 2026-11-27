@@ -71,36 +71,36 @@ alignas(256) constexpr std::array<std::uint32_t, 10> StoreRowLayerCode{
 
 class GuestBlock {
 public:
-    GuestBlock() {
+    explicit GuestBlock(std::size_t bytes = BlockBytes, bool touched = true) : bytes(bytes) {
 #ifdef _WIN32
-        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
-        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
+        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
+        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
 #else
         constexpr std::uintptr_t alignment = 65536;
-        void* mapped = mmap(nullptr, BlockBytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* mapped = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
             const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
             const auto aligned = (begin + alignment - 1) & ~(alignment - 1);
             if (aligned != begin) munmap(mapped, aligned - begin);
-            if (aligned + BlockBytes != begin + BlockBytes + alignment) munmap(reinterpret_cast<void*>(aligned + BlockBytes), begin + alignment - aligned);
+            if (aligned + bytes != begin + bytes + alignment) munmap(reinterpret_cast<void*>(aligned + bytes), begin + alignment - aligned);
             block = reinterpret_cast<std::uint8_t*>(aligned);
-            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
         }
 #endif
         Require(block != nullptr, "depth surface from storage: cannot allocate the guest block");
-        std::memset(block, 0, BlockBytes);
-        GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
-        AgcDriver::GuestMemory::CollectWritesUncached(reinterpret_cast<std::uintptr_t>(block), BlockBytes);
+        if (touched) std::memset(block, 0, bytes);
+        GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+        AgcDriver::GuestMemory::CollectWritesUncached(reinterpret_cast<std::uintptr_t>(block), bytes);
     }
 
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);
 #ifdef _WIN32
-        GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
-        GuestArena::GuestArenaRelease_nid_postfix(block, BlockBytes);
+        GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
 #else
-        munmap(block, BlockBytes);
-        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, BlockBytes);
+        munmap(block, bytes);
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, bytes);
 #endif
     }
 
@@ -110,6 +110,7 @@ public:
     std::uint8_t* Plane(std::size_t index) { return block + index * PlaneBytes; }
 
 private:
+    std::size_t bytes;
     std::uint8_t* block = nullptr;
 };
 
@@ -361,6 +362,22 @@ void IncompatibleStorageCase(AgcDriver::VulkanDevice& device, const DepthFastCle
     RequireCount(SeedsSince(seeds), 1, "a new D32 depth surface under a live R8 storage image of its plane, surfaces seeded from guest memory");
 }
 
+std::uint64_t DepthPlaneFills() {
+    return AgcDriver::Graphics::DirectDepthCopyCount() + AgcDriver::Graphics::DepthUploadCount() + AgcDriver::Graphics::DepthTransferPassCount();
+}
+
+void DemandZeroPlaneCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane) {
+    if (!AgcDriver::GuestMemory::WriteWatched() || !AgcDriver::GuestMemory::Watched(Address(plane), PlaneBytes)) {
+        std::puts("demand-zero seed: the plane is not write-watched here, so a sync after the seed is not checked");
+        return;
+    }
+    const auto seeds = AgcDriver::Graphics::DepthSurfaceSeedCount();
+    const auto fills = DepthPlaneFills();
+    RequireCount(DepthFastClearHarness::Draw(device, shaders, Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), {}), 0, "a new D32 depth surface over a plane nothing has touched, tested LESS at 0.5");
+    RequireCount(SeedsSince(seeds), 1, "a new D32 depth surface over a plane nothing has touched, surfaces seeded from guest memory");
+    if (const auto refilled = DepthPlaneFills() - fills; refilled != 0u) failures.push_back("a new D32 depth surface over a plane nothing has touched: the same bind filled the seeded surface again " + std::to_string(refilled) + " times, expected 0");
+}
+
 void PendingChainCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane) {
     Fill(plane, VK_FORMAT_D32_SFLOAT);
     StoreRow(device, plane, VK_FORMAT_D32_SFLOAT, 1, 1);
@@ -450,6 +467,7 @@ int main() {
         if (!device) return VulkanTestSkipped;
         const auto shaders = DepthFastClearHarness::Compile(*device);
         GuestBlock block;
+        GuestBlock untouched(PlaneBytes, false);
         NewSurfaceCase(*device, shaders, block.Plane(0), VK_FORMAT_D32_SFLOAT, false, "a new D32 depth surface over a pending R32F storage write");
         NewSurfaceCase(*device, shaders, block.Plane(1), VK_FORMAT_D16_UNORM, false, "a new D16 depth surface over a pending R16 unorm storage write");
         NewSurfaceCase(*device, shaders, block.Plane(2), VK_FORMAT_D32_SFLOAT, true, "a new D32 depth surface over a flushed R32F storage write");
@@ -459,6 +477,7 @@ int main() {
         SeedRaceCase(*device, shaders, block.Plane(28));
         IncompatibleStorageCase(*device, shaders, block.Plane(29));
         PartialWatchCollectCase(*device, shaders, block.Plane(30));
+        DemandZeroPlaneCase(*device, shaders, untouched.Plane(0));
 
         auto* cleared = block.Plane(3);
         const auto htile = Address(block.Plane(4));

@@ -1796,6 +1796,7 @@ public:
         const auto planeBytes = static_cast<std::size_t>(geometry.layerBytes);
         auto upload = std::make_shared<Buffer>(context, planeBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         GuestMemory::FlushGpuWrites(resource.baseAddress, planeBytes);
+        GuestMemory::MaterializeKnownZero(resource.baseAddress, planeBytes);
         std::uint64_t baseline = 0;
         static_cast<void>(WrittenUnits(resource, baseline));
         GuestMemory::ReadCommitted(resource.baseAddress, upload->Bytes().first(planeBytes));
