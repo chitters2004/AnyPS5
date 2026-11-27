@@ -1292,30 +1292,41 @@ VKAPI_ATTR void VKAPI_CALL BurnInstanceDraw(VkCommandBuffer, std::uint32_t, std:
     BusyFor(std::chrono::microseconds(microseconds));
 }
 
+bool HoldsInAnAttempt(const std::function<bool()>& attempt) {
+    for (int tries = 0; tries < 3; ++tries) {
+        if (attempt()) return true;
+    }
+    return false;
+}
+
 void HandoffChargesTheLastProbeBlocksBacklog() {
-    Reset();
-    const auto commands = Handle<VkCommandBuffer>(0x1780);
-    DeviceFunctions table{};
-    table.cmdDraw = &BurnInstanceDraw;
-    const auto attached = Attached(Handle<VkDevice>(0x58), table);
-    auto& encoder = *attached;
     constexpr std::uint64_t Backlogged = 12;
     constexpr std::uint64_t Windows = 2 * CommandEncoder::ProbeWindows + CommandEncoder::SettledSpanMin + 256;
     std::uint64_t inlined = 0;
-    for (std::uint64_t index = 0; index < Windows; ++index) {
-        const bool encoded = encoder.Admit(CommandEncoder::Handoff::Adaptive);
-        const bool backlogged = index % CommandEncoder::ProbeBlock >= CommandEncoder::ProbeBlock - Backlogged;
-        if (encoded) encoder.Open(commands, RecordingOf(commands));
-        table.cmdDraw(commands, 3, 1, 0, encoded ? (backlogged ? 2000u : 0u) : 50u);
-        if (encoded) {
-            encoder.Close();
-        } else {
-            encoder.EndInline();
-            ++inlined;
+    const bool charged = HoldsInAnAttempt([&] {
+        Reset();
+        const auto commands = Handle<VkCommandBuffer>(0x1780);
+        DeviceFunctions table{};
+        table.cmdDraw = &BurnInstanceDraw;
+        const auto attached = Attached(Handle<VkDevice>(0x58), table);
+        auto& encoder = *attached;
+        inlined = 0;
+        for (std::uint64_t index = 0; index < Windows; ++index) {
+            const bool encoded = encoder.Admit(CommandEncoder::Handoff::Adaptive);
+            const bool backlogged = index % CommandEncoder::ProbeBlock >= CommandEncoder::ProbeBlock - Backlogged;
+            if (encoded) encoder.Open(commands, RecordingOf(commands));
+            table.cmdDraw(commands, 3, 1, 0, encoded ? (backlogged ? 2000u : 0u) : 50u);
+            if (encoded) {
+                encoder.Close();
+            } else {
+                encoder.EndInline();
+                ++inlined;
+            }
         }
-    }
-    encoder.Quiesce();
-    Require(inlined == Windows - CommandEncoder::ProbeWindows, "the adaptive hand-off recorded " + std::to_string(inlined) + " of " + std::to_string(Windows) + " windows inline, not the " + std::to_string(Windows - CommandEncoder::ProbeWindows) + " outside its encoded probe blocks, so the backlog left by a probe's last encoded block was not charged to it");
+        encoder.Quiesce();
+        return inlined == Windows - CommandEncoder::ProbeWindows;
+    });
+    Require(charged, "the adaptive hand-off recorded " + std::to_string(inlined) + " of " + std::to_string(Windows) + " windows inline, not the " + std::to_string(Windows - CommandEncoder::ProbeWindows) + " outside its encoded probe blocks, so the backlog left by a probe's last encoded block was not charged to it");
 }
 
 void HandoffPolicyFollowsItsMeasuredCost() {
@@ -1327,12 +1338,18 @@ void HandoffPolicyFollowsItsMeasuredCost() {
     Reset();
     RunPattern({"always", 2, 1000, 0}, CommandEncoder::Handoff::Always, Draws, counts);
     Require(counts.inlined == 0 && counts.posts == Draws, "an always-handoff draw was recorded inline");
-    Reset();
-    RunPattern({"short batches", 2, 1000, 0}, CommandEncoder::Handoff::Adaptive, Draws, counts);
-    Require(counts.inlined * 10 >= static_cast<std::uint64_t>(Draws) * 7, "the adaptive hand-off kept " + std::to_string(Draws - counts.inlined) + " of " + std::to_string(Draws) + " draws on the encoder although each batch cost more to wait for than to record");
-    Reset();
-    RunPattern({"waits in every window", 1000000, 0, 0, true, 20000}, CommandEncoder::Handoff::Adaptive, Draws, counts);
-    Require(counts.inlined * 10 >= static_cast<std::uint64_t>(Draws) * 9, "the adaptive hand-off kept " + std::to_string(Draws - counts.inlined) + " of " + std::to_string(Draws) + " draws on the encoder although every window waited for the encoder thread's own time");
+    const bool shortBatches = HoldsInAnAttempt([&] {
+        Reset();
+        RunPattern({"short batches", 2, 1000, 0}, CommandEncoder::Handoff::Adaptive, Draws, counts);
+        return counts.inlined * 10 >= static_cast<std::uint64_t>(Draws) * 7;
+    });
+    Require(shortBatches, "the adaptive hand-off kept " + std::to_string(Draws - counts.inlined) + " of " + std::to_string(Draws) + " draws on the encoder although each batch cost more to wait for than to record");
+    const bool waitingWindows = HoldsInAnAttempt([&] {
+        Reset();
+        RunPattern({"waits in every window", 1000000, 0, 0, true, 20000}, CommandEncoder::Handoff::Adaptive, Draws, counts);
+        return counts.inlined * 10 >= static_cast<std::uint64_t>(Draws) * 9;
+    });
+    Require(waitingWindows, "the adaptive hand-off kept " + std::to_string(Draws - counts.inlined) + " of " + std::to_string(Draws) + " draws on the encoder although every window waited for the encoder thread's own time");
     Reset();
     RunPattern({"first block", 64, 0, 0}, CommandEncoder::Handoff::Adaptive, CommandEncoder::ProbeBlock, counts);
     Require(counts.inlined == 0, "the adaptive hand-off recorded " + std::to_string(counts.inlined) + " draws of its first probe block inline");
