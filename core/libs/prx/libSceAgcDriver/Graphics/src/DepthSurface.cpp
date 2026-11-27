@@ -79,6 +79,7 @@ std::atomic<bool> directDepthCopy{std::getenv("APS5_NO_DIRECT_DEPTH_COPY") == nu
 std::atomic<bool> forcedDepthUploadImage{false};
 std::atomic<std::uint64_t> depthUploads{0};
 std::atomic<std::uint64_t> directDepthCopies{0};
+std::atomic<std::uint64_t> depthSurfaceSeeds{0};
 
 std::uint32_t aspectCopyBytes(VkFormat format, VkImageAspectFlagBits aspect) {
     if (aspect != VK_IMAGE_ASPECT_DEPTH_BIT) return 0;
@@ -403,6 +404,24 @@ std::optional<Element> uniformPlaneValue(std::uint64_t address, std::size_t byte
         offset += count * sizeof(Element);
     }
     return value;
+}
+
+std::optional<float> uniformCommittedDepth(std::uint64_t address, std::size_t bytes) {
+    std::array<std::uint32_t, 16384> chunk{};
+    std::optional<std::uint32_t> word;
+    for (std::size_t offset = 0u; offset + sizeof(std::uint32_t) <= bytes;) {
+        const auto elements = std::span(chunk).first(std::min(chunk.size(), (bytes - offset) / sizeof(std::uint32_t)));
+        GuestMemory::ReadCommittedUnsynced(address + offset, std::as_writable_bytes(elements));
+        if (!word) word = elements.front();
+        if (std::ranges::any_of(elements, [&](std::uint32_t element) { return element != *word; })) return std::nullopt;
+        offset += elements.size() * sizeof(std::uint32_t);
+    }
+    // A clear converts its value to the format, so only +0.0 and normal floats in (0, 1] are known to
+    // land bit for bit; -0.0 and denormals take the copy.
+    const auto bits = word.value_or(0u);
+    const auto depth = std::bit_cast<float>(bits);
+    if (bits != 0u && !(std::isnormal(depth) && depth > 0.0f && depth <= 1.0f)) return std::nullopt;
+    return depth;
 }
 
 DepthSamplingState prepareUniformPlaneSampling(const Context& context, const DepthTarget& target, DepthSamplingState state) {
@@ -1707,13 +1726,16 @@ public:
         NoteHostWrite();
     }
 
-    void TakeStorage() {
+    void TakeStorage(const std::optional<GuestTextureResource>& guestPlane) {
         if (target.samples != 1 || hostFormat != target.format) return;
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto bytes = DepthSliceBytes(target.extent, d16 ? 2u : 4u);
         auto storage = StorageTexture::FindPending(target.address, bytes);
         if (storage == nullptr) storage = StorageTexture::FindLive(target.address, bytes);
-        if (storage == nullptr || !storageFits(target, storage->Descriptor())) return;
+        if (storage == nullptr || !storageFits(target, storage->Descriptor())) {
+            if (guestPlane) SeedFromGuestPlane(*guestPlane);
+            return;
+        }
         storage->Refresh();
         const bool direct = DirectDepthCopy(context, hostFormat, VK_IMAGE_ASPECT_DEPTH_BIT, storage->ImageFormat());
         if (!direct && depthPlane.staging == nullptr) depthPlane.staging = std::make_unique<DeviceBuffer>(context, static_cast<std::size_t>(target.extent.width) * target.extent.height * (d16 ? 2u : 4u), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -1783,6 +1805,65 @@ public:
         }
         if (batch) batch->SubmitAndWait();
         else Recorder::CountBarriers(Recorder::CommandClass::Copy, target.stencilAddress == 0 ? 4 : 3);
+    }
+
+    void SeedFromGuestPlane(const GuestTextureResource& resource) {
+        if (context.detiler == nullptr) return;
+        const auto geometry = DescribeSurface(resource);
+        const auto& mip = geometry.mips.front();
+        const auto planeBytes = static_cast<std::size_t>(geometry.layerBytes);
+        GuestMemory::FlushGpuWrites(resource.baseAddress, planeBytes);
+        GuestMemory::MaterializeKnownZero(resource.baseAddress, planeBytes);
+        std::uint64_t baseline = 0;
+        static_cast<void>(WrittenUnits(resource, baseline));
+        if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::SeedBaselineTaken);
+        const auto uniform = uniformCommittedDepth(resource.baseAddress, planeBytes);
+        std::shared_ptr<Buffer> upload;
+        if (!uniform) {
+            upload = std::make_shared<Buffer>(context, planeBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            GuestMemory::ReadCommitted(resource.baseAddress, upload->Bytes().first(planeBytes));
+        }
+        if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::GuestPlaneSeeded);
+        auto* recorder = RecorderFor(context);
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        std::shared_ptr<DeviceBuffer> linear;
+        if (!uniform) {
+            // The recorder owns both buffers before any command names them, so a throw while recording
+            // leaves no recorded command behind its buffer.
+            linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(geometry.sliceLinearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            if (recorder != nullptr) {
+                recorder->Keep(upload, upload->Bytes().size());
+                recorder->Keep(linear, linear->Size());
+            }
+            context.detiler->BeginBatch();
+        }
+        unitGeneration.assign(unitGeneration.size(), baseline);
+        depthSurfaceSeeds.fetch_add(1, std::memory_order_relaxed);
+        if (uniform) {
+            const VkClearDepthStencilValue value{*uniform, 0u};
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+            if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::SeedRecorded);
+            if (batch) batch->SubmitAndWait();
+            else Recorder::CountBarriers(Recorder::CommandClass::Copy, 1);
+            return;
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        context.detiler->Dispatch(commands, resource.tileMode, 4u, upload->Handle(), 0, linear->Handle(), 0, mip, false, 0, geometry.thick, {.pipeBankXor = resource.pipeBankXor});
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy region{};
+        region.bufferOffset = mip.linearOffset;
+        region.bufferRowLength = mip.pitchBytes / 4u;
+        region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        region.imageExtent = {target.extent.width, target.extent.height, 1};
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::SeedRecorded);
+        if (batch) batch->SubmitAndWait();
+        else Recorder::CountBarriers(Recorder::CommandClass::Copy, 3);
     }
 
     std::shared_ptr<StorageTexture> Mirror(const GuestTextureResource& resource) {
@@ -1909,23 +1990,33 @@ public:
             changed[unit] = true;
         };
         if (collected == 0u) {
+            auto& tracked = trackedRanges;
+            tracked.clear();
+            const auto track = [&](std::size_t unit, std::uint64_t address, std::size_t length) {
+                if (!tracked.empty() && tracked.back().unit == unit && tracked.back().address + tracked.back().length == address) tracked.back().length += length;
+                else tracked.push_back({unit, address, length});
+            };
             for (std::size_t unit = 0; unit < unitGeneration.size(); ++unit) {
                 const auto offset = unit * unitBytes;
                 const auto address = resource.baseAddress + offset;
                 const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(unitBytes, bytes - offset));
                 if (GuestMemory::CollectWritesUncached(address, length) != 0u) {
-                    if (unitGeneration[unit] != 0u && GuestMemory::WrittenSince(address, length, unitGeneration[unit])) mark(unit);
+                    track(unit, address, length);
                     continue;
                 }
                 constexpr std::uint64_t pageBytes = 4096u;
                 for (std::size_t page = 0; page < length;) {
                     const auto pageAddress = address + page;
                     const auto pageLength = static_cast<std::size_t>(std::min<std::uint64_t>(length - page, pageBytes - pageAddress % pageBytes));
-                    if (GuestMemory::CollectWritesUncached(pageAddress, pageLength) != 0u && unitGeneration[unit] != 0u && GuestMemory::WrittenSince(pageAddress, pageLength, unitGeneration[unit])) mark(unit);
+                    if (GuestMemory::CollectWritesUncached(pageAddress, pageLength) != 0u) track(unit, pageAddress, pageLength);
                     page += pageLength;
                 }
             }
+            if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::UnitsCollected);
             generation = GuestMemory::TrackerGeneration();
+            for (const auto& range : tracked) {
+                if (unitGeneration[range.unit] != 0u && GuestMemory::WrittenSince(range.address, range.length, unitGeneration[range.unit])) mark(range.unit);
+            }
             return changed;
         }
         if (unitGeneration.size() == 1u) {
@@ -2051,6 +2142,13 @@ public:
     std::vector<std::uint64_t> unitBacking;
     std::uint64_t backingGeneration = 0;
     std::vector<std::uint64_t> unitGeneration;
+    struct TrackedRange {
+        std::size_t unit;
+        std::uint64_t address;
+        std::size_t length;
+    };
+    // WrittenUnits' partial-watch ranges, kept so a bind reuses their storage.
+    std::vector<TrackedRange> trackedRanges;
     std::uint64_t unitBytes = 0;
     bool syncing = false;
     std::uint64_t scannedEpoch = 0;
@@ -3754,6 +3852,7 @@ GuestTextureResource mirrorResource(const DepthTarget& target) {
     resource.mipCount = 1;
     resource.allocatedMipCount = 1;
     resource.tileMode = TextureTileMode::kZ64KBX;
+    resource.pipeBankXor = target.pipeBankXor;
     resource.dimension = TextureDimension::k2D;
     resource.format = 22;
     resource.dstSelX = 4;
@@ -3841,6 +3940,21 @@ void retire(DepthSurface& surface) {
     std::lock_guard lock(planes.mutex);
     std::erase(planes.ranges, plane);
     publishStaleHull(planes);
+}
+
+// Unpublishes a surface created by the bind that threw while filling it: no lookup finds it, the planes
+// go back to the owners they had before the bind (or to none when those were retired by it), and the
+// next bind creates and fills a new surface. It stays in surfaces(), retired, until releaseRetired
+// hands it to the recorder, so commands already recorded against its image stay valid.
+void abandonCreated(DepthSurface& surface, const std::array<PlaneOwner, 2>& previous) {
+    surface.active->store(false, std::memory_order_release);
+    retire(surface);
+    const auto restore = [&](PlaneOwners& owners, std::uint64_t address, const PlaneOwner& owner) {
+        if (owner.surface != nullptr && owner.surface != &surface && !owner.surface->retired && owner.surface->active->load(std::memory_order_acquire)) owners[{surface.context.device, address}] = owner;
+    };
+    restore(depthOwners(), surface.target.address, previous[0]);
+    if (surface.target.stencilAddress != 0) restore(stencilOwners(), surface.target.stencilAddress, previous[1]);
+    surfacesSerial.fetch_add(1, std::memory_order_release);
 }
 
 void retireStoringStale(DepthSurface& surface) {
@@ -4308,9 +4422,19 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     surface->clearStencil = target.clearStencil;
     const auto stencilOwner = stencilOwners().find({context.device, target.stencilAddress});
     const bool stencilRebound = stencilOwner == stencilOwners().end() || stencilOwner->second.surface != surface;
+    const bool fills = created && !inherits && target.htileAddress == 0;
+    std::array<PlaneOwner, 2> previousOwners{};
+    if (fills) previousOwners = {owner != depthOwners().end() ? owner->second : PlaneOwner{}, target.stencilAddress != 0 && stencilOwner != stencilOwners().end() ? stencilOwner->second : PlaneOwner{}};
     takePlanes(*surface, created, htileCleared | (cleared ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u));
     if (cleared || htileCleared != 0u) surface->expanded = false;
-    if (created && !inherits && target.htileAddress == 0) surface->TakeStorage();
+    if (fills) {
+        try {
+            surface->TakeStorage(mirrorable(target) ? std::optional(mirrorResource(target)) : std::nullopt);
+        } catch (...) {
+            abandonCreated(*surface, previousOwners);
+            throw;
+        }
+    }
     if (cleared && (!created || inherits)) {
         if (target.samples != 1u && (!created || !surface->samplingActive)) surface->sampling.Refuse("native multisample depth fast-clear transition is not implemented");
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
@@ -5518,6 +5642,10 @@ bool DirectDepthCopy(const Context& context, VkFormat depthFormat, VkImageAspect
 
 std::uint64_t DirectDepthCopyCount() {
     return directDepthCopies.load(std::memory_order_relaxed);
+}
+
+std::uint64_t DepthSurfaceSeedCount() {
+    return depthSurfaceSeeds.load(std::memory_order_relaxed);
 }
 
 void SetDirectDepthCopy(bool enabled) {
