@@ -1813,6 +1813,7 @@ public:
         GuestMemory::MaterializeKnownZero(resource.baseAddress, planeBytes);
         std::uint64_t baseline = 0;
         static_cast<void>(WrittenUnits(resource, baseline));
+        if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::SeedBaselineTaken);
         const auto uniform = uniformCommittedDepth(resource.baseAddress, planeBytes);
         std::shared_ptr<Buffer> upload;
         if (!uniform) {
@@ -1847,6 +1848,7 @@ public:
         region.imageExtent = {target.extent.width, target.extent.height, 1};
         context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::SeedRecorded);
         if (batch) batch->SubmitAndWait();
         else {
             Recorder::CountBarriers(Recorder::CommandClass::Copy, 3);

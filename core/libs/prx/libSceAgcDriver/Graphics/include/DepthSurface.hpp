@@ -56,7 +56,7 @@ enum class DepthReadCause { Access, Reuse, Attachment, Write };
 void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t bytes, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt, bool allowPublication = true, DepthReadCause cause = DepthReadCause::Access);
 void AppendHostWrittenDepthRanges(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 void AppendStaleDepthPlanes(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
-enum class DepthPublicationStage { ReadCaptured, GuestCopied, BeforeCommit, PlaneCommitted, StencilPlaneRead, GuestPlaneSeeded, UnitsCollected };
+enum class DepthPublicationStage { ReadCaptured, GuestCopied, BeforeCommit, PlaneCommitted, StencilPlaneRead, SeedBaselineTaken, GuestPlaneSeeded, SeedRecorded, UnitsCollected };
 void SetDepthPublicationHookForTest(void (*hook)(DepthPublicationStage));
 bool HasResidentDepthGuards_nid_no_patch();
 bool ResidentDepthGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes);

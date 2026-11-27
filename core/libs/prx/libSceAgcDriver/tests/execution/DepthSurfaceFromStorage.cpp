@@ -24,6 +24,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -54,7 +55,7 @@ constexpr std::uint32_t TileDepth64KB = 0x18;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Type2DArray = 13;
 constexpr std::size_t PlaneBytes = 65536;
-constexpr std::size_t BlockBytes = 34 * PlaneBytes;
+constexpr std::size_t BlockBytes = 52 * PlaneBytes;
 constexpr std::uint32_t RowPasses = 15;
 
 alignas(256) constexpr std::array<std::uint32_t, 9> StoreRowCode{
@@ -209,23 +210,29 @@ std::uint64_t EquationOffset(const AgcDriver::Graphics::TextureSwizzleEquation& 
     return offset;
 }
 
-std::uint64_t TexelOffset(std::uint32_t x, std::uint32_t y) {
-    static const auto geometry = [] {
-        AgcDriver::Graphics::GuestTextureResource resource{};
-        resource.width = PatternExtent.width;
-        resource.height = PatternExtent.height;
-        resource.mipCount = 1;
-        resource.allocatedMipCount = 1;
-        resource.tileMode = AgcDriver::Graphics::TextureTileMode::kZ64KBX;
-        resource.dimension = AgcDriver::Graphics::TextureDimension::k2D;
-        resource.format = Format32Float;
-        return AgcDriver::Graphics::DescribeSurface(resource);
-    }();
+auto DescribePlane(VkExtent2D extent) {
+    AgcDriver::Graphics::GuestTextureResource resource{};
+    resource.width = extent.width;
+    resource.height = extent.height;
+    resource.mipCount = 1;
+    resource.allocatedMipCount = 1;
+    resource.tileMode = AgcDriver::Graphics::TextureTileMode::kZ64KBX;
+    resource.dimension = AgcDriver::Graphics::TextureDimension::k2D;
+    resource.format = Format32Float;
+    return AgcDriver::Graphics::DescribeSurface(resource);
+}
+
+std::uint64_t TiledOffset(const decltype(DescribePlane({}))& geometry, std::uint32_t x, std::uint32_t y, std::uint32_t pipeBankXor) {
     static const auto layout = AgcDriver::Graphics::ThinBlockLayout(AgcDriver::Graphics::TextureTileMode::kZ64KBX, 4u);
     static const auto* equation = AgcDriver::Graphics::FindTextureSwizzleEquation(ZSwizzle(), 4u);
-    Require(equation != nullptr && geometry.guestBytes <= 4u * PlaneBytes, "the SW_64KB_Z_X equation is missing or the 192x136 plane does not fit four slots");
+    Require(equation != nullptr && geometry.guestBytes <= 4u * PlaneBytes, "the SW_64KB_Z_X equation is missing or the plane does not fit four slots");
     const auto& mip = geometry.mips.front();
-    return mip.tiledOffset + (static_cast<std::uint64_t>(y / layout[2]) * mip.blocksPerRow + x / layout[1]) * layout[0] + EquationOffset(*equation, x, y);
+    return mip.tiledOffset + (static_cast<std::uint64_t>(y / layout[2]) * mip.blocksPerRow + x / layout[1]) * layout[0] + (EquationOffset(*equation, x, y) ^ pipeBankXor);
+}
+
+std::uint64_t TexelOffset(std::uint32_t x, std::uint32_t y, std::uint32_t pipeBankXor = 0) {
+    static const auto geometry = DescribePlane(PatternExtent);
+    return TiledOffset(geometry, x, y, pipeBankXor);
 }
 
 float PatternDepth(std::uint32_t x, std::uint32_t y, bool inverted) {
@@ -233,11 +240,11 @@ float PatternDepth(std::uint32_t x, std::uint32_t y, bool inverted) {
     return distant != inverted ? 0.75f : 0.25f;
 }
 
-void WritePattern(std::uint8_t* plane, bool inverted) {
+void WritePattern(std::uint8_t* plane, bool inverted, std::uint32_t pipeBankXor = 0) {
     for (std::uint32_t y = 0; y < PatternExtent.height; ++y) {
         for (std::uint32_t x = 0; x < PatternExtent.width; ++x) {
             const float depth = PatternDepth(x, y, inverted);
-            std::memcpy(plane + TexelOffset(x, y), &depth, sizeof(depth));
+            std::memcpy(plane + TexelOffset(x, y, pipeBankXor), &depth, sizeof(depth));
         }
     }
 }
@@ -246,8 +253,10 @@ void FillPlane(std::uint8_t* plane, float depth) {
     for (std::size_t offset = 0; offset < PlaneBytes; offset += sizeof(depth)) std::memcpy(plane + offset, &depth, sizeof(depth));
 }
 
-void RequirePattern(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane, bool inverted, const std::string& what) {
-    static_cast<void>(DepthFastClearHarness::Draw(device, shaders, Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), {}, PatternExtent, PatternPixels));
+void RequirePattern(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane, bool inverted, const std::string& what, std::uint32_t pipeBankXor = 0) {
+    auto surface = Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle());
+    surface.pipeBankXor = pipeBankXor;
+    static_cast<void>(DepthFastClearHarness::Draw(device, shaders, surface, {}, PatternExtent, PatternPixels));
     std::uint32_t wrong = 0;
     for (std::uint32_t y = 0; y < PatternExtent.height; ++y) {
         for (std::uint32_t x = 0; x < PatternExtent.width; ++x) {
@@ -360,6 +369,71 @@ void IncompatibleStorageCase(AgcDriver::VulkanDevice& device, const DepthFastCle
     const auto seeds = AgcDriver::Graphics::DepthSurfaceSeedCount();
     RequireCount(DepthFastClearHarness::Draw(device, shaders, Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), {}), 0, "a new D32 depth surface under a live R8 storage image of its plane, after the CPU wrote 0.25 there, tested LESS at 0.5");
     RequireCount(SeedsSince(seeds), 1, "a new D32 depth surface under a live R8 storage image of its plane, surfaces seeded from guest memory");
+}
+
+std::optional<AgcDriver::Graphics::DepthPublicationStage> faultStage;
+
+void FaultWhileSeeding(AgcDriver::Graphics::DepthPublicationStage stage) {
+    if (!faultStage || stage != *faultStage) return;
+    faultStage.reset();
+    throw std::runtime_error("injected seed fault");
+}
+
+void SeedFaultCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane, AgcDriver::Graphics::DepthPublicationStage stage, const std::string& what) {
+    WritePattern(plane, false);
+    faultStage = stage;
+    AgcDriver::Graphics::SetDepthPublicationHookForTest(FaultWhileSeeding);
+    bool threw = false;
+    try {
+        static_cast<void>(DepthFastClearHarness::Draw(device, shaders, Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), {}, PatternExtent, PatternPixels));
+    } catch (const std::runtime_error& error) {
+        threw = std::string(error.what()).find("injected seed fault") != std::string::npos;
+    }
+    AgcDriver::Graphics::SetDepthPublicationHookForTest(nullptr);
+    faultStage.reset();
+    if (!threw) failures.push_back(what + ": the injected fault did not leave the bind");
+    device.WaitIdle();
+    const auto seeds = AgcDriver::Graphics::DepthSurfaceSeedCount();
+    RequirePattern(device, shaders, plane, false, what + ", bound again and tested LESS at 0.5");
+    RequireCount(SeedsSince(seeds), 1, what + ", bound again, surfaces seeded from guest memory");
+}
+
+void PipeBankXorCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane) {
+    constexpr std::uint32_t pipeBankXor = 0xcf00u;
+    const auto base = Address(plane);
+    const auto bytes = static_cast<std::size_t>(4u * PlaneBytes);
+    const bool watched = AgcDriver::GuestMemory::WriteWatched() && AgcDriver::GuestMemory::Watched(base, bytes);
+    WritePattern(plane, false, pipeBankXor);
+    const auto seeds = AgcDriver::Graphics::DepthSurfaceSeedCount();
+    RequirePattern(device, shaders, plane, false, "a new 192x136 D32 depth surface with pipe/bank XOR 0xcf00 over a plane only the CPU wrote, tested LESS at 0.5", pipeBankXor);
+    RequireCount(SeedsSince(seeds), 1, "a new 192x136 D32 depth surface with pipe/bank XOR 0xcf00, surfaces seeded from guest memory");
+    if (!watched) return;
+    WritePattern(plane, true, pipeBankXor);
+    RequirePattern(device, shaders, plane, true, "the seeded depth surface with pipe/bank XOR 0xcf00 after the CPU inverted its plane", pipeBankXor);
+}
+
+void RawDepthBitsCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane, std::uint32_t bits, const std::string& what) {
+    for (std::size_t offset = 0; offset < PlaneBytes; offset += sizeof(bits)) std::memcpy(plane + offset, &bits, sizeof(bits));
+    const auto seeds = AgcDriver::Graphics::DepthSurfaceSeedCount();
+    RequireCount(DepthFastClearHarness::Draw(device, shaders, Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), {.depthWrite = true, .depthCompare = VK_COMPARE_OP_NEVER}), 0, what + ", drawn with depth writes and NEVER");
+    RequireCount(SeedsSince(seeds), 1, what + ", surfaces seeded from guest memory");
+    static_cast<void>(AgcDriver::Graphics::FlushDepthPlanes(Address(plane), PlaneBytes));
+    device.WaitIdle();
+    static const auto geometry = DescribePlane({Width, Height});
+    std::uint32_t changed = 0;
+    std::uint32_t first = bits;
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            std::uint32_t stored = 0;
+            std::memcpy(&stored, plane + TiledOffset(geometry, x, y, 0), sizeof(stored));
+            if (stored != bits && changed++ == 0) first = stored;
+        }
+    }
+    if (changed != 0) {
+        char text[64];
+        std::snprintf(text, sizeof(text), "0x%08x became 0x%08x", bits, first);
+        failures.push_back(what + ", stored back: " + std::to_string(changed) + " of " + std::to_string(Covered) + " texels changed, " + text);
+    }
 }
 
 std::uint64_t DepthPlaneFills() {
@@ -478,6 +552,12 @@ int main() {
         IncompatibleStorageCase(*device, shaders, block.Plane(29));
         PartialWatchCollectCase(*device, shaders, block.Plane(30));
         DemandZeroPlaneCase(*device, shaders, untouched.Plane(0));
+        SeedFaultCase(*device, shaders, block.Plane(34), AgcDriver::Graphics::DepthPublicationStage::SeedBaselineTaken, "a depth surface seed that threw after taking its baseline");
+        SeedFaultCase(*device, shaders, block.Plane(38), AgcDriver::Graphics::DepthPublicationStage::GuestPlaneSeeded, "a depth surface seed that threw after reading its plane");
+        SeedFaultCase(*device, shaders, block.Plane(42), AgcDriver::Graphics::DepthPublicationStage::SeedRecorded, "a depth surface seed that threw after recording its copy");
+        PipeBankXorCase(*device, shaders, block.Plane(46));
+        RawDepthBitsCase(*device, shaders, block.Plane(50), 0x80000000u, "a new D32 depth surface over a plane of -0.0");
+        RawDepthBitsCase(*device, shaders, block.Plane(51), 0x00000001u, "a new D32 depth surface over a plane of the smallest denormal");
 
         auto* cleared = block.Plane(3);
         const auto htile = Address(block.Plane(4));
