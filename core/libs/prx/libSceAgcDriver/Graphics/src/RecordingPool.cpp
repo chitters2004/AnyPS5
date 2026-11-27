@@ -30,6 +30,7 @@ std::uint64_t RecordingPool::RecordedBuffers() {
 struct RecordingPool::Returned {
     std::mutex mutex;
     std::vector<VkCommandBuffer> buffers;
+    std::size_t allocated = 0;
 };
 
 struct RecordingPool::Release {
@@ -100,6 +101,7 @@ VkCommandBuffer RecordingPool::acquire(VkCommandPool pool, Returned& returned) c
             returned.buffers.pop_back();
             return commands;
         }
+        returned.buffers.reserve(returned.allocated + 1);
     }
     VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocation.commandPool = pool;
@@ -107,6 +109,8 @@ VkCommandBuffer RecordingPool::acquire(VkCommandPool pool, Returned& returned) c
     allocation.commandBufferCount = 1;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     Check(allocateBuffers(device, &allocation, &commands), "vkAllocateCommandBuffers recording worker");
+    std::lock_guard lock(returned.mutex);
+    ++returned.allocated;
     return commands;
 }
 
