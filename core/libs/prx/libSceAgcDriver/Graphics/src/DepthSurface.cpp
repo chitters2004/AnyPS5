@@ -406,6 +406,21 @@ std::optional<Element> uniformPlaneValue(std::uint64_t address, std::size_t byte
     return value;
 }
 
+std::optional<float> uniformCommittedDepth(std::uint64_t address, std::size_t bytes) {
+    std::array<std::uint32_t, 16384> chunk{};
+    std::optional<std::uint32_t> word;
+    for (std::size_t offset = 0u; offset + sizeof(std::uint32_t) <= bytes;) {
+        const auto elements = std::span(chunk).first(std::min(chunk.size(), (bytes - offset) / sizeof(std::uint32_t)));
+        GuestMemory::ReadCommittedUnsynced(address + offset, std::as_writable_bytes(elements));
+        if (!word) word = elements.front();
+        if (std::ranges::any_of(elements, [&](std::uint32_t element) { return element != *word; })) return std::nullopt;
+        offset += elements.size() * sizeof(std::uint32_t);
+    }
+    const auto depth = std::bit_cast<float>(word.value_or(0u));
+    if (!(depth >= 0.0f && depth <= 1.0f)) return std::nullopt;
+    return depth;
+}
+
 DepthSamplingState prepareUniformPlaneSampling(const Context& context, const DepthTarget& target, DepthSamplingState state) {
     const auto refuse = [&](const char* reason) {
         state.refusal = reason;
@@ -1794,19 +1809,33 @@ public:
         const auto geometry = DescribeSurface(resource);
         const auto& mip = geometry.mips.front();
         const auto planeBytes = static_cast<std::size_t>(geometry.layerBytes);
-        auto upload = std::make_shared<Buffer>(context, planeBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         GuestMemory::FlushGpuWrites(resource.baseAddress, planeBytes);
         GuestMemory::MaterializeKnownZero(resource.baseAddress, planeBytes);
         std::uint64_t baseline = 0;
         static_cast<void>(WrittenUnits(resource, baseline));
-        GuestMemory::ReadCommitted(resource.baseAddress, upload->Bytes().first(planeBytes));
+        const auto uniform = uniformCommittedDepth(resource.baseAddress, planeBytes);
+        std::shared_ptr<Buffer> upload;
+        if (!uniform) {
+            upload = std::make_shared<Buffer>(context, planeBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            GuestMemory::ReadCommitted(resource.baseAddress, upload->Bytes().first(planeBytes));
+        }
         if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::GuestPlaneSeeded);
         unitGeneration.assign(unitGeneration.size(), baseline);
-        auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(geometry.sliceLinearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         auto* recorder = RecorderFor(context);
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        depthSurfaceSeeds.fetch_add(1, std::memory_order_relaxed);
+        if (uniform) {
+            const VkClearDepthStencilValue value{*uniform, 0u};
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+            if (batch) batch->SubmitAndWait();
+            else Recorder::CountBarriers(Recorder::CommandClass::Copy, 1);
+            return;
+        }
+        auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(geometry.sliceLinearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         context.detiler->BeginBatch();
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         context.detiler->Dispatch(commands, resource.tileMode, 4u, upload->Handle(), 0, linear->Handle(), 0, mip, false, 0, geometry.thick, {.pipeBankXor = resource.pipeBankXor});
@@ -1818,7 +1847,6 @@ public:
         region.imageExtent = {target.extent.width, target.extent.height, 1};
         context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-        depthSurfaceSeeds.fetch_add(1, std::memory_order_relaxed);
         if (batch) batch->SubmitAndWait();
         else {
             Recorder::CountBarriers(Recorder::CommandClass::Copy, 3);
