@@ -420,7 +420,7 @@ std::optional<float> uniformCommittedDepth(std::uint64_t address, std::size_t by
     // land bit for bit; -0.0 and denormals take the copy.
     const auto bits = word.value_or(0u);
     const auto depth = std::bit_cast<float>(bits);
-    if (bits != 0u && !(std::isnormal(depth) && depth > 0.0f && depth <= 1.0f)) return std::nullopt;
+    if (!(depth >= 0.0f && depth <= 1.0f)) return std::nullopt;
     return depth;
 }
 
@@ -1842,7 +1842,7 @@ public:
         unitGeneration.assign(unitGeneration.size(), baseline);
         depthSurfaceSeeds.fetch_add(1, std::memory_order_relaxed);
         if (uniform) {
-            const VkClearDepthStencilValue value{*uniform, 0u};
+            const VkClearDepthStencilValue value{std::fpclassify(*uniform) == FP_NORMAL ? *uniform : 0.0f, 0u};
             const VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
             context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
