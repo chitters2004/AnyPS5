@@ -473,8 +473,6 @@ void EpochExitSurfaceCase(AgcDriver::VulkanDevice& device, GuestBlock& block, st
     FillSlice(base, SliceBytes, Bits(0.75f), 4u);
     const auto program = LoadProgram(device, base, shape, 0, output);
     const AgcDriver::Graphics::CompiledShader shader{ShaderStage::Compute, &program, 0};
-    FillSlice(block.At(ReloadOffset), SliceBytes, Bits(0.25f), 4u);
-    Load(device, block.At(ReloadOffset), shape, 0, output);
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     AgcDriver::GuestMemory::MarkProofThread();
