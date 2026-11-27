@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -17,6 +18,7 @@
 #include <sys/mman.h>
 #endif
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -52,7 +54,7 @@ constexpr std::uint32_t TileDepth64KB = 0x18;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Type2DArray = 13;
 constexpr std::size_t PlaneBytes = 65536;
-constexpr std::size_t BlockBytes = 23 * PlaneBytes;
+constexpr std::size_t BlockBytes = 34 * PlaneBytes;
 constexpr std::uint32_t RowPasses = 15;
 
 alignas(256) constexpr std::array<std::uint32_t, 9> StoreRowCode{
@@ -161,8 +163,12 @@ void StoreStencilRow(AgcDriver::VulkanDevice& device, std::uint8_t* stencil) {
     Store(device, StorageView(Address(stencil), Format8Uint, 1), StoreStencilRowCode);
 }
 
-DepthFastClearHarness::Surface Plane(std::uint8_t* plane, VkFormat format, std::uint64_t htile = 0) {
-    return {Address(plane), 0, htile, false, format};
+DepthFastClearHarness::Surface Plane(std::uint8_t* plane, VkFormat format, std::uint64_t htile = 0, std::uint32_t swizzle = 0) {
+    return {Address(plane), 0, htile, false, format, 0, 0, swizzle};
+}
+
+std::uint32_t ZSwizzle() {
+    return AgcDriver::Graphics::XorSwizzleMode(AgcDriver::Graphics::TextureTileMode::kZ64KBX);
 }
 
 std::vector<std::string> failures;
@@ -171,7 +177,7 @@ void RequireCount(std::uint32_t covered, std::uint32_t expected, const std::stri
     if (covered != expected) failures.push_back(what + ": " + std::to_string(covered) + " pixels passed, expected " + std::to_string(expected));
 }
 
-void NewSurfaceCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane, VkFormat format, bool flushed, const std::string& what, std::uint32_t layers = 1) {
+void NewSurfaceCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane, VkFormat format, bool flushed, const std::string& what, std::uint32_t layers = 1, std::uint32_t swizzle = 0) {
     for (std::uint32_t layer = 0; layer < layers; ++layer) Fill(plane + layer * PlaneBytes, format);
     StoreRow(device, plane, format, layers);
     if (layers > 1u) {
@@ -183,7 +189,176 @@ void NewSurfaceCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness
     } else {
         Require(AgcDriver::Graphics::StorageTexture::FindPending(Address(plane), PlaneBytes) != nullptr, what + ": the stored row is not pending in a storage image");
     }
-    RequireCount(DepthFastClearHarness::Draw(device, shaders, Plane(plane, format), {}), RowPasses, what);
+    const auto seeds = AgcDriver::Graphics::DepthSurfaceSeedCount();
+    RequireCount(DepthFastClearHarness::Draw(device, shaders, Plane(plane, format, 0, swizzle), {}), RowPasses, what);
+    RequireCount(static_cast<std::uint32_t>(AgcDriver::Graphics::DepthSurfaceSeedCount() - seeds), 0, what + ", surfaces seeded from guest memory");
+}
+
+constexpr VkExtent2D PatternExtent{192, 136};
+constexpr std::uint32_t PatternTexels = PatternExtent.width * PatternExtent.height;
+alignas(256) std::array<std::byte, PatternTexels * 4> PatternPixels{};
+
+std::uint64_t EquationOffset(const AgcDriver::Graphics::TextureSwizzleEquation& equation, std::uint32_t x, std::uint32_t y) {
+    std::uint64_t offset = 0;
+    for (std::uint32_t bit = 0; bit < 16; ++bit) {
+        const auto mask = equation.bits[bit];
+        const auto selected = (x & (mask & 0xfffu)) ^ ((y << 12) & (mask & 0xfff000u));
+        offset |= static_cast<std::uint64_t>(std::popcount(selected) & 1u) << bit;
+    }
+    return offset;
+}
+
+std::uint64_t TexelOffset(std::uint32_t x, std::uint32_t y) {
+    static const auto geometry = [] {
+        AgcDriver::Graphics::GuestTextureResource resource{};
+        resource.width = PatternExtent.width;
+        resource.height = PatternExtent.height;
+        resource.mipCount = 1;
+        resource.allocatedMipCount = 1;
+        resource.tileMode = AgcDriver::Graphics::TextureTileMode::kZ64KBX;
+        resource.dimension = AgcDriver::Graphics::TextureDimension::k2D;
+        resource.format = Format32Float;
+        return AgcDriver::Graphics::DescribeSurface(resource);
+    }();
+    static const auto layout = AgcDriver::Graphics::ThinBlockLayout(AgcDriver::Graphics::TextureTileMode::kZ64KBX, 4u);
+    static const auto* equation = AgcDriver::Graphics::FindTextureSwizzleEquation(ZSwizzle(), 4u);
+    Require(equation != nullptr && geometry.guestBytes <= 4u * PlaneBytes, "the SW_64KB_Z_X equation is missing or the 192x136 plane does not fit four slots");
+    const auto& mip = geometry.mips.front();
+    return mip.tiledOffset + (static_cast<std::uint64_t>(y / layout[2]) * mip.blocksPerRow + x / layout[1]) * layout[0] + EquationOffset(*equation, x, y);
+}
+
+float PatternDepth(std::uint32_t x, std::uint32_t y, bool inverted) {
+    const bool distant = (((x >> 3u) ^ (y >> 2u) ^ (x >> 6u) ^ ((y * 5u) >> 5u)) & 1u) != 0u;
+    return distant != inverted ? 0.75f : 0.25f;
+}
+
+void WritePattern(std::uint8_t* plane, bool inverted) {
+    for (std::uint32_t y = 0; y < PatternExtent.height; ++y) {
+        for (std::uint32_t x = 0; x < PatternExtent.width; ++x) {
+            const float depth = PatternDepth(x, y, inverted);
+            std::memcpy(plane + TexelOffset(x, y), &depth, sizeof(depth));
+        }
+    }
+}
+
+void FillPlane(std::uint8_t* plane, float depth) {
+    for (std::size_t offset = 0; offset < PlaneBytes; offset += sizeof(depth)) std::memcpy(plane + offset, &depth, sizeof(depth));
+}
+
+void RequirePattern(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane, bool inverted, const std::string& what) {
+    static_cast<void>(DepthFastClearHarness::Draw(device, shaders, Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), {}, PatternExtent, PatternPixels));
+    std::uint32_t wrong = 0;
+    for (std::uint32_t y = 0; y < PatternExtent.height; ++y) {
+        for (std::uint32_t x = 0; x < PatternExtent.width; ++x) {
+            const bool passed = std::to_integer<std::uint8_t>(PatternPixels[(static_cast<std::size_t>(y) * PatternExtent.width + x) * 4u]) == 255u;
+            if (passed != (PatternDepth(x, y, inverted) > 0.5f)) ++wrong;
+        }
+    }
+    if (wrong != 0) failures.push_back(what + ": " + std::to_string(wrong) + " of " + std::to_string(PatternTexels) + " pixels disagree with the plane's depth pattern");
+}
+
+std::uint32_t SeedsSince(std::uint64_t seeds) {
+    return static_cast<std::uint32_t>(AgcDriver::Graphics::DepthSurfaceSeedCount() - seeds);
+}
+
+void GuestPlanePatternCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane) {
+    const auto base = Address(plane);
+    const auto bytes = static_cast<std::size_t>(4u * PlaneBytes);
+    const bool watched = AgcDriver::GuestMemory::WriteWatched() && AgcDriver::GuestMemory::Watched(base, bytes);
+    WritePattern(plane, false);
+    const auto seeds = AgcDriver::Graphics::DepthSurfaceSeedCount();
+    RequirePattern(device, shaders, plane, false, "a new 192x136 D32 depth surface over a plane only the CPU wrote, tested LESS at 0.5");
+    RequireCount(SeedsSince(seeds), 1, "a new 192x136 D32 depth surface over a plane only the CPU wrote, surfaces seeded from guest memory");
+    if (!watched) std::puts("guest plane seed: the plane is not write-watched here, so CPU writes after the bind are not checked");
+    if (watched && !AgcDriver::GuestMemory::Watched(base, bytes)) failures.push_back("seeding a depth surface from its guest plane took the plane out of write tracking");
+    if (watched) {
+        WritePattern(plane, true);
+        RequirePattern(device, shaders, plane, true, "the seeded depth surface after the CPU inverted its plane");
+        WritePattern(plane, false);
+        RequirePattern(device, shaders, plane, false, "the seeded depth surface after the CPU restored its plane");
+    }
+    RequireCount(DepthFastClearHarness::Draw(device, shaders, Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), {.depthWrite = true, .depthCompare = VK_COMPARE_OP_ALWAYS}, PatternExtent, PatternPixels), PatternTexels, "the seeded depth surface writing depth 0.5");
+    static_cast<void>(AgcDriver::Graphics::FlushDepthPlanes(base, bytes));
+    device.WaitIdle();
+    std::uint32_t unstored = 0;
+    for (std::uint32_t y = 0; y < PatternExtent.height; ++y) {
+        for (std::uint32_t x = 0; x < PatternExtent.width; ++x) {
+            float depth = 0.0f;
+            std::memcpy(&depth, plane + TexelOffset(x, y), sizeof(depth));
+            if (depth != 0.5f) ++unstored;
+        }
+    }
+    if (unstored != 0) failures.push_back("the seeded depth surface's write of 0.5, flushed to its plane: " + std::to_string(unstored) + " texels do not hold it");
+    if (watched) {
+        WritePattern(plane, true);
+        RequirePattern(device, shaders, plane, true, "the seeded depth surface after the CPU wrote over the depth the GPU flushed to its plane");
+    }
+    RequireCount(SeedsSince(seeds), 1, "a seeded depth surface bound again, surfaces seeded from guest memory");
+}
+
+std::uint8_t* racedPlane = nullptr;
+
+void WriteWhileSeeding(AgcDriver::Graphics::DepthPublicationStage stage) {
+    if (stage == AgcDriver::Graphics::DepthPublicationStage::GuestPlaneSeeded && racedPlane != nullptr) FillPlane(racedPlane, 0.75f);
+}
+
+void SeedRaceCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane) {
+    if (!AgcDriver::GuestMemory::WriteWatched() || !AgcDriver::GuestMemory::Watched(Address(plane), PlaneBytes)) {
+        std::puts("guest plane seed: the plane is not write-watched here, so a CPU write during the seed is not checked");
+        return;
+    }
+    FillPlane(plane, 0.25f);
+    racedPlane = plane;
+    AgcDriver::Graphics::SetDepthPublicationHookForTest(WriteWhileSeeding);
+    const auto seeds = AgcDriver::Graphics::DepthSurfaceSeedCount();
+    static_cast<void>(DepthFastClearHarness::Draw(device, shaders, Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), {}));
+    AgcDriver::Graphics::SetDepthPublicationHookForTest(nullptr);
+    racedPlane = nullptr;
+    RequireCount(SeedsSince(seeds), 1, "a depth surface whose plane the CPU wrote while it was seeded, surfaces seeded from guest memory");
+    RequireCount(DepthFastClearHarness::Draw(device, shaders, Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), {}), Covered, "a depth surface seeded from 0.25 while the CPU wrote 0.75 over its plane, bound again and tested LESS at 0.5");
+}
+
+std::uint8_t* collectedPlane = nullptr;
+
+void CollectWhileStamping(AgcDriver::Graphics::DepthPublicationStage stage) {
+    if (stage != AgcDriver::Graphics::DepthPublicationStage::UnitsCollected || collectedPlane == nullptr) return;
+    FillPlane(collectedPlane, 0.75f);
+    static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(Address(collectedPlane), PlaneBytes));
+    collectedPlane = nullptr;
+}
+
+void PartialWatchCollectCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane) {
+    const auto base = Address(plane);
+    if (!AgcDriver::GuestMemory::WriteWatched() || !AgcDriver::GuestMemory::Watched(base, 4u * PlaneBytes)) {
+        std::puts("partial watch collect: the plane is not write-watched here, so a write collected during a page scan is not checked");
+        return;
+    }
+    for (std::uint32_t block = 0; block < 4u; ++block) FillPlane(plane + block * PlaneBytes, 0.25f);
+    AgcDriver::GuestMemory::Unwatch(base + 3u * PlaneBytes, PlaneBytes);
+    Require(!AgcDriver::GuestMemory::Watched(base, 4u * PlaneBytes) && AgcDriver::GuestMemory::Watched(base, PlaneBytes), "partial watch collect: the plane's last block is still watched or its first is not");
+    const auto surface = Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle());
+    RequireCount(DepthFastClearHarness::Draw(device, shaders, surface, {}, PatternExtent, PatternPixels), 0, "a new 192x136 D32 depth surface over a 0.25 plane whose last block is unwatched, tested LESS at 0.5");
+    collectedPlane = plane;
+    AgcDriver::Graphics::SetDepthPublicationHookForTest(CollectWhileStamping);
+    static_cast<void>(DepthFastClearHarness::Draw(device, shaders, surface, {}, PatternExtent, PatternPixels));
+    AgcDriver::Graphics::SetDepthPublicationHookForTest(nullptr);
+    Require(collectedPlane == nullptr, "partial watch collect: the bind did not scan the plane page by page");
+    std::uint32_t firstBlock = 0;
+    for (std::uint32_t y = 0; y < PatternExtent.height; ++y) {
+        for (std::uint32_t x = 0; x < PatternExtent.width; ++x) firstBlock += TexelOffset(x, y) < PlaneBytes ? 1u : 0u;
+    }
+    RequireCount(DepthFastClearHarness::Draw(device, shaders, surface, {}, PatternExtent, PatternPixels), firstBlock, "a depth surface over a partially watched plane whose first block another collect took 0.75 from while a bind scanned it page by page, bound again and tested LESS at 0.5");
+}
+
+void IncompatibleStorageCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane) {
+    StoreStencilRow(device, plane);
+    AgcDriver::Graphics::StorageTexture::FlushPending(Address(plane), PlaneBytes, nullptr, "test");
+    device.WaitIdle();
+    Require(AgcDriver::Graphics::StorageTexture::FindLive(Address(plane), PlaneBytes) != nullptr, "the R8 row over the depth plane is not held by a live storage image of the plane's size");
+    FillPlane(plane, 0.25f);
+    const auto seeds = AgcDriver::Graphics::DepthSurfaceSeedCount();
+    RequireCount(DepthFastClearHarness::Draw(device, shaders, Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), {}), 0, "a new D32 depth surface under a live R8 storage image of its plane, after the CPU wrote 0.25 there, tested LESS at 0.5");
+    RequireCount(SeedsSince(seeds), 1, "a new D32 depth surface under a live R8 storage image of its plane, surfaces seeded from guest memory");
 }
 
 void PendingChainCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane) {
@@ -279,6 +454,11 @@ int main() {
         NewSurfaceCase(*device, shaders, block.Plane(1), VK_FORMAT_D16_UNORM, false, "a new D16 depth surface over a pending R16 unorm storage write");
         NewSurfaceCase(*device, shaders, block.Plane(2), VK_FORMAT_D32_SFLOAT, true, "a new D32 depth surface over a flushed R32F storage write");
         NewSurfaceCase(*device, shaders, block.Plane(7), VK_FORMAT_D32_SFLOAT, false, "a new D32 depth surface over a pending R32F storage write through a two-layer 2D array view", 2);
+        NewSurfaceCase(*device, shaders, block.Plane(27), VK_FORMAT_D32_SFLOAT, true, "a new mirrored D32 depth surface over a flushed R32F storage write", 1, ZSwizzle());
+        GuestPlanePatternCase(*device, shaders, block.Plane(23));
+        SeedRaceCase(*device, shaders, block.Plane(28));
+        IncompatibleStorageCase(*device, shaders, block.Plane(29));
+        PartialWatchCollectCase(*device, shaders, block.Plane(30));
 
         auto* cleared = block.Plane(3);
         const auto htile = Address(block.Plane(4));
