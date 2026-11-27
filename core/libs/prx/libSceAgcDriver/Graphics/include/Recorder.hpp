@@ -803,6 +803,8 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
+        std::unique_ptr<Batch> parked;
+        std::size_t parkedBytes = 0;
         std::unordered_set<const void*> keptOwners;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;

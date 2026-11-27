@@ -5464,7 +5464,7 @@ bool Recorder::Reap() {
 }
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
-    inFlightKeptBytes -= batch->keptBytes;
+    inFlightKeptBytes -= batch->keptBytes + batch->parkedBytes;
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;
@@ -5654,6 +5654,15 @@ void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
         publishPendingWrites();
     } catch (...) {
     }
+    if (inFlight.empty()) return;
+    auto& last = *inFlight.back();
+    const auto bytes = batch->keptBytes + batch->parkedBytes;
+    auto* tail = batch.get();
+    while (tail->parked != nullptr) tail = tail->parked.get();
+    tail->parked = std::move(last.parked);
+    last.parked = std::move(batch);
+    last.parkedBytes += bytes;
+    inFlightKeptBytes += bytes;
 }
 
 void Recorder::removeLabels(Batch& batch) {
