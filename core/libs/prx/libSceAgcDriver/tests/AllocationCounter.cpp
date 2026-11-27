@@ -7,6 +7,7 @@ namespace {
 
 thread_local bool countingAllocations = false;
 thread_local std::size_t countedAllocations = 0;
+thread_local bool failingAllocations = false;
 
 }
 
@@ -26,7 +27,12 @@ extern "C" void AllocateForCount_nid_no_patch(std::size_t bytes) {
     ::operator delete(allocation);
 }
 
+extern "C" void FailAllocations_nid_no_patch(bool failing) noexcept {
+    failingAllocations = failing;
+}
+
 extern "C" void* __wrap__Znwy(std::size_t bytes) {
+    if (failingAllocations) throw std::bad_alloc();
     if (countingAllocations) ++countedAllocations;
     return __real__Znwy(bytes);
 }
