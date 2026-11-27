@@ -7973,6 +7973,28 @@ void drawInputMirrorTests(const Device& device) {
     const auto remade = reuse(first);
     Require(remade != nullptr && remade != lostMirror && !remade->Mapped() && use(2 * held, held), "a mirror was not made again after its batch was discarded");
     Require(drawInputHolds(context, cache, remade, first, held), "a draw input mirror made after a discarded batch does not hold the bytes of its snapshot");
+    constexpr VkBufferUsageFlags mirrorUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const auto pooledMirrorHandle = [&] {
+        const auto probe = Buffer::WithinDeviceLocalHeadroom(context, held, mirrorUsage);
+        return probe != nullptr ? probe->Handle() : VK_NULL_HANDLE;
+    };
+    const auto keepSnapshot = [&](std::uint64_t at) { cache.KeepDrawSnapshot(at, held, CollectWrites(at, held), registry, snapshot(at), Use::Vertex); };
+    keepSnapshot(second);
+    const auto pooled = pooledMirrorHandle();
+    const auto pooledMirror = reuse(second);
+    Require(pooled != VK_NULL_HANDLE && pooledMirror != nullptr && pooledMirror->Handle() == pooled, "the mirror of a draw input was not made from the pooled buffer the probe released");
+    keepSnapshot(fourth);
+    const auto unwound = pooledMirrorHandle();
+    Recorder::FailNextDiscardRegistrationsForTest(1);
+    bool registrationRefused = false;
+    try {
+        reuse(fourth);
+    } catch (const std::bad_alloc&) {
+        registrationRefused = true;
+    }
+    Recorder::FailNextDiscardRegistrationsForTest(0);
+    Require(registrationRefused, "a mirror was made although registering its discard action failed");
+    Require(unwound != VK_NULL_HANDLE && pooledMirrorHandle() != unwound, "a mirror whose upload was recorded was released when registering its discard action failed");
     cache.Sync();
     auto tight = context;
     tight.memoryProperties2 = tightMemoryBudget;
