@@ -1,5 +1,7 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordingPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "Recompiler.hpp"
 #include "StencilReplay.hpp"
@@ -10,6 +12,7 @@
 #include <cstdio>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -117,6 +120,7 @@ ShaderRecompiler::ShaderPixelStageInfo PixelInfo(std::uint32_t shaderControl) {
 
 bool LastReplayStored = false;
 std::uint64_t LastDraws = 0;
+const AgcDriver::Graphics::DrawTraceContext* DrawTrace = nullptr;
 
 void Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::uint32_t shaderControl, const VkStencilOpState& stencil, std::uint32_t vertices = 3u, std::uint32_t instances = 1u, bool depthFail = false, const std::function<void(AgcDriver::Graphics::State&)>& alter = {}, const std::function<void(AgcDriver::Pm4::DrawParameters&)>& alterDraw = {}, std::span<const std::array<float, 4>> vertexData = Vertices, std::span<const std::uint32_t> vertexCode = VertexCode, std::span<const std::uint32_t> pixelData = {}, std::span<const ShaderRecompiler::MemoryRegion> pixelSrt = {}, const std::function<void(ShaderRecompiler::RecompileResult&)>& alterVertex = {}, std::uint32_t pixelPushBytes = 0u) {
     Pixels.fill(Kept);
@@ -195,8 +199,11 @@ void Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelC
     if (alterDraw) alterDraw(draw);
     const auto bindsBefore = GraphicsBinds.load();
     const auto drawsBefore = GraphicsDraws.load();
-    device.Draw(state, draw, shaders);
-    device.WaitIdle();
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        device.Draw(state, draw, shaders, {}, nullptr, DrawTrace);
+        device.WaitIdle();
+    }
     LastDraws = GraphicsDraws.load() - drawsBefore;
     if (!pixelResult.stencilReferences.empty()) Require(GraphicsBinds.load() - bindsBefore == 1u, "stencil replay rebound its shader pipeline within an original draw");
 }
@@ -214,11 +221,33 @@ void Check(const std::function<bool(std::uint32_t, std::uint32_t)>& drawn, std::
 }
 
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        const std::string_view mode = argc > 1 ? argv[1] : "";
+        const bool depthOnly = mode == "--pooled" || mode == "--traced";
+        std::unique_lock setup(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+        if (depthOnly) setup.lock();
         const auto device = OpenVulkanTestDevice();
+        if (setup.owns_lock()) setup.unlock();
         if (!device) return VulkanTestSkipped;
         const BindTrace binds(*device);
+        if (depthOnly) {
+            if (!AgcDriver::VulkanDeviceTestAccess::ContextOf(*device).graphicsPipelineLibrary) return VulkanTestSkipped;
+            const AgcDriver::Graphics::DrawTraceContext trace{1u};
+            if (mode == "--traced") DrawTrace = &trace;
+            const auto recorded = AgcDriver::Graphics::RecordingPool::RecordedBuffers();
+            Draw(*device, ColumnPixelCode, 0x52u, VkStencilOpState{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xffu, 0xffu, 0u}, 3u, 1u, false, [](AgcDriver::Graphics::State& state) {
+                state.hasColorTarget = false;
+                state.color = {};
+                state.colors.clear();
+                state.blends.clear();
+            });
+            const bool pooled = AgcDriver::Graphics::RecordingPool::RecordedBuffers() != recorded;
+            if (mode == "--pooled") Require(pooled, "a depth-only stencil replay was not recorded on the recording pool");
+            else Require(!pooled, "a depth-only draw traced to its batch was recorded on the recording pool");
+            std::printf("depth-only stencil replay %s passed\n", pooled ? "on the recording pool" : "inline");
+            return 0;
+        }
         constexpr std::uint32_t exported = 0x52u;
         constexpr std::uint32_t plain = 0x50u;
         constexpr std::array<std::uint32_t, 12> alternating{
