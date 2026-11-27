@@ -1698,13 +1698,13 @@ public:
         NoteHostWrite();
     }
 
-    void TakeStorage() {
-        if (target.samples != 1 || hostFormat != target.format) return;
+    bool TakeStorage() {
+        if (target.samples != 1 || hostFormat != target.format) return false;
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto bytes = DepthSliceBytes(target.extent, d16 ? 2u : 4u);
         auto storage = StorageTexture::FindPending(target.address, bytes);
         if (storage == nullptr) storage = StorageTexture::FindLive(target.address, bytes);
-        if (storage == nullptr || !storageFits(target, storage->Descriptor())) return;
+        if (storage == nullptr || !storageFits(target, storage->Descriptor())) return false;
         storage->Refresh();
         const bool direct = DirectDepthCopy(context, hostFormat, VK_IMAGE_ASPECT_DEPTH_BIT, storage->ImageFormat());
         if (!direct && depthPlane.staging == nullptr) depthPlane.staging = std::make_unique<DeviceBuffer>(context, static_cast<std::size_t>(target.extent.width) * target.extent.height * (d16 ? 2u : 4u), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -1745,7 +1745,7 @@ public:
             directDepthCopies.fetch_add(1, std::memory_order_relaxed);
             if (batch) batch->SubmitAndWait();
             else Recorder::CountBarriers(Recorder::CommandClass::Copy, discarding ? 3 : 2);
-            return;
+            return true;
         }
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, storage->Image(), VK_IMAGE_LAYOUT_GENERAL, depthPlane.staging->Handle(), 1, &colorRegion);
@@ -1774,6 +1774,7 @@ public:
         }
         if (batch) batch->SubmitAndWait();
         else Recorder::CountBarriers(Recorder::CommandClass::Copy, target.stencilAddress == 0 ? 4 : 3);
+        return true;
     }
 
     std::shared_ptr<StorageTexture> Mirror(const GuestTextureResource& resource) {
@@ -1942,9 +1943,17 @@ public:
         return changed;
     }
 
-    void SyncFromMemory(const GuestTextureResource& resource, bool storing = false) {
+    bool PlaneHoldsData(const GuestTextureResource& resource) {
+        const auto bytes = static_cast<std::size_t>(MirrorBytes());
+        if (!GuestMemory::DescribeCommitted(resource.baseAddress, bytes).whole) return false;
+        const auto* words = reinterpret_cast<const std::uint32_t*>(resource.baseAddress);
+        return std::any_of(words, words + bytes / sizeof(std::uint32_t), [](std::uint32_t word) { return word != 0u; });
+    }
+
+    void SyncFromMemory(const GuestTextureResource& resource, bool storing = false, bool seeding = false) {
         std::uint64_t generation = 0;
-        const auto changed = WrittenUnits(resource, generation);
+        auto changed = WrittenUnits(resource, generation);
+        if (seeding) changed.assign(unitGeneration.size(), true);
         // The registry generation moves on every mapping mutation, so an unchanged value means every recorded backing is still current. Read it before the lookups: a mutation racing them leaves the stored value old and the next sync refreshes again.
         if (const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix(); registryGeneration != backingGeneration) {
             for (std::size_t unit = 0; unit < unitBacking.size(); ++unit) unitBacking[unit] = RegisteredBacking(target.address + unit * unitBytes);
@@ -4304,13 +4313,14 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     const bool stencilRebound = stencilOwner == stencilOwners().end() || stencilOwner->second.surface != surface;
     takePlanes(*surface, created, htileCleared | (cleared ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u));
     if (cleared || htileCleared != 0u) surface->expanded = false;
-    if (created && !inherits && target.htileAddress == 0) surface->TakeStorage();
+    const bool unprepared = created && !inherits && target.htileAddress == 0;
+    const bool inheritedStorage = unprepared && surface->TakeStorage();
     if (cleared && (!created || inherits)) {
         if (target.samples != 1u && (!created || !surface->samplingActive)) surface->sampling.Refuse("native multisample depth fast-clear transition is not implemented");
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
-    if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
+    if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target), false, unprepared && !inheritedStorage && !cleared && htileCleared == 0u && surface->PlaneHoldsData(mirrorResource(target)));
     if (surface->StencilMirrorable()) surface->SyncStencilFromMemory(stencilResource(target));
     surface->TakeStencilStorage();
     surface->ApplyFastClear();
