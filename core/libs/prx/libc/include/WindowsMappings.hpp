@@ -14,6 +14,7 @@
 #include <mutex>
 #include <map>
 #include <memory>
+#include <set>
 #include <unordered_map>
 #include <vector>
 #include <stdexcept>
@@ -649,13 +650,15 @@ public:
         std::lock_guard lock(mutex);
         const auto capacity = *count;
         if (!collect(address, bytes, pages, count, clear, collection, skipRefused)) return false;
-        addHostWrites(address, address + bytes, pages, count, capacity);
+        addHostWrites(address, address + bytes, pages, count, capacity, clear);
         return true;
     }
 
 private:
-    void addHostWrites(std::uintptr_t address, std::uintptr_t end, void** pages, std::size_t* count, std::size_t capacity) const {
-        if (ownedHostStores.empty() || !overlapsOwnedRange(ownedHostStores, address, end)) return;
+    void addHostWrites(std::uintptr_t address, std::uintptr_t end, void** pages, std::size_t* count, std::size_t capacity, bool clear) {
+        const auto heldFirst = unreturnedWrites.lower_bound(address);
+        const auto heldEnd = unreturnedWrites.lower_bound(end);
+        if (heldFirst == heldEnd && (ownedHostStores.empty() || !overlapsOwnedRange(ownedHostStores, address, end))) return;
         std::vector<std::uintptr_t> merged;
         merged.reserve(*count);
         for (std::size_t index = 0; index < *count; ++index) merged.push_back(reinterpret_cast<std::uintptr_t>(pages[index]));
@@ -665,11 +668,15 @@ private:
             const auto to = std::min(last, end);
             for (auto page = from; page < to; page += 4096) merged.push_back(std::max(page, address));
         }
+        merged.insert(merged.end(), heldFirst, heldEnd);
         if (merged.size() == collected) return;
         std::sort(merged.begin(), merged.end());
         merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
         *count = std::min(merged.size(), capacity);
         for (std::size_t index = 0; index < *count; ++index) pages[index] = reinterpret_cast<void*>(merged[index]);
+        if (!clear) return;
+        unreturnedWrites.erase(heldFirst, heldEnd);
+        unreturnedWrites.insert(merged.begin() + static_cast<std::ptrdiff_t>(*count), merged.end());
     }
 
     bool collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection, bool skipRefused) {
@@ -1716,6 +1723,7 @@ private:
         disown(address, address + bytes);
         forgetOwnedPending(address, address + bytes);
         forgetZero(address, address + bytes);
+        unreturnedWrites.erase(unreturnedWrites.lower_bound(address), unreturnedWrites.lower_bound(address + bytes));
         collectableRanges.clear();
         const auto end = address + bytes;
         privateAllocations.erase(privateAllocations.lower_bound(address), privateAllocations.lower_bound(end));
@@ -1817,6 +1825,7 @@ private:
     OwnedRanges ownedPins;
     OwnedRanges ownedHostAccess;
     OwnedRanges ownedHostStores;
+    std::set<std::uintptr_t> unreturnedWrites;
     std::uint64_t nextOwned = 1;
     Ranges cleanRanges;
     Ranges collectableRanges;

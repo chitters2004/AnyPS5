@@ -173,6 +173,44 @@ void CheckPrivate() {
     VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+std::set<std::size_t> CollectPrivatePages(std::uintptr_t address, std::size_t capacity, bool skipRefused = false) {
+    std::set<std::size_t> result;
+    for (auto cursor = address; cursor < address + Bytes;) {
+        std::array<void*, 32> pages{};
+        auto count = capacity;
+        Require(Mappings::Get().Collect(cursor, address + Bytes - cursor, pages.data(), &count, true, Collection::All, skipRefused), "private collection failed");
+        for (std::size_t i = 0; i < count; ++i) result.insert((reinterpret_cast<std::uintptr_t>(pages[i]) - address) / Small);
+        if (count < capacity) break;
+        cursor = reinterpret_cast<std::uintptr_t>(pages[count - 1]) + Small;
+    }
+    return result;
+}
+
+void CheckHostStoresKeepCollectedPages() {
+    auto& mappings = Mappings::Get();
+    auto* memory = static_cast<unsigned char*>(mappings.Reserve(nullptr, Bytes));
+    Require(memory != nullptr, "private reservation failed");
+    mappings.Commit(memory, Bytes, PAGE_READWRITE, Bytes, true);
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    const auto write = [&] {
+        for (std::size_t page = 2; page < 10; ++page) static_cast<volatile unsigned char*>(memory)[page * Small] = static_cast<unsigned char>(page);
+    };
+    CollectPrivatePages(address, 32);
+    write();
+    Require(CollectPrivatePages(address, 4) == Pages(2, 10), "a small page buffer lost private writes");
+    Require(mappings.BeginHostWrite(address, 2 * Small), "host write refused");
+    Require(CollectPrivatePages(address, 32) == Pages(0, 2), "open host store pages were not reported");
+    write();
+    Require(CollectPrivatePages(address, 4) == Pages(0, 10), "open host store pages pushed collected writes out of a small page buffer");
+    write();
+    Require(CollectPrivatePages(address, 4, true) == Pages(0, 10), "open host store pages pushed writes out of a small buffer in a collect that skips refused pieces");
+    Require(CollectPrivatePages(address, 4) == Pages(0, 2), "collected writes were reported twice");
+    mappings.EndHostWrite(address, 2 * Small);
+    Require(CollectPrivatePages(address, 4).empty(), "a closed host store stayed written");
+    mappings.Reset(memory, Bytes);
+    VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 MEMORY_BASIC_INFORMATION RegionAt(const void* address) {
     MEMORY_BASIC_INFORMATION info{};
     Require(VirtualQuery(address, &info, sizeof(info)) == sizeof(info), "private commit query failed");
@@ -1151,6 +1189,7 @@ int main(int argc, char** argv) {
         CheckPinsAndHostWrites();
         CheckFailureAndHoles();
         CheckPrivate();
+        CheckHostStoresKeepCollectedPages();
         CheckConcurrentWrites();
         CheckSplitRunReportsRacingStores();
         CheckForgottenSectionKeepsNoPages();
