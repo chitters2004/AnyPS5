@@ -307,6 +307,13 @@ struct WaitProbe {
 PFN_vkGetDeviceProcAddr originalProc = nullptr;
 PFN_vkWaitSemaphoresKHR originalWaitSemaphores = nullptr;
 std::atomic<WaitProbe*> probe{nullptr};
+PFN_vkWaitForFences originalWaitForFences = nullptr;
+PFN_vkDeviceWaitIdle originalDeviceWaitIdle = nullptr;
+std::atomic<bool> failWaits{false};
+std::atomic<bool> missingWait{false};
+std::atomic<unsigned> failedWaits{0};
+std::atomic<unsigned> failedIdles{0};
+std::atomic<unsigned> missingLookups{0};
 
 VKAPI_ATTR VkResult VKAPI_CALL WaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* info, std::uint64_t timeout) {
     if (auto* watched = probe.load(); watched != nullptr && std::this_thread::get_id() == watched->audited) {
@@ -319,7 +326,29 @@ VKAPI_ATTR VkResult VKAPI_CALL WaitSemaphores(VkDevice device, const VkSemaphore
     return originalWaitSemaphores(device, info, timeout);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL WaitForFences(VkDevice device, std::uint32_t count, const VkFence* fences, VkBool32 waitAll, std::uint64_t timeout) {
+    if (failWaits.load()) {
+        failedWaits.fetch_add(1);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    return originalWaitForFences(device, count, fences, waitAll, timeout);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL DeviceWaitIdle(VkDevice device) {
+    if (failWaits.load()) {
+        failedIdles.fetch_add(1);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    return originalDeviceWaitIdle(device);
+}
+
 PFN_vkVoidFunction VKAPI_CALL Resolve(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkWaitSemaphoresKHR") == 0 && missingWait.load()) {
+        missingLookups.fetch_add(1);
+        return nullptr;
+    }
+    if (std::strcmp(name, "vkWaitForFences") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&WaitForFences);
+    if (std::strcmp(name, "vkDeviceWaitIdle") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&DeviceWaitIdle);
     if (std::strcmp(name, "vkWaitSemaphoresKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&WaitSemaphores);
     return originalProc(device, name);
 }
@@ -327,6 +356,8 @@ PFN_vkVoidFunction VKAPI_CALL Resolve(VkDevice device, const char* name) {
 Graphics::Context Probed(const Graphics::Context& context) {
     originalProc = context.deviceProc;
     originalWaitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+    originalWaitForFences = context.Function<PFN_vkWaitForFences>("vkWaitForFences");
+    originalDeviceWaitIdle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle");
     auto probed = context;
     probed.functions = nullptr;
     probed.deviceProc = &Resolve;
@@ -538,6 +569,54 @@ void LongParkedChain(std::size_t length) {
     std::printf("a parked chain of %zu batches was destroyed\n", length);
 }
 
+void FailedWait(const Graphics::Context& context, const Graphics::Context& probed, bool later, bool missing) {
+    const std::string what = std::string(missing ? "a sync whose wait function is missing" : "a sync whose wait and device idle fail") + (later ? ", with a later batch in flight" : ", with no later batch in flight");
+    Hold hold(context);
+    std::weak_ptr<int> first;
+    bool completionRan = false;
+    {
+        Graphics::Recorder recorder(probed, missing);
+        ReleaseOnExit release{hold};
+        recorder.Activate();
+        first = KeepSentinel(recorder, 4096);
+        recorder.OnComplete([&] { completionRan = true; });
+        recorder.NotePendingWrite(HeldWrite, 256);
+        recorder.HoldNextSubmit(hold.semaphore, 1);
+        recorder.Submit();
+        if (later) {
+            KeepSentinel(recorder);
+            recorder.Submit();
+        }
+        failedWaits = 0;
+        failedIdles = 0;
+        missingLookups = 0;
+        (missing ? missingWait : failWaits).store(true);
+        bool threw = false;
+        try {
+            recorder.Sync();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        missingWait.store(false);
+        failWaits.store(false);
+        if (!threw) Fail(what + ": the sync did not report the failure");
+        if (missing ? missingLookups.load() != 1 : failedWaits.load() != 1 || failedIdles.load() != 1) Fail(what + ": the failure was not reached (" + std::to_string(missingLookups.load()) + " lookups, " + std::to_string(failedWaits.load()) + " waits, " + std::to_string(failedIdles.load()) + " idles failed)");
+        if (first.expired()) Fail(what + ": the batch's objects were destroyed while it was still held on the GPU");
+        hold.Release();
+        static_cast<void>(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device));
+        if (first.expired()) Fail(what + ": the batch's objects were destroyed before a later batch proved it complete");
+        if (!later) {
+            KeepSentinel(recorder);
+            recorder.Submit();
+        }
+        Drain(recorder, what);
+        if (recorder.InFlightKeptBytes() != 0) Fail(what + ": " + std::to_string(recorder.InFlightKeptBytes()) + " bytes stayed in flight");
+    }
+    if (!first.expired()) Fail(what + ": the batch's objects outlived the batch that carried them");
+    if (completionRan) Fail(what + ": the completion of a batch no wait proved complete ran");
+    std::printf("%s: kept until a later batch completed\n", what.c_str());
+}
+
 }
 
 int main() {
@@ -555,6 +634,9 @@ int main() {
         Timed("retired into a discarded batch", [&] { RetiredIntoDiscardedBatch(context); });
         Timed("held parked chain", [&] { HeldParkedChain(context, 64); });
         Timed("long parked chain", [&] { LongParkedChain(200000); });
+        Timed("failed wait, later batch", [&] { FailedWait(context, probed, true, false); });
+        Timed("failed wait, no later batch", [&] { FailedWait(context, probed, false, false); });
+        Timed("missing wait function", [&] { FailedWait(context, probed, true, true); });
         for (const auto& failure : failures) std::cerr << failure << '\n';
         return failures.empty() ? 0 : 1;
     } catch (const std::exception& error) {
