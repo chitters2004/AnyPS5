@@ -576,6 +576,7 @@ public:
     // when an access overlaps one of that thread's queued labels; it records them. Set once.
     static void SetQueuedLabelRecorder(void (*recorder)());
     static void FailNextSubmitsForTest(unsigned count);
+    static void DestroyParkedChainForTest(std::size_t length);
     static void FailNextDiscardRegistrationsForTest(unsigned count);
     // Whether the lock-free pending-write snapshot (open, in-flight and finishing batches) overlaps
     // the range: false means no recorded work writes it, so a wait on it has nothing to submit.
@@ -797,6 +798,12 @@ private:
     };
     static_assert(std::is_nothrow_move_constructible_v<SampleSegment> && std::is_nothrow_move_assignable_v<SampleSegment>);
     struct Batch {
+        ~Batch() {
+            while (parked != nullptr) {
+                auto current = std::move(parked);
+                parked = std::move(current->parked);
+            }
+        }
         std::uint64_t sampleBatch = 0;
         std::vector<SampleSegment> foldedSamples;
         VkCommandBuffer commands = VK_NULL_HANDLE;
@@ -804,6 +811,8 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
+        std::unique_ptr<Batch> parked;
+        std::size_t parkedBytes = 0;
         std::unordered_set<const void*> keptOwners;
         Batch* nextFinishing = nullptr;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
@@ -1065,6 +1074,7 @@ private:
     // `source` is the CountSync source the wait is attributed to.
     void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
     void discard(std::unique_ptr<Batch> batch) noexcept;
+    void park(std::unique_ptr<Batch> batch) noexcept;
     void removeLabels(Batch& batch);
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);

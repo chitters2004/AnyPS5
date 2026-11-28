@@ -466,6 +466,78 @@ void ReserveKeptLimits(const Graphics::Context& context) {
     std::printf("ReserveKept: refused an overflowing reservation; reserved keeps made no allocation\n");
 }
 
+void RetiredIntoDiscardedBatch(const Graphics::Context& context) {
+    Hold hold(context);
+    std::weak_ptr<Graphics::Buffer> retired;
+    bool discardedCompletionRan = false;
+    {
+        Graphics::Recorder recorder(context, true);
+        ReleaseOnExit release{hold};
+        recorder.Activate();
+        auto surface = std::make_shared<Graphics::Buffer>(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        retired = surface;
+        RecordMarker(context, recorder, *surface);
+        recorder.HoldNextSubmit(hold.semaphore, 1);
+        recorder.Submit();
+        recorder.ReserveKept(1);
+        recorder.Keep(std::move(surface), 4096);
+        recorder.OnComplete([&] { discardedCompletionRan = true; });
+        Graphics::Recorder::FailNextSubmitsForTest(1);
+        bool threw = false;
+        try {
+            recorder.Submit();
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        if (!threw) Fail("a retired object: the injected submit failure did not happen");
+        if (retired.expired()) Fail("a retired object: a discarded batch destroyed it while a batch held on the GPU still used it");
+        if (recorder.InFlightKeptBytes() != 4096) Fail("a retired object: the bytes of the parked batch are not counted in flight (" + std::to_string(recorder.InFlightKeptBytes()) + ")");
+        hold.Release();
+        recorder.Sync();
+        if (retired.expired()) Fail("a retired object: the finish destroyed the parked batch under the mutex instead of deferring it");
+        if (recorder.InFlightKeptBytes() != 0) Fail("a retired object: the finish left " + std::to_string(recorder.InFlightKeptBytes()) + " bytes in flight");
+        recorder.FlushDeferredReleases();
+    }
+    if (!retired.expired()) Fail("a retired object: it outlived its recorder");
+    if (discardedCompletionRan) Fail("a retired object: the completion of the discarded batch ran");
+    std::printf("a retired object: kept by the held batch through the discard of its batch, released after its finish\n");
+}
+
+void HeldParkedChain(const Graphics::Context& context, std::size_t length) {
+    Hold hold(context);
+    std::vector<std::weak_ptr<int>> parked;
+    {
+        Graphics::Recorder recorder(context, true);
+        ReleaseOnExit release{hold};
+        recorder.OpenBatch();
+        recorder.HoldNextSubmit(hold.semaphore, 1);
+        recorder.Submit();
+        parked.reserve(length);
+        Graphics::Recorder::FailNextSubmitsForTest(static_cast<unsigned>(length));
+        for (std::size_t index = 0; index < length; ++index) {
+            parked.push_back(KeepSentinel(recorder));
+            try {
+                recorder.Submit();
+                Fail("a parked chain: an injected submit failure did not happen");
+            } catch (const std::runtime_error&) {
+            }
+        }
+        Graphics::Recorder::FailNextSubmitsForTest(0);
+        const auto lost = std::count_if(parked.begin(), parked.end(), [](const auto& object) { return object.expired(); });
+        if (lost != 0) Fail("a parked chain: " + std::to_string(lost) + " objects of discarded batches were destroyed while the held batch ran");
+        hold.Release();
+        Drain(recorder, "a parked chain");
+    }
+    const auto kept = std::count_if(parked.begin(), parked.end(), [](const auto& object) { return !object.expired(); });
+    if (kept != 0) Fail("a parked chain: " + std::to_string(kept) + " objects of discarded batches outlived their recorder");
+    std::printf("a parked chain: %zu discarded batches parked behind a held batch\n", length);
+}
+
+void LongParkedChain(std::size_t length) {
+    Graphics::Recorder::DestroyParkedChainForTest(length);
+    std::printf("a parked chain of %zu batches was destroyed\n", length);
+}
+
 }
 
 int main() {
@@ -480,6 +552,9 @@ int main() {
         Timed("sync sweep", [&] { SyncSweep(probed); });
         Timed("nested finish", [&] { NestedFinish(context); });
         Timed("reserve kept", [&] { ReserveKeptLimits(context); });
+        Timed("retired into a discarded batch", [&] { RetiredIntoDiscardedBatch(context); });
+        Timed("held parked chain", [&] { HeldParkedChain(context, 64); });
+        Timed("long parked chain", [&] { LongParkedChain(200000); });
         for (const auto& failure : failures) std::cerr << failure << '\n';
         return failures.empty() ? 0 : 1;
     } catch (const std::exception& error) {
