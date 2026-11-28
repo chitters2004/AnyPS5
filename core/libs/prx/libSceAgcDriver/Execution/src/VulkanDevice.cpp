@@ -1244,6 +1244,8 @@ struct VulkanDevice::State {
                     recorder->Sync();
                 } catch (const std::exception& error) {
                     std::fprintf(stderr, "[gpu] unit shadow teardown: %s\n", error.what());
+                } catch (...) {
+                    std::fprintf(stderr, "[gpu] unit shadow teardown: a non-standard exception\n");
                 }
             }
             Graphics::DestroyShadows(device);
@@ -2970,6 +2972,10 @@ void VulkanDevice::startJournalReplay() {
 }
 
 VulkanDevice::~VulkanDevice() = default;
+
+void VulkanDevice::ReportFailure(std::exception_ptr error) noexcept {
+    if (state->recorder) state->recorder->ReportFailure(std::move(error));
+}
 
 VkPipelineCreateFlags VulkanDevice::computePipelineFlags() const {
     return (graphicsContext().pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
