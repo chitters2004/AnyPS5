@@ -1244,6 +1244,8 @@ struct VulkanDevice::State {
                     recorder->Sync();
                 } catch (const std::exception& error) {
                     std::fprintf(stderr, "[gpu] unit shadow teardown: %s\n", error.what());
+                } catch (...) {
+                    std::fprintf(stderr, "[gpu] unit shadow teardown: a non-standard exception\n");
                 }
             }
             Graphics::DestroyShadows(device);
@@ -2971,6 +2973,10 @@ void VulkanDevice::startJournalReplay() {
 
 VulkanDevice::~VulkanDevice() = default;
 
+void VulkanDevice::ReportFailure(std::exception_ptr error) noexcept {
+    if (state->recorder) state->recorder->ReportFailure(std::move(error));
+}
+
 VkPipelineCreateFlags VulkanDevice::computePipelineFlags() const {
     return (graphicsContext().pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
 }
@@ -3562,6 +3568,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
                 copyBuffer(chain, patternBuffer->Handle(), patternBuffer->Handle(), 1, &copy);
             }
             Graphics::RecordMemoryBarrier(context, chain, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            recorder.OnDiscard([cache = state.get(), made = patternBuffer.get()] { std::erase_if(cache->patternBuffers, [made](const auto& entry) { return entry.second.get() == made; }); });
             if (buffers.size() >= PatternBuffersKept) buffers.erase(buffers.begin());
             buffers.emplace_back(patternWords, patternBuffer);
             ++patternBuffersMade;
@@ -3630,6 +3637,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     const auto generation = GuestMemory::MarkWritten(address, bytes);
     if (elideRepeats && generation != 0) {
         constexpr std::size_t RepeatedFillsKept = 256;
+        recorder.OnDiscard([cache = state.get(), address] { cache->repeatedFills.erase(address); });
         if (state->repeatedFills.size() >= RepeatedFillsKept && !state->repeatedFills.contains(address)) state->repeatedFills.clear();
         state->repeatedFills[address] = {bytes, patternWords, generation, importSerial, unwatchSerial};
     }

@@ -9,8 +9,16 @@ std::shared_ptr<VulkanDevice> DevicePointer::Load() const { return pointer.load(
 DevicePointer::operator std::shared_ptr<VulkanDevice>() const { return Load(); }
 
 DevicePointer& DevicePointer::operator=(std::shared_ptr<VulkanDevice> value) {
+    std::lock_guard lock(installMutex);
+    if (value != nullptr && failure != nullptr) value->ReportFailure(failure);
     pointer.store(std::move(value), std::memory_order_release);
     return *this;
+}
+
+void DevicePointer::ReportFailure(std::exception_ptr error) noexcept {
+    std::lock_guard lock(installMutex);
+    if (failure == nullptr) failure = error;
+    if (const auto device = Load()) device->ReportFailure(std::move(error));
 }
 
 void DevicePointer::Reset() { *this = nullptr; }

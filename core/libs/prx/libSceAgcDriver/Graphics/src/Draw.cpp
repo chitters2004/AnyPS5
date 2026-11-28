@@ -5183,6 +5183,14 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     APS5_LOG_CHARS_OUT_DEBUG("Draw finished");
 }
 
+std::uint64_t batchChangesBefore(const Context& context) {
+    return context.recorder != nullptr ? context.recorder->BatchChanges() : 0;
+}
+
+void discardOpenBatchIfChanged(const Context& context, std::uint64_t changes) noexcept {
+    if (context.recorder != nullptr && context.recorder->BatchChanges() != changes) context.recorder->DiscardOpen();
+}
+
 }
 
 constexpr std::uint64_t MaxCapturedTriangles = 1ull << 20u;
@@ -5238,7 +5246,7 @@ std::vector<std::uint32_t> DrawResourceContentKey(const Context& context, const 
     return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
 }
 
-DrawResult Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey) {
+static DrawResult drawIntoOpenBatch(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (draw.indirect && draw.indirect->capturedRecords) {
         const auto& args = *draw.indirect;
@@ -5370,7 +5378,17 @@ DrawResult Draw(const Context& context, const State& state, const Pm4::DrawParam
     return prepared.inputs.result;
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
+DrawResult Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey) {
+    const auto changes = batchChangesBefore(context);
+    try {
+        return drawIntoOpenBatch(context, state, draw, shaders, snapshots, recipeOut, trace, shape, contentKey);
+    } catch (...) {
+        discardOpenBatchIfChanged(context, changes);
+        throw;
+    }
+}
+
+static DrawRecipeOutcome drawRecipeIntoOpenBatch(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
@@ -5524,6 +5542,16 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, " recorded from recipe");
     result.recorded = true;
     return result;
+}
+
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
+    const auto changes = batchChangesBefore(context);
+    try {
+        return drawRecipeIntoOpenBatch(context, state, draw, shaders, snapshots, recipe, trace);
+    } catch (...) {
+        discardOpenBatchIfChanged(context, changes);
+        throw;
+    }
 }
 
 namespace {
