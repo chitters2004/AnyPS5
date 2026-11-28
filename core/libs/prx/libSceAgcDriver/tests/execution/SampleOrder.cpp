@@ -25,6 +25,9 @@
 #include "SampleOrderTestReadStencil_spv.h"
 #include "SampleOrderTestRG32_spv.h"
 #include "SampleOrderTestRGBA32_spv.h"
+#ifdef APS5_AGC_ALLOCATION_COUNT
+#include "prx/libSceAgcDriver/tests/AllocationCounter.hpp"
+#endif
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -726,6 +729,7 @@ struct Pass {
     bool storesInvocations = false;
     std::function<void()> beforeReplay;
     bool buildsNoRecipe = false;
+    std::function<void()> beforeDraw;
 };
 
 void Draw(AgcDriver::VulkanDevice& device, const Context& context, const Pass& pass) {
@@ -814,6 +818,7 @@ void Draw(AgcDriver::VulkanDevice& device, const Context& context, const Pass& p
     shaders.push_back({ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)});
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(pass.vertices->size()), 0, 1, 0, false};
     if (!pass.beforeReplay && !pass.buildsNoRecipe) {
+        if (pass.beforeDraw) pass.beforeDraw();
         AgcDriver::Graphics::Draw(context, state, draw, shaders);
         return;
     }
@@ -1435,6 +1440,125 @@ int RecipeDepthLocations(AgcDriver::VulkanDevice& device) {
     return 0;
 }
 
+#ifdef APS5_AGC_ALLOCATION_COUNT
+enum class InjectedFailure { Unreached, Thrown, Absorbed };
+
+InjectedFailure DrawFailingAt(AgcDriver::VulkanDevice& device, const Context& context, Pass pass, std::size_t allocation, bool replay) {
+    const auto arm = [allocation] { FailAllocationsAfter_nid_no_patch(allocation); };
+    if (replay) pass.beforeReplay = arm;
+    else pass.beforeDraw = arm;
+    try {
+        Draw(device, context, pass);
+    } catch (const std::bad_alloc&) {
+        StopAllocationFailures_nid_no_patch();
+        return InjectedFailure::Thrown;
+    } catch (...) {
+        const bool fired = !AllocationFailurePending_nid_no_patch();
+        StopAllocationFailures_nid_no_patch();
+        if (!fired) throw;
+        return InjectedFailure::Absorbed;
+    }
+    const bool fired = !AllocationFailurePending_nid_no_patch();
+    StopAllocationFailures_nid_no_patch();
+    return fired ? InjectedFailure::Absorbed : InjectedFailure::Unreached;
+}
+
+std::size_t FailEachAllocation(AgcDriver::VulkanDevice& device, const Context& context, const Pass& pass, bool replay, const std::string& what) {
+    auto& recorder = *AgcDriver::Graphics::Recorder::Active();
+    Draw(device, context, pass);
+    Settle(device);
+    std::size_t thrown = 0;
+    for (std::size_t allocation = 0;; ++allocation) {
+        Require(allocation < (std::size_t{1} << 16), what + ": the draw never ran out of allocations to fail");
+        const auto failure = DrawFailingAt(device, context, pass, allocation, replay);
+        if (failure == InjectedFailure::Unreached) break;
+        if (failure == InjectedFailure::Thrown) {
+            ++thrown;
+            const auto submitted = recorder.Submissions();
+            {
+                std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+                try {
+                    recorder.Sync();
+                } catch (const std::bad_alloc&) {
+                }
+            }
+            Require(recorder.Submissions() == submitted, what + ": the batch a draw was recording into when its allocation " + std::to_string(allocation) + " failed was submitted");
+        }
+        Settle(device);
+    }
+    Require(thrown != 0, what + ": no failed allocation reached the caller");
+    std::printf("%s: %zu failed allocations threw out of the draw, and none of their batches was submitted\n", what.c_str(), thrown);
+    return thrown;
+}
+
+int FailedDraws(AgcDriver::VulkanDevice& device) {
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    std::optional<std::uint32_t> samples;
+    for (const std::uint32_t count : {4u, 2u, 8u}) {
+        if ((context.limits.framebufferDepthSampleCounts & count) != 0u && (context.limits.framebufferNoAttachmentsSampleCounts & count) != 0u) {
+            samples = count;
+            break;
+        }
+    }
+    if (!samples) {
+        std::printf("skipped, the device has no multisampled depth targets\n");
+        return VulkanTestSkipped;
+    }
+    const auto order = OrderFor(*samples);
+    Require(AgcDriver::Graphics::ReordersSamples(order), "the test's sample order keeps the host's order");
+    const auto back = Screen(0.25f), middle = Screen(0.5f);
+    AgcDriver::Graphics::DepthTarget depth{reinterpret_cast<std::uintptr_t>(DepthMemory.data()) + 256u * 1024u * 8u, 0u, {RemapWidth, RemapHeight}, VK_FORMAT_D32_SFLOAT, 0.0f, 0};
+    depth.samples = *samples;
+    Pass reset;
+    reset.vertices = &back;
+    reset.code = NullExportCode;
+    reset.samples = *samples;
+    reset.depth = depth;
+    reset.depthWrite = true;
+    Draw(device, context, reset);
+    Pass reordered = reset;
+    reordered.vertices = &middle;
+    reordered.code = MaskCode(0u, 1u);
+    reordered.shaderControl = 0x100u;
+    reordered.order = order;
+    FailEachAllocation(device, context, reordered, false, std::to_string(*samples) + "x depth draw in the guest's sample order");
+    if (std::getenv("APS5_DRAW_TRANSITIONS") != nullptr) {
+        std::printf("a draw replayed from its recipe is not failed: draws recorded with APS5_DRAW_TRANSITIONS build no recipe\n");
+        return 0;
+    }
+    constexpr std::uint32_t locatedSamples = 2u;
+    if ((context.sampleLocationSampleCounts & locatedSamples) == 0u || !AgcDriver::Graphics::SampleLocationsCompatibleDepth(context, VK_FORMAT_D32_SFLOAT, locatedSamples) || !DepthSampleable(context, VK_FORMAT_D32_SFLOAT, locatedSamples) || !AgcDriver::Graphics::DrawRecipes()) {
+        std::printf("a draw replayed from its recipe is not failed: the device has no sampleable 2x depth at custom sample locations, or draw recipes are off\n");
+        return 0;
+    }
+    AgcDriver::Graphics::DepthTarget located{reinterpret_cast<std::uintptr_t>(DepthMemory.data()) + 256u * 1024u * 9u, 0u, ReferenceExtent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    located.samples = locatedSamples;
+    const Vertices clear = Screen(ClearDepth);
+    Pass clearPass;
+    clearPass.vertices = &clear;
+    clearPass.code = NullExportCode;
+    clearPass.samples = locatedSamples;
+    clearPass.extent = ReferenceExtent;
+    clearPass.depth = located;
+    clearPass.depthWrite = true;
+    clearPass.locations = UniformLocations(VillageLocations, 0u);
+    auto slopes = clearPass;
+    slopes.vertices = &Slopes;
+    auto& vertexBlock = NewBlock(Slopes.size() * sizeof(Slopes[0]));
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(vertexBlock.Address())), Slopes.data(), Slopes.size() * sizeof(Slopes[0]));
+    slopes.vertexMemory = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(vertexBlock.Address()));
+    slopes.beforeReplay = [] {};
+    Draw(device, context, clearPass);
+    FailEachAllocation(device, context, slopes, true, "2x depth draw at custom sample locations replayed from its recipe");
+    return 0;
+}
+#else
+int FailedDraws(AgcDriver::VulkanDevice&) {
+    std::printf("skipped, this build cannot fail allocations inside the driver\n");
+    return VulkanTestSkipped;
+}
+#endif
+
 int Bench(AgcDriver::VulkanDevice& device, VkExtent2D extent, std::uint32_t samples, std::uint32_t frames) {
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     if ((context.limits.framebufferColorSampleCounts & samples) == 0u || (context.limits.framebufferDepthSampleCounts & samples) == 0u) {
@@ -1524,6 +1648,7 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         if (mode == "--grid-reference") return GridReference(*device);
         if (mode == "--recipe-depth-locations") return RecipeDepthLocations(*device);
+        if (mode == "--failed-draw") return FailedDraws(*device);
         if (mode == "--bench") {
             VkExtent2D extent{1920u, 2160u};
             if (argc > 2) Require(std::sscanf(argv[2], "%ux%u", &extent.width, &extent.height) == 2, "--bench takes WIDTHxHEIGHT");
