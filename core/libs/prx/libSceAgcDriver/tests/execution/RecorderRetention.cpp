@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -16,6 +17,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -30,6 +32,8 @@ void Fail(std::string failure) {
 }
 
 constexpr std::uint64_t HeldWrite = 0x7f0000000000ull;
+constexpr std::uint64_t OuterWrite = 0x7f0000010000ull;
+constexpr std::uint64_t InnerWrite = 0x7f0000020000ull;
 
 struct Hold {
     explicit Hold(const Graphics::Context& context) : context(context) {
@@ -110,6 +114,7 @@ struct Outcome {
     bool executed = false;
     bool lostWhileHeld = false;
     bool failed = false;
+    bool waited = false;
 };
 
 void ArmAllocationFailure(std::size_t allocations) {
@@ -290,6 +295,151 @@ void InFlightGrowth(const Graphics::Context& context) {
 #endif
 }
 
+struct WaitProbe {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::thread::id audited;
+    bool waiting = false;
+    bool returned = false;
+};
+
+PFN_vkGetDeviceProcAddr originalProc = nullptr;
+PFN_vkWaitSemaphoresKHR originalWaitSemaphores = nullptr;
+std::atomic<WaitProbe*> probe{nullptr};
+
+VKAPI_ATTR VkResult VKAPI_CALL WaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* info, std::uint64_t timeout) {
+    if (auto* watched = probe.load(); watched != nullptr && std::this_thread::get_id() == watched->audited) {
+        {
+            std::lock_guard lock(watched->mutex);
+            watched->waiting = true;
+        }
+        watched->changed.notify_all();
+    }
+    return originalWaitSemaphores(device, info, timeout);
+}
+
+PFN_vkVoidFunction VKAPI_CALL Resolve(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkWaitSemaphoresKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&WaitSemaphores);
+    return originalProc(device, name);
+}
+
+Graphics::Context Probed(const Graphics::Context& context) {
+    originalProc = context.deviceProc;
+    originalWaitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+    auto probed = context;
+    probed.functions = nullptr;
+    probed.deviceProc = &Resolve;
+    return probed;
+}
+
+Outcome HeldSync(const Graphics::Context& probed, std::size_t failAfter) {
+    Outcome outcome;
+    Hold hold(probed);
+    std::weak_ptr<int> watch;
+    WaitProbe watched;
+    watched.audited = std::this_thread::get_id();
+    {
+        Graphics::Recorder recorder(probed, true);
+        ReleaseOnExit release{hold};
+        recorder.Activate();
+        watch = KeepSentinel(recorder);
+        recorder.NotePendingWrite(HeldWrite, 256);
+        recorder.HoldNextSubmit(hold.semaphore, 1);
+        recorder.Submit();
+        probe.store(&watched);
+        std::thread releaser([&] {
+            {
+                std::unique_lock lock(watched.mutex);
+                watched.changed.wait(lock, [&] { return watched.waiting || watched.returned; });
+                outcome.waited = watched.waiting;
+            }
+            outcome.lostWhileHeld = watch.expired();
+            hold.Release();
+        });
+        struct JoinOnExit {
+            WaitProbe& watched;
+            std::thread& releaser;
+            ~JoinOnExit() {
+                {
+                    std::lock_guard lock(watched.mutex);
+                    watched.returned = true;
+                }
+                watched.changed.notify_all();
+                releaser.join();
+                probe.store(nullptr);
+            }
+        };
+        {
+            JoinOnExit join{watched, releaser};
+            ArmAllocationFailure(failAfter);
+            try {
+                recorder.Sync();
+            } catch (const std::exception&) {
+                outcome.threw = true;
+            }
+            outcome.failed = DisarmAllocationFailure();
+        }
+        Drain(recorder, "a held sync");
+    }
+    if (!watch.expired()) Fail("a held sync, failing allocation " + std::to_string(failAfter) + ": the kept object outlived its recorder");
+    return outcome;
+}
+
+void SyncSweep(const Graphics::Context& probed) {
+    const std::string what = "a sync finishing a batch held on the GPU";
+#ifdef APS5_AGC_ALLOCATION_COUNT
+    std::size_t cases = 0;
+    std::size_t waited = 0;
+    for (std::size_t failAfter = 0;; ++failAfter) {
+        Require(failAfter < 4096, what + ": the allocation sweep did not end");
+        const auto outcome = HeldSync(probed, failAfter);
+        if (!outcome.failed) {
+            if (!outcome.waited) Fail(what + ": the sync without a failure did not wait for the held batch");
+            break;
+        }
+        ++cases;
+        if (outcome.waited) ++waited;
+        if (outcome.lostWhileHeld) Fail(what + ", failing allocation " + std::to_string(failAfter) + ": the kept object was destroyed while the batch was still held on the GPU");
+    }
+    if (cases == 0) Fail(what + ": the sync made no allocation to fail");
+    std::printf("%s: %zu allocations failed one at a time, %zu of them before the sync waited for the hold\n", what.c_str(), cases, cases - waited);
+#else
+    const auto outcome = HeldSync(probed, 0);
+    if (outcome.lostWhileHeld || !outcome.waited) Fail(what + ": the batch was not waited for while keeping its objects");
+    std::printf("%s: skipped the allocation sweep, the driver's allocator is wrapped only in MinGW test builds\n", what.c_str());
+#endif
+}
+
+void NestedFinish(const Graphics::Context& context) {
+    bool outerRan = false;
+    bool innerRan = false;
+    bool outerSeen = false;
+    bool innerSeen = true;
+    {
+        Graphics::Recorder recorder(context, true);
+        recorder.Activate();
+        recorder.NotePendingWrite(OuterWrite, 256);
+        recorder.OnComplete([&] {
+            outerRan = true;
+            recorder.Sync();
+            outerSeen = Graphics::Recorder::SnapshotWriteOverlaps(OuterWrite, 256);
+            innerSeen = Graphics::Recorder::SnapshotWriteOverlaps(InnerWrite, 256);
+        });
+        recorder.Submit();
+        recorder.NotePendingWrite(InnerWrite, 256);
+        recorder.OnComplete([&] { innerRan = true; });
+        recorder.Submit();
+        Require(Graphics::Recorder::SnapshotWriteOverlaps(OuterWrite, 256) && Graphics::Recorder::SnapshotWriteOverlaps(InnerWrite, 256), "the pending-write snapshot does not hold the writes of both submitted batches");
+        recorder.Sync();
+        if (Graphics::Recorder::SnapshotWriteOverlaps(OuterWrite, 256) || Graphics::Recorder::SnapshotWriteOverlaps(InnerWrite, 256)) Fail("a nested finish: the pending-write snapshot kept the writes of finished batches");
+        recorder.FlushDeferredReleases();
+    }
+    if (!outerRan || !innerRan) Fail("a nested finish: a completion did not run");
+    if (!outerSeen) Fail("a nested finish: the outer batch's writes left the snapshot while its completion was running");
+    if (innerSeen) Fail("a nested finish: the inner batch's writes stayed in the snapshot after its finish");
+    std::printf("a nested finish: the outer batch's writes stayed published through the inner finish\n");
+}
+
 }
 
 int main() {
@@ -298,8 +448,11 @@ int main() {
         if (!device) return VulkanTestSkipped;
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         const auto context = device->graphicsContext();
+        const auto probed = Probed(context);
         Timed("submit sweep", [&] { SubmitSweep(context); });
         Timed("in-flight growth", [&] { InFlightGrowth(context); });
+        Timed("sync sweep", [&] { SyncSweep(probed); });
+        Timed("nested finish", [&] { NestedFinish(context); });
         for (const auto& failure : failures) std::cerr << failure << '\n';
         return failures.empty() ? 0 : 1;
     } catch (const std::exception& error) {

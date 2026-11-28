@@ -4335,7 +4335,7 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
         } else {
             if (open != nullptr) merged->insert(merged->end(), open->writes.begin(), open->writes.end());
             for (const auto& batch : inFlight) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
-            for (const auto* batch : finishing) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
+            for (const auto* batch = finishing; batch != nullptr; batch = batch->nextFinishing) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
         }
         std::sort(merged->begin(), merged->end());
         std::size_t out = 0;
@@ -5475,10 +5475,14 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;
-        const Batch* batch;
+        Batch* batch;
         ~Finishing() {
-            auto& list = recorder.finishing;
-            list.erase(std::remove(list.begin(), list.end(), batch), list.end());
+            for (auto** link = &recorder.finishing; *link != nullptr; link = &(*link)->nextFinishing) {
+                if (*link == batch) {
+                    *link = batch->nextFinishing;
+                    break;
+                }
+            }
             // The batch's completion labels have landed, or never will (fence failure below).
             if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
             if (batch->completionStoreCount != 0) completionStores.fetch_sub(batch->completionStoreCount, std::memory_order_acq_rel);
@@ -5496,7 +5500,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         }
     } finishingScope{*this, batch.get()};
-    finishing.push_back(batch.get());
+    batch->nextFinishing = finishing;
+    finishing = batch.get();
     if (wait) {
         // APS5_PROFILE_DRAW: how long the CPU waits for recorded GPU work, reported every 10 s.
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
