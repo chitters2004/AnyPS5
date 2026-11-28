@@ -843,8 +843,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::fprintf(stderr, "[dispatch-io] queue=0x%x submission=%llu shader 0x%llx%s\n", submission.queue, static_cast<unsigned long long>(submission.serial), static_cast<unsigned long long>(address), words.c_str());
     }
 
-    const auto rethrow = [&](const std::exception& error) {
-        if (fromAhead) {
+    const auto rethrow = [&](const std::exception& error, bool recorded) {
+        if (fromAhead && !recorded) {
             ++groupStats.deviceRejects;
             dispatch(queue, packet, submission, indirectArguments);
             return true;
@@ -992,7 +992,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             try {
                 prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads, address, htileClearCompletion, registeredViews);
             } catch (const std::exception& error) {
-                if (rethrow(error)) return;
+                if (rethrow(error, false)) return;
             }
             if (profile) {
                 const auto now = std::chrono::steady_clock::now();
@@ -1034,6 +1034,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         phaseTiming.Phase(PhaseNoteWriters);
         auto* const keysRecorder = filledKeys ? Graphics::Recorder::Active() : nullptr;
         const auto keysNoteBefore = keysRecorder != nullptr ? keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes) : 0;
+        auto* const dispatchRecorder = Graphics::Recorder::Active();
+        const auto recordingsBefore = dispatchRecorder != nullptr ? dispatchRecorder->Recordings() : 0;
         try {
             if (recipeHit != nullptr) {
                 VulkanDevice::IndirectOutcome outcome{0, 0};
@@ -1052,7 +1054,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : (attachTo != nullptr ? &builtRecipe : nullptr), htileClearCompletion, registeredViews);
             }
         } catch (const std::exception& error) {
-            if (rethrow(error)) return;
+            const bool recorded = dispatchRecorder != nullptr && dispatchRecorder->Recordings() != recordingsBefore;
+            if (recorded) dispatchRecorder->FailOpen();
+            if (rethrow(error, recorded)) return;
         }
         if (keysRecorder != nullptr && keysRecorder == Graphics::Recorder::Active()) {
             const auto note = keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes);
