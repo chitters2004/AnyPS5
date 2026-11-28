@@ -161,6 +161,7 @@ int main() {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         const auto context = device->graphicsContext();
         Sweep(context, false);
+        Sweep(context, true);
         for (const auto& failure : failures) std::cerr << failure << '\n';
         return failures.empty() ? 0 : 1;
     } catch (const std::exception& error) {

@@ -804,6 +804,7 @@ private:
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
+        Batch* nextFinishing = nullptr;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::function<void()>> discards;
@@ -1145,7 +1146,7 @@ private:
     std::deque<std::unique_ptr<Batch>> inFlight;
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
-    std::vector<const Batch*> finishing;
+    Batch* finishing = nullptr;
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
     std::size_t inFlightKeptBytes = 0;
