@@ -39,6 +39,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -66,7 +67,7 @@ constexpr std::uint32_t TileDepth64KB = 0x18;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Type2DArray = 13;
 constexpr std::size_t PlaneBytes = 65536;
-constexpr std::size_t BlockBytes = 88 * PlaneBytes;
+constexpr std::size_t BlockBytes = 92 * PlaneBytes;
 constexpr std::uint32_t RowPasses = 15;
 
 alignas(256) constexpr std::array<std::uint32_t, 9> StoreRowCode{
@@ -896,6 +897,95 @@ void DisplacedMirrorOwnerCase(AgcDriver::VulkanDevice& device, const DepthFastCl
     if (wrong != 0u) failures.push_back(what + ", read back from the depth image: " + std::to_string(wrong) + " of " + std::to_string(texels.size()) + " texels hold neither the old surface's 0.25 inside its extent nor the CPU's 0.75 outside it");
 }
 
+bool flushFaultArmed = false;
+
+void FaultWhenFlushSelected() {
+    if (!std::exchange(flushFaultArmed, false)) return;
+    throw std::runtime_error("injected flush fault");
+}
+
+void StaleOwnerFlushFailureCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* plane) {
+    const std::string what = "a new 192x136 D32 depth surface at the plane of a 64x32 surface that wrote 0.25 there on the GPU after the CPU wrote 0.75, whose bind failed while it stored the old surface's depth, then bound again";
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const auto target = Target(Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), PatternExtent);
+    const auto drawOwner = [&] {
+        device.WaitIdle();
+        AgcDriver::Graphics::ClearDepthSurfaces(context.device);
+        for (std::uint32_t block = 0; block < 4u; ++block) FillPlane(plane + block * PlaneBytes, 0.75f);
+        RequireCount(DepthFastClearHarness::Draw(device, shaders, Plane(plane, VK_FORMAT_D32_SFLOAT, 0, ZSwizzle()), {.depthTest = true, .depthWrite = true, .depthCompare = VK_COMPARE_OP_ALWAYS, .minDepth = 0.25f, .maxDepth = 0.25f}), Covered, "a 64x32 D32 depth surface writing depth 0.25 on the GPU over a 0.75 plane");
+    };
+    const auto bind = [&] {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::Graphics::DepthSurfaceView(context, target);
+    };
+    const auto requireContents = [&](const std::string& at) {
+        try {
+            bind();
+        } catch (const std::exception& error) {
+            failures.push_back(at + ": the bind again threw: " + error.what());
+            return;
+        }
+        const auto texels = ReadDepthImage(device, target);
+        std::uint32_t wrong = 0;
+        for (std::uint32_t y = 0; y < PatternExtent.height; ++y) {
+            for (std::uint32_t x = 0; x < PatternExtent.width; ++x) wrong += texels[static_cast<std::size_t>(y) * PatternExtent.width + x] != (x < Width && y < Height ? 0x3e800000u : 0x3f400000u);
+        }
+        if (wrong != 0u) failures.push_back(at + ", read back from the depth image: " + std::to_string(wrong) + " of " + std::to_string(texels.size()) + " texels hold neither the old surface's 0.25 inside its extent nor the CPU's 0.75 outside it");
+    };
+
+    drawOwner();
+    flushFaultArmed = true;
+    AgcDriver::Graphics::StorageTexture::SetFlushSelectedHookForTest(FaultWhenFlushSelected);
+    bool threw = false;
+    try {
+        bind();
+    } catch (const std::runtime_error& error) {
+        threw = std::string(error.what()).find("injected flush fault") != std::string::npos;
+    }
+    AgcDriver::Graphics::StorageTexture::SetFlushSelectedHookForTest(nullptr);
+    if (flushFaultArmed || !threw) failures.push_back(what + ", failing once the flush selected the old surface's store: the fault was not reached or did not leave the bind");
+    flushFaultArmed = false;
+    requireContents(what + ", failing once the flush selected the old surface's store");
+
+#ifdef APS5_AGC_ALLOCATION_COUNT
+    drawOwner();
+    std::size_t counted = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        BeginAllocationCount_nid_no_patch();
+        try {
+            AgcDriver::Graphics::DepthSurfaceView(context, target);
+        } catch (const std::exception&) {
+        }
+        counted = EndAllocationCount_nid_no_patch();
+    }
+    std::size_t aborted = 0;
+    for (std::size_t failAfter = 0; failAfter < counted; ++failAfter) {
+        const auto at = what + ", failing from allocation " + std::to_string(failAfter);
+        drawOwner();
+        bool failed = false;
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            FailEveryAllocationAfter_nid_no_patch(failAfter);
+            try {
+                AgcDriver::Graphics::DepthSurfaceView(context, target);
+            } catch (const std::exception&) {
+                failed = true;
+            }
+            StopAllocationFailures_nid_no_patch();
+        }
+        aborted += failed;
+        requireContents(at);
+    }
+    device.WaitIdle();
+    AgcDriver::Graphics::ClearDepthSurfaces(context.device);
+    if (aborted == 0u) failures.push_back(what + ": no failed allocation left the bind");
+    std::printf("%s: %zu of %zu allocations aborted the bind when they failed\n", what.c_str(), aborted, counted);
+#else
+    skipped.push_back(what + ", failing at each allocation: the driver's allocator is wrapped only in MinGW test builds");
+#endif
+}
+
 void CurrentOwnerImageCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint8_t* depth, std::uint8_t* firstStencil, std::uint8_t* secondStencil) {
     const DepthFastClearHarness::Surface first{Address(depth), Address(firstStencil), 0, false, VK_FORMAT_D32_SFLOAT_S8_UINT};
     const DepthFastClearHarness::Surface second{Address(depth), Address(secondStencil), 0, false, VK_FORMAT_D32_SFLOAT_S8_UINT};
@@ -1148,6 +1238,7 @@ int main() {
         PaddingOutOfRangeCase(*device, block.Plane(71));
         OverlappedOwnerCase(*device, shaders, block.Plane(67));
         DisplacedMirrorOwnerCase(*device, shaders, block.Plane(75));
+        StaleOwnerFlushFailureCase(*device, shaders, block.Plane(88));
         CurrentOwnerImageCase(*device, shaders, block.Plane(39), block.Plane(40), block.Plane(41));
 
         auto* cleared = block.Plane(3);

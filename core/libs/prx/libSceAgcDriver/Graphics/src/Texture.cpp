@@ -52,6 +52,7 @@
 #include <mutex>
 #include <map>
 #include <limits>
+#include <new>
 #include <exception>
 #include <functional>
 #include <optional>
@@ -5478,7 +5479,13 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             lock.lock();
         }
         const auto* exempt = Refreshing::Get();
-        for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
+        const bool mayOverlap = pending.textures.MayOverlap(address, bytes);
+        if (mayOverlap) {
+            const auto candidates = static_cast<std::size_t>(pending.textures.end() - pending.textures.begin());
+            flush.reserve(candidates);
+            pending.flushing.reserve(pending.flushing.size() + candidates);
+        }
+        for (auto it = mayOverlap ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
             if (texture != except && texture != exempt && (device == VK_NULL_HANDLE || texture->context.device == device) && texture->overlaps(address, bytes)) {
                 if (!texture->pendingUnitInside(address, bytes)) {
@@ -5518,9 +5525,13 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         ++pending.flushingChanges;
         pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
         if (!flush.empty()) BumpPendingSerial();
-        for (const auto& texture : flush) {
-            if (texture->drawnListed) ownNotes.insert(ownNotes.end(), texture->storeNotes.begin(), texture->storeNotes.end());
-            ownNotes.insert(ownNotes.end(), texture->flushNotes.begin(), texture->flushNotes.end());
+        try {
+            for (const auto& texture : flush) {
+                if (texture->drawnListed) ownNotes.insert(ownNotes.end(), texture->storeNotes.begin(), texture->storeNotes.end());
+                ownNotes.insert(ownNotes.end(), texture->flushNotes.begin(), texture->flushNotes.end());
+            }
+        } catch (const std::bad_alloc&) {
+            ownNotes.clear();
         }
     }
     if (flush.empty()) {
@@ -5543,6 +5554,14 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             BumpPendingSerial();
         }
     } unregister{flush};
+    struct Restore {
+        const std::vector<std::shared_ptr<StorageTexture>>& flush;
+        bool stored = false;
+        ~Restore() {
+            if (stored) return;
+            for (const auto& texture : flush) texture->reconcilePending();
+        }
+    } restore{flush};
     if (const auto hook = flushSelectedHookForTest.load(std::memory_order_acquire)) hook();
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
     static const bool trace = std::getenv("APS5_TRACE_FLUSH") != nullptr;
@@ -5572,60 +5591,54 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         orderedFlushSkips.fetch_add(1, std::memory_order_relaxed);
     }
     if (flushFailureForTest.exchange(false, std::memory_order_acq_rel)) {
-        for (const auto& texture : flush) texture->reconcilePending();
         flushFailureFiredForTest.store(GpuOrderedFlush() ? 2 : 1, std::memory_order_release);
         throw std::runtime_error("StorageTexture::FlushPending: injected failure for a test");
     }
     if (auto* recorder = Recorder::Active(); !orderedSkip && recorder != nullptr && !Recorder::InCompletion()) {
-        try {
-            static const bool wholeRange = std::getenv("APS5_FLUSH_WAIT_WHOLE_RANGE") != nullptr;
-            const bool publishes = !wholeRange && scope != PublishScope::None;
-            std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
-            const auto waitRanges = [&] {
-                stored.clear();
-                if (wholeRange) {
-                    stored.emplace_back(address, address + bytes);
-                    return;
-                }
-                for (const auto& texture : flush) texture->appendStoredLayers(address, bytes, stored);
-                if (publishes) {
-                    for (const auto& range : LiveShadowedRanges(address, bytes, scope)) stored.push_back(range);
-                }
-            };
-            const auto pendingWriter = [&](const Recorder& active) {
-                constexpr std::uint64_t block = 65536;
-                std::uint64_t writer = 0;
-                if (publishes) {
-                    constexpr auto top = std::numeric_limits<std::uint64_t>::max();
-                    const auto first = address / block * block;
-                    const auto end = bytes > top - address ? top : address + bytes;
-                    const auto last = end > top - block ? end : (end + block - 1) / block * block;
-                    writer = active.PendingLeaseSerial(first, static_cast<std::size_t>(last - first));
-                }
-                for (const auto& [begin, end] : stored) {
-                    if (writer == active.OpenSerial()) break;
-                    writer = std::max(writer, active.PendingWriterSerial(begin, static_cast<std::size_t>(end - begin), ownNotes));
-                }
-                return writer;
-            };
-            const auto openWrites = [&stored](const Recorder& active) {
-                return std::any_of(stored.begin(), stored.end(), [&active](const auto& range) { return active.OpenWriteOverlaps(range.first, static_cast<std::size_t>(range.second - range.first)); });
-            };
-            for (waitRanges(); pendingWriter(*recorder) != 0; waitRanges()) {
-                recorder->Reap();
-                waitRanges();
-                const auto writer = pendingWriter(*recorder);
-                if (writer == recorder->OpenSerial()) {
-                    Recorder::CountSync(openWrites(*recorder) ? 1 : 3);
-                    recorder->Sync();
-                    break;
-                }
-                if (writer == 0) break;
-                recorder->FinishUpTo(writer);
+        static const bool wholeRange = std::getenv("APS5_FLUSH_WAIT_WHOLE_RANGE") != nullptr;
+        const bool publishes = !wholeRange && scope != PublishScope::None;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
+        const auto waitRanges = [&] {
+            stored.clear();
+            if (wholeRange) {
+                stored.emplace_back(address, address + bytes);
+                return;
             }
-        } catch (...) {
-            for (const auto& texture : flush) texture->reconcilePending();
-            throw;
+            for (const auto& texture : flush) texture->appendStoredLayers(address, bytes, stored);
+            if (publishes) {
+                for (const auto& range : LiveShadowedRanges(address, bytes, scope)) stored.push_back(range);
+            }
+        };
+        const auto pendingWriter = [&](const Recorder& active) {
+            constexpr std::uint64_t block = 65536;
+            std::uint64_t writer = 0;
+            if (publishes) {
+                constexpr auto top = std::numeric_limits<std::uint64_t>::max();
+                const auto first = address / block * block;
+                const auto end = bytes > top - address ? top : address + bytes;
+                const auto last = end > top - block ? end : (end + block - 1) / block * block;
+                writer = active.PendingLeaseSerial(first, static_cast<std::size_t>(last - first));
+            }
+            for (const auto& [begin, end] : stored) {
+                if (writer == active.OpenSerial()) break;
+                writer = std::max(writer, active.PendingWriterSerial(begin, static_cast<std::size_t>(end - begin), ownNotes));
+            }
+            return writer;
+        };
+        const auto openWrites = [&stored](const Recorder& active) {
+            return std::any_of(stored.begin(), stored.end(), [&active](const auto& range) { return active.OpenWriteOverlaps(range.first, static_cast<std::size_t>(range.second - range.first)); });
+        };
+        for (waitRanges(); pendingWriter(*recorder) != 0; waitRanges()) {
+            recorder->Reap();
+            waitRanges();
+            const auto writer = pendingWriter(*recorder);
+            if (writer == recorder->OpenSerial()) {
+                Recorder::CountSync(openWrites(*recorder) ? 1 : 3);
+                recorder->Sync();
+                break;
+            }
+            if (writer == 0) break;
+            recorder->FinishUpTo(writer);
         }
     }
     if (const auto hook = flushingHookForTest.load(std::memory_order_acquire)) hook();
@@ -5644,6 +5657,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     }
     flushReason = previousReason;
     if (failure) std::rethrow_exception(failure);
+    restore.stored = true;
     // The stores above went into the unit shadows where slabs took them: the consumer reads the
     // import, so they are published under the same hold, after every store.
     if (scope != PublishScope::None) {
