@@ -3758,6 +3758,12 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     open->keptBytes += bytes;
 }
 
+void Recorder::ReserveKept(std::size_t objects) {
+    ensureOpen();
+    auto& kept = open->kept;
+    if (kept.capacity() - kept.size() < objects) kept.reserve(std::max(kept.size() + objects, 2 * kept.capacity()));
+}
+
 bool Recorder::KeepWithOutstanding(const std::shared_ptr<void>& object) noexcept {
     try {
         if (open != nullptr) open->kept.push_back(object);

@@ -3230,6 +3230,7 @@ void releaseRetired(const Context& context) {
             ++it;
             continue;
         }
+        if (recorder != nullptr) recorder->ReserveKept(1);
         if (!surface.retired) retire(surface);
         if (drawnDepth == &surface) drawnDepth = nullptr;
         std::shared_ptr<DepthSurface> released = std::move(*it);
