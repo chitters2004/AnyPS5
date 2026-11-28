@@ -2354,6 +2354,23 @@ bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<c
     return FillClearColor(format, elementBytes, pattern, clear);
 }
 
+namespace {
+
+template <typename Views, typename Key, typename Create>
+VkImageView cachedView(Views& views, const Key& key, Create&& create) {
+    const auto [slot, inserted] = views.try_emplace(key, VK_NULL_HANDLE);
+    if (!inserted) return slot->second;
+    try {
+        slot->second = create();
+    } catch (...) {
+        views.erase(slot);
+        throw;
+    }
+    return slot->second;
+}
+
+}
+
 VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFormat format) const {
     Require(mip < descriptor.mipCount, "storage texture mip level is outside the texture");
     Require(!firstLayer || descriptor.dimension == TextureDimension::k2DArray || descriptor.dimension == TextureDimension::k1DArray, "a first-layer storage view needs a 1D or 2D array surface");
@@ -2390,21 +2407,20 @@ bool StorageTexture::singlePass() {
 }
 
 VkImageView StorageTexture::elementLayerView(std::uint32_t level, std::uint32_t layer) {
-    const auto key = (level << 16) | layer;
-    if (const auto found = elementLayerViews.find(key); found != elementLayerViews.end()) return found->second;
-    VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-    usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
-    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    viewInfo.pNext = &usage;
-    viewInfo.image = image;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = TextureDetiler::ImageElementFormat(BytesPerElement(descriptor.format));
-    viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, geometry.CopyLayer(layer), 1u};
-    VkImageView created = VK_NULL_HANDLE;
-    Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView storage element");
-    elementLayerViews.emplace(key, created);
-    return created;
+    return cachedView(elementLayerViews, (level << 16) | layer, [&] {
+        VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.pNext = &usage;
+        viewInfo.image = image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = TextureDetiler::ImageElementFormat(BytesPerElement(descriptor.format));
+        viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, geometry.CopyLayer(layer), 1u};
+        VkImageView created = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView storage element");
+        return created;
+    });
 }
 
 VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t layers, std::uint32_t layer) {
@@ -2415,21 +2431,20 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
     const auto depth = volume ? std::max((descriptor.depthOrLastArray + 1u) >> mip, 1u) : 1u;
     Require((depthSlice == 0 && layers == 1) || (volume && layers != 0 && depthSlice < depth && layers <= depth - depthSlice) || (array && depthSlice == 0 && layers != 0), "attachment slice is outside the storage image");
     Require((layer == 0 && layers == 1) || (volume && layer == 0) || (array && descriptor.baseArray + layer + layers - 1u <= descriptor.depthOrLastArray), "attachment layer is outside the storage image");
-    const auto found = attachmentViews.find({format, mip, depthSlice, layers, layer});
-    if (found != attachmentViews.end()) return found->second;
-    VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-    usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    viewInfo.pNext = &usage;
-    viewInfo.image = image;
-    viewInfo.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = format;
-    viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, volume ? depthSlice : descriptor.baseArray + layer, layers};
-    VkImageView created = VK_NULL_HANDLE;
-    Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView attachment");
-    attachmentViews.emplace(std::tuple{format, mip, depthSlice, layers, layer}, created);
-    return created;
+    return cachedView(attachmentViews, std::tuple{format, mip, depthSlice, layers, layer}, [&] {
+        VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.pNext = &usage;
+        viewInfo.image = image;
+        viewInfo.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = format;
+        viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, volume ? depthSlice : descriptor.baseArray + layer, layers};
+        VkImageView created = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView attachment");
+        return created;
+    });
 }
 
 VkImageView StorageTexture::AttachmentProxyView() {
@@ -2517,19 +2532,11 @@ void StorageTexture::RecordAttachmentProxyStore(VkCommandBuffer commands, VkImag
 
 VkImageView StorageTexture::View(std::uint32_t mip) {
     if (mip == defaultMip) return view;
-    const auto found = extraViews.find(mip);
-    if (found != extraViews.end()) return found->second;
-    const auto created = createView(mip, false, storageFormat);
-    extraViews.emplace(mip, created);
-    return created;
+    return cachedView(extraViews, mip, [&] { return createView(mip, false, storageFormat); });
 }
 
 VkImageView StorageTexture::FirstLayerView(std::uint32_t mip) {
-    const auto found = firstLayerViews.find(mip);
-    if (found != firstLayerViews.end()) return found->second;
-    const auto created = createView(mip, true, storageFormat);
-    firstLayerViews.emplace(mip, created);
-    return created;
+    return cachedView(firstLayerViews, mip, [&] { return createView(mip, true, storageFormat); });
 }
 
 VkImageView StorageTexture::StorageView(std::uint32_t mip, bool firstLayer, bool uintStorage) {
@@ -2537,12 +2544,10 @@ VkImageView StorageTexture::StorageView(std::uint32_t mip, bool firstLayer, bool
     const auto format = packed != VK_FORMAT_UNDEFINED ? packed : uintStorage ? UintStorageViewFormat(storageFormat) : VK_FORMAT_UNDEFINED;
     if (format == VK_FORMAT_UNDEFINED) return firstLayer ? FirstLayerView(mip) : View(mip);
     if (format == VK_FORMAT_R32_UINT) return AtomicView(mip, firstLayer);
-    const auto found = uintViews.find({mip, firstLayer});
-    if (found != uintViews.end()) return found->second;
-    Require(StorageFormatOrUndefined(context, format) == format, "storage image of format " + std::to_string(storageFormat) + " has no storage view of its UINT format " + std::to_string(format));
-    const auto created = createView(mip, firstLayer, format);
-    uintViews.emplace(std::pair{mip, firstLayer}, created);
-    return created;
+    return cachedView(uintViews, std::pair{mip, firstLayer}, [&] {
+        Require(StorageFormatOrUndefined(context, format) == format, "storage image of format " + std::to_string(storageFormat) + " has no storage view of its UINT format " + std::to_string(format));
+        return createView(mip, firstLayer, format);
+    });
 }
 
 VkImageView StorageTexture::ElementView() {
@@ -2558,22 +2563,14 @@ VkImageView StorageTexture::ElementView() {
 VkImageView StorageTexture::AtomicView(std::uint32_t mip, bool firstLayer) {
     if (storageFormat == VK_FORMAT_R32_UINT) return firstLayer ? FirstLayerView(mip) : View(mip);
     Require(storageFormat == VK_FORMAT_R32_SINT || storageFormat == VK_FORMAT_R32_SFLOAT, "storage image atomics need a surface of one 32-bit component");
-    const auto found = atomicViews.find({mip, firstLayer});
-    if (found != atomicViews.end()) return found->second;
-    const auto created = createView(mip, firstLayer, VK_FORMAT_R32_UINT);
-    atomicViews.emplace(std::pair{mip, firstLayer}, created);
-    return created;
+    return cachedView(atomicViews, std::pair{mip, firstLayer}, [&] { return createView(mip, firstLayer, VK_FORMAT_R32_UINT); });
 }
 
 VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
     const auto format = context.imageInt64Atomics ? VK_FORMAT_R64_UINT : VK_FORMAT_R32G32_UINT;
     if (storageFormat == format) return firstLayer ? FirstLayerView(mip) : View(mip);
     Require(storageFormat == VK_FORMAT_R32G32_UINT || storageFormat == VK_FORMAT_R32G32_SINT || storageFormat == VK_FORMAT_R32G32_SFLOAT, "64-bit storage image atomics need a surface of two 32-bit components");
-    const auto found = atomicViews.find({mip, firstLayer});
-    if (found != atomicViews.end()) return found->second;
-    const auto created = createView(mip, firstLayer, format);
-    atomicViews.emplace(std::pair{mip, firstLayer}, created);
-    return created;
+    return cachedView(atomicViews, std::pair{mip, firstLayer}, [&] { return createView(mip, firstLayer, format); });
 }
 
 const char* LookupOutcomes::Name(Kind kind) {
