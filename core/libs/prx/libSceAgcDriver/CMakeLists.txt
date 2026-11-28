@@ -892,6 +892,13 @@ if(BUILD_TESTING)
     endforeach()
 endif()
 
+if(BUILD_TESTING AND TARGET agc_driver_recorder_retention_tests)
+    set_tests_properties(agc_driver_recorder_retention PROPERTIES FAIL_REGULAR_EXPRESSION "SYNC-HAZARD-|VUID-")
+    if(MINGW)
+        target_compile_definitions(agc_driver_recorder_retention_tests PRIVATE APS5_AGC_ALLOCATION_COUNT=1)
+    endif()
+endif()
+
 foreach(agcExecutionTestName IN LISTS ANYPS5_AGC_EXECUTION_TESTS)
     if(NOT agcExecutionTestName IN_LIST agcExecutionTestNames)
         message(FATAL_ERROR "ANYPS5_AGC_EXECUTION_TESTS names ${agcExecutionTestName}, which does not match a tests/execution source name")
