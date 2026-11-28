@@ -203,7 +203,7 @@ std::atomic<int>& WaitersOf(std::uint64_t id) { return unlockedWaiters[id % Wait
 // Recorders alive, by id (own mutex, taken under the GpuMutex or with nothing held): a thread that
 // released the GpuMutex around a wait learns whether its recorder still exists before touching it.
 AgcDriver::Mutex liveRecordersMutex;
-std::vector<std::uint64_t> liveRecorders;
+std::vector<Recorder*> liveRecorders;
 std::atomic<std::uint64_t> nextRecorderId{1};
 std::atomic<std::uint64_t> samplesPassed{0};
 constexpr std::uint32_t SampleFoldCapacity = 64;
@@ -258,7 +258,7 @@ struct SamplePool {
 
 bool RecorderAlive(std::uint64_t id) {
     std::lock_guard lock(liveRecordersMutex);
-    return std::find(liveRecorders.begin(), liveRecorders.end(), id) != liveRecorders.end();
+    return std::any_of(liveRecorders.begin(), liveRecorders.end(), [id](const Recorder* recorder) { return recorder->Id() == id; });
 }
 
 // Completion actions in progress on this thread (finish()): a pending-write sync the flush hook
@@ -1398,8 +1398,9 @@ struct Recorder::ProgressWatcher {
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
     {
         std::lock_guard lock(liveRecordersMutex);
-        liveRecorders.push_back(id);
+        liveRecorders.push_back(this);
     }
+    GuestMemory::SetGpuUnwindHook(&Recorder::discardUnwound);
     // Idempotent: the same hook for every recorder (the deferred lists are per thread, not per recorder).
     GuestMemory::SetGpuUnlockHook(&ReleaseDeferredKeeps);
     if (ProcTable() && context.deviceProc != nullptr) {
@@ -1444,6 +1445,18 @@ Recorder::~Recorder() {
         Sync();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "[gpu] recorder teardown: a non-standard exception\n");
+    }
+    DiscardOpen();
+    while (!inFlight.empty()) {
+        auto batch = std::move(inFlight.front());
+        inFlight.pop_front();
+        try {
+            finish(std::move(batch), true, 4);
+        } catch (...) {
+            std::fprintf(stderr, "[gpu] recorder teardown: a batch failed to finish\n");
+        }
     }
     ForgetHtileMasks_nid_no_patch(id);
     progressWatcher.reset();
@@ -1465,7 +1478,7 @@ Recorder::~Recorder() {
         // failure paths do; a worker dropping the last device reference after releasing its lock
         // would run this without the mutex, concurrently with a relocked waiter.
         std::lock_guard lock(liveRecordersMutex);
-        liveRecorders.erase(std::remove(liveRecorders.begin(), liveRecorders.end(), id), liveRecorders.end());
+        liveRecorders.erase(std::remove(liveRecorders.begin(), liveRecorders.end(), this), liveRecorders.end());
     }
     // Sync() above completed every batch, so every timeline wait in progress on this recorder
     // returns now; the semaphore is destroyed only once they all left it.
@@ -1747,6 +1760,7 @@ void CommandState::SetColorWriteMasks(const Context& context, std::span<const Vk
 
 CommandState& Recorder::GraphicsState() {
     Require(open != nullptr, "no batch is open for graphics state");
+    noteChange();
     return open->graphicsState;
 }
 
@@ -1974,6 +1988,7 @@ Recorder::OverlapStatistics Recorder::OverlapCounts() {
 
 void Recorder::flushDeferredDispatch() {
     if (open == nullptr || open->deferredDispatchQueue == 0) return;
+    noteChange();
     open->deferredDispatchQueue = 0;
     open->deferredRun.clear();
     open->runAccess.clear();
@@ -1992,7 +2007,10 @@ void Recorder::flushDeferredDispatch() {
             if (failure == nullptr) failure = std::current_exception();
         }
     }
-    if (failure != nullptr) std::rethrow_exception(failure);
+    if (failure != nullptr) {
+        DiscardOpen();
+        std::rethrow_exception(failure);
+    }
 }
 
 bool Recorder::runConflict(std::span<const RunAccess> accesses) const {
@@ -2042,6 +2060,7 @@ VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<cons
 
 void Recorder::DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses) {
     Require(open != nullptr && queueKey != 0, "a deferred dispatch barrier has no batch");
+    noteChange();
     if (open->deferredDispatchQueue == 0) {
         open->deferredRun.clear();
         open->runAccess.clear();
@@ -2158,6 +2177,7 @@ bool Recorder::RenderPassOpen() const {
 }
 
 void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
+    noteChange();
     ++passGeneration;
     auto& pass = open->renderPass;
     if (open->segmentActive) endSegment(*open);
@@ -2168,7 +2188,14 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
         recordBarrier(open->commands, PassEndBarrier.srcStage, PassEndBarrier.dstStage, PassEndBarrier.srcAccess, PassEndBarrier.dstAccess);
         CountBarriers(CommandClass::Draw);
     }
-    if (pass.afterPass) pass.afterPass(open->graphicsState);
+    if (pass.afterPass) {
+        try {
+            pass.afterPass(open->graphicsState);
+        } catch (...) {
+            DiscardOpen();
+            throw;
+        }
+    }
     EndGpuTiming(pass.timing);
     open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0;
     open->hostReadOwed = true;
@@ -2184,7 +2211,10 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
             if (failure == nullptr) failure = std::current_exception();
         }
     }
-    if (failure != nullptr) std::rethrow_exception(failure);
+    if (failure != nullptr) {
+        DiscardOpen();
+        std::rethrow_exception(failure);
+    }
 }
 
 void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end) {
@@ -2222,6 +2252,7 @@ void Recorder::FlushKeyStores() {
 }
 
 void Recorder::recordKeyStores(bool forWriter) {
+    noteChange();
     auto stores = std::move(open->keyStores);
     open->keyStores.clear();
     if (stores.empty()) return;
@@ -2256,6 +2287,7 @@ void Recorder::recordKeyStores(bool forWriter) {
 
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
+    noteChange();
     if (open == nullptr) {
         ++passGeneration;
         auto batch = std::make_unique<Batch>();
@@ -2412,6 +2444,7 @@ void Recorder::flushPendingStore() {
 }
 
 bool Recorder::closeStoreRun(bool atSubmit) {
+    noteChange();
     flushDeferredDispatch();
     auto& run = open->run;
     if (LabelRunsPerBatch()) {
@@ -2823,6 +2856,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
 
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
+    noteChange();
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
 }
@@ -3187,12 +3221,14 @@ void Recorder::takeSegmentPool(Batch& batch) {
 
 void Recorder::beginSegment(Batch& batch) {
     Require(batch.segments != VK_NULL_HANDLE && batch.segmentNext < SegmentSlots, "an occlusion segment begins without a reset query slot");
+    noteChange();
     batch.segmentSlot = batch.segmentNext++;
     function(cmdBeginQuery, "vkCmdBeginQuery")(batch.commands, batch.segments, batch.segmentSlot, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
     batch.segmentActive = true;
 }
 
 void Recorder::endSegment(Batch& batch) {
+    noteChange();
     function(cmdEndQuery, "vkCmdEndQuery")(batch.commands, batch.segments, batch.segmentSlot);
     batch.segmentActive = false;
     reserveSampleRestore(batch);
@@ -3290,6 +3326,7 @@ void Recorder::foldSegments() {
 
 void Recorder::endSamples(Batch& batch) {
     if (!batch.sampleActive) return;
+    noteChange();
     function(cmdEndQuery, "vkCmdEndQuery")(batch.commands, batch.samples, 0);
     batch.sampleActive = false;
     if (sampleCounterState > 0 && batch.samplesDrawn) {
@@ -3562,6 +3599,7 @@ bool Recorder::RecordBoundChangedCopy(VkCommandBuffer commands, BoundWords resul
 }
 
 void Recorder::beginSamples(Batch& batch) {
+    noteChange();
     auto cache = std::static_pointer_cast<SamplePoolCache>(samplePools);
     if (sampleCounterState > 0 && cache == nullptr) {
         cache = std::make_shared<SamplePoolCache>();
@@ -4961,6 +4999,14 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    if (failed.load(std::memory_order_acquire)) refuseAfterFailure();
+    struct DiscardOpenOnThrow {
+        Recorder& recorder;
+        bool finalized = false;
+        ~DiscardOpenOnThrow() {
+            if (!finalized) recorder.DiscardOpen();
+        }
+    } discardOpenOnThrow{*this};
     flushDeferredDispatch();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass(PassBreak::NewBatch);
@@ -4988,6 +5034,7 @@ void Recorder::Submit() {
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
         for (const auto& [begin, end] : notedReads(*open)) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, end - begin));
     }
+    discardOpenOnThrow.finalized = true;
     auto batch = std::move(open);
     struct DiscardUnsubmitted {
         Recorder& recorder;
@@ -5037,8 +5084,13 @@ void Recorder::Submit() {
     if (hold != VK_NULL_HANDLE || timeline != VK_NULL_HANDLE) submission.pNext = &timelineInfo;
     DestroyDeferredAtIdle(context);
     const auto submitStart = std::chrono::steady_clock::now();
-    batch->submitStarted.store(true, std::memory_order_release);
-    const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    VkResult result = VK_SUCCESS;
+    {
+        std::lock_guard refusal(failureMutex);
+        if (failure != nullptr) std::rethrow_exception(failure);
+        batch->submitStarted.store(true, std::memory_order_release);
+        result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    }
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
@@ -5072,6 +5124,47 @@ void Recorder::Submit() {
     inFlight.push_back(std::move(batch));
     inFlightKeptBytes += inFlight.back()->keptBytes;
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+}
+
+void Recorder::DiscardOpen() noexcept {
+    if (open != nullptr) discard(std::move(open));
+}
+
+void Recorder::ReportFailure(std::exception_ptr error) noexcept {
+    std::lock_guard lock(failureMutex);
+    if (failure == nullptr) failure = std::move(error);
+    failed.store(true, std::memory_order_release);
+}
+
+std::exception_ptr Recorder::Failure() const {
+    std::lock_guard lock(failureMutex);
+    return failure;
+}
+
+void Recorder::noteChange() {
+    if (failed.load(std::memory_order_acquire)) [[unlikely]] refuseAfterFailure();
+    ++batchChanges;
+    changedHold = GuestMemory::GpuMutex().NoteChange();
+}
+
+void Recorder::refuseAfterFailure() {
+    DiscardOpen();
+    std::rethrow_exception(Failure());
+}
+
+void Recorder::discardUnwound() noexcept {
+    const auto hold = GuestMemory::GpuMutex().Hold();
+    for (;;) {
+        Recorder* unwound = nullptr;
+        {
+            std::lock_guard lock(liveRecordersMutex);
+            const auto found = std::find_if(liveRecorders.begin(), liveRecorders.end(), [hold](const Recorder* recorder) { return recorder->changedHold == hold; });
+            if (found == liveRecorders.end()) return;
+            unwound = *found;
+            unwound->changedHold = 0;
+        }
+        unwound->DiscardOpen();
+    }
 }
 
 std::uint64_t Recorder::SubmitAndEpoch() {
@@ -5170,16 +5263,26 @@ void Recorder::Sync() {
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
-    Submit();
+    std::exception_ptr first;
+    try {
+        Submit();
+    } catch (...) {
+        first = std::current_exception();
+    }
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
     const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
     while (!inFlight.empty()) {
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
-        finish(std::move(batch), true, source);
+        try {
+            finish(std::move(batch), true, source);
+        } catch (...) {
+            if (first == nullptr) first = std::current_exception();
+        }
     }
     activeSyncSite = previousSite;
+    if (first != nullptr) std::rethrow_exception(first);
 }
 
 void Recorder::FlushDeferredReleases() {
