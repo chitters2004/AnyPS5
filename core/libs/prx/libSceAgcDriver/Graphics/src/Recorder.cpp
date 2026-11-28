@@ -5070,6 +5070,11 @@ void Recorder::Submit() {
     inFlightKeptBytes += batch->keptBytes;
     inFlight.back() = std::move(batch);
     releaseUnfilledSlot.inFlight = nullptr;
+    if (unfinished != nullptr) {
+        inFlight.back()->parked = std::move(unfinished);
+        inFlight.back()->parkedBytes = std::exchange(unfinishedBytes, 0);
+        inFlightKeptBytes += inFlight.back()->parkedBytes;
+    }
     const auto& submitted = *inFlight.back();
     {
         std::lock_guard lock(completedMutex);
@@ -5510,6 +5515,14 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     } finishingScope{*this, batch.get()};
     batch->nextFinishing = finishing;
     finishing = batch.get();
+    struct Completion {
+        Recorder& recorder;
+        std::unique_ptr<Batch>& batch;
+        bool proven;
+        ~Completion() {
+            if (!proven) recorder.parkUnfinished(std::move(batch));
+        }
+    } completion{*this, batch, !wait};
     if (wait) {
         // APS5_PROFILE_DRAW: how long the CPU waits for recorded GPU work, reported every 10 s.
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -5564,11 +5577,14 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
+        completion.proven = true;
         if (result != VK_SUCCESS) {
+            releaseParked(*batch);
             release(*batch);
             Check(result, fenceless ? "vkWaitSemaphoresKHR recorder" : "vkWaitForFences recorder");
         }
     }
+    releaseParked(*batch);
     readGpuTiming(*batch);
     readSamples(*batch);
     if (batch->serial != 0) {
@@ -5680,15 +5696,30 @@ void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
 }
 
 void Recorder::park(std::unique_ptr<Batch> batch) noexcept {
-    if (inFlight.empty() || inFlight.back()->serial <= batch->serial) return;
-    auto& host = *inFlight.back();
+    const bool carried = !inFlight.empty() && inFlight.back()->serial > batch->serial;
+    if (!carried && batch->serial == 0 && unfinished == nullptr) return;
     const auto bytes = batch->keptBytes + batch->parkedBytes;
     auto* tail = batch.get();
     while (tail->parked != nullptr) tail = tail->parked.get();
-    tail->parked = std::move(host.parked);
-    host.parked = std::move(batch);
-    host.parkedBytes += bytes;
-    inFlightKeptBytes += bytes;
+    auto& chain = carried ? inFlight.back()->parked : unfinished;
+    tail->parked = std::move(chain);
+    chain = std::move(batch);
+    if (carried) {
+        inFlight.back()->parkedBytes += bytes;
+        inFlightKeptBytes += bytes;
+    } else {
+        unfinishedBytes += bytes;
+    }
+}
+
+void Recorder::parkUnfinished(std::unique_ptr<Batch> batch) noexcept {
+    std::fprintf(stderr, "[recorder] no wait proved batch %llu complete; it is kept until a later batch completes\n", static_cast<unsigned long long>(batch->serial));
+    removeLabels(*batch);
+    park(std::move(batch));
+}
+
+void Recorder::releaseParked(Batch& batch) noexcept {
+    for (auto* parked = batch.parked.get(); parked != nullptr; parked = parked->parked.get()) release(*parked);
 }
 
 void Recorder::DestroyParkedChainForTest(std::size_t length) {
