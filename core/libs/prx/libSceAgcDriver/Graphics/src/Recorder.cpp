@@ -3723,13 +3723,8 @@ std::shared_ptr<DeviceBuffer> Recorder::UploadScratchBuffer(UploadScratch kind, 
 }
 
 void Recorder::ReserveRetention(std::size_t additional) {
-    ensureOpen();
-    if (additional > open->kept.max_size() - open->kept.size()) throw std::length_error("recorded owner count exceeds the batch capacity");
+    ReserveKept(additional);
     prepareRetention(additional);
-    const auto needed = open->kept.size() + additional;
-    if (needed <= open->kept.capacity()) return;
-    const auto grown = open->kept.capacity() <= open->kept.max_size() / 2 ? open->kept.capacity() * 2 : open->kept.max_size();
-    open->kept.reserve(std::max(needed, grown));
 }
 
 void Recorder::prepareRetention(std::size_t additional) {
@@ -3756,6 +3751,16 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     ensureOpen();
     open->kept.push_back(std::move(object));
     open->keptBytes += bytes;
+}
+
+void Recorder::ReserveKept(std::size_t objects) {
+    ensureOpen();
+    auto& kept = open->kept;
+    if (objects > kept.max_size() - kept.size()) throw std::length_error("recorded owner count exceeds the batch capacity");
+    const auto needed = kept.size() + objects;
+    if (needed <= kept.capacity()) return;
+    const auto grown = kept.capacity() <= kept.max_size() / 2 ? kept.capacity() * 2 : kept.max_size();
+    kept.reserve(std::max(needed, grown));
 }
 
 bool Recorder::KeepWithOutstanding(const std::shared_ptr<void>& object) noexcept {

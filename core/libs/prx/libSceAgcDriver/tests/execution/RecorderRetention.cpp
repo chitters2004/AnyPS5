@@ -13,6 +13,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -440,6 +441,31 @@ void NestedFinish(const Graphics::Context& context) {
     std::printf("a nested finish: the outer batch's writes stayed published through the inner finish\n");
 }
 
+void ReserveKeptLimits(const Graphics::Context& context) {
+    Graphics::Recorder recorder(context, true);
+    const auto first = KeepSentinel(recorder);
+    bool refused = false;
+    try {
+        recorder.ReserveKept(std::numeric_limits<std::size_t>::max());
+    } catch (const std::length_error&) {
+        refused = true;
+    }
+    if (!refused) Fail("ReserveKept accepted more objects than a batch can keep");
+    if (first.expired()) Fail("a refused ReserveKept released an object the batch kept");
+#ifdef APS5_AGC_ALLOCATION_COUNT
+    constexpr std::size_t reserved = 1000;
+    recorder.ReserveKept(reserved);
+    std::vector<std::shared_ptr<void>> objects;
+    for (std::size_t index = 0; index < reserved; ++index) objects.push_back(std::make_shared<int>(0));
+    BeginAllocationCount_nid_no_patch();
+    for (auto& object : objects) recorder.Keep(std::move(object));
+    const auto made = EndAllocationCount_nid_no_patch();
+    if (made != 0) Fail("keeping " + std::to_string(reserved) + " reserved objects made " + std::to_string(made) + " allocations");
+#endif
+    Drain(recorder, "ReserveKept");
+    std::printf("ReserveKept: refused an overflowing reservation; reserved keeps made no allocation\n");
+}
+
 }
 
 int main() {
@@ -453,6 +479,7 @@ int main() {
         Timed("in-flight growth", [&] { InFlightGrowth(context); });
         Timed("sync sweep", [&] { SyncSweep(probed); });
         Timed("nested finish", [&] { NestedFinish(context); });
+        Timed("reserve kept", [&] { ReserveKeptLimits(context); });
         for (const auto& failure : failures) std::cerr << failure << '\n';
         return failures.empty() ? 0 : 1;
     } catch (const std::exception& error) {
