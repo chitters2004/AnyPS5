@@ -914,6 +914,7 @@ struct HeldBatchResult {
     bool empty = false;
     bool parked = false;
     bool behindHeld = false;
+    bool drained = false;
     std::uint64_t released = 0;
 };
 
@@ -948,6 +949,7 @@ HeldBatchResult DiscardBehindHeldBatch(AgcDriver::VulkanDevice& device, const st
         return true;
     };
     bool timedOut = false;
+    std::weak_ptr<int> watch;
     std::jthread watchdog([&](std::stop_token stop) {
         for (int tick = 0; tick < 200 && !stop.stop_requested(); ++tick) std::this_thread::sleep_for(100ms);
         if (!stop.stop_requested() && release()) timedOut = true;
@@ -969,7 +971,7 @@ HeldBatchResult DiscardBehindHeldBatch(AgcDriver::VulkanDevice& device, const st
             AgcDriver::Graphics::DepthSurfaceView(context, Target(Plane(unrelated, VK_FORMAT_D16_UNORM)));
             result.released = AgcDriver::Graphics::DepthSurfacesReleased() - releasedBefore;
             auto sentinel = std::make_shared<int>(0);
-            const std::weak_ptr<int> watch = sentinel;
+            watch = sentinel;
             recorder->Keep(std::move(sentinel));
             result.behindHeld = recorder->InFlightBatches() != 0u;
             AgcDriver::Graphics::Recorder::FailNextSubmitsForTest(1);
@@ -1003,6 +1005,14 @@ HeldBatchResult DiscardBehindHeldBatch(AgcDriver::VulkanDevice& device, const st
     watchdog.join();
     result.waited = timedOut;
     device.WaitIdle();
+    if (result.checked) {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        if (auto* recorder = AgcDriver::Graphics::Recorder::Active(); recorder != nullptr && recorder->Device() == context.device) {
+            recorder->Sync();
+            recorder->FlushDeferredReleases();
+        }
+        result.drained = watch.expired();
+    }
     context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, hold, nullptr);
     return result;
 }
@@ -1015,6 +1025,7 @@ void RequireHeldBatch(const HeldBatchResult& result, const std::string& what) {
     if (!result.behindHeld) failures.push_back(what + ": no batch was in flight when the next one was discarded");
     if (!result.discarded) failures.push_back(what + ": the batch after the held one was not discarded by the injected submit failure");
     else if (!result.parked) failures.push_back(what + ": the discarded batch destroyed the objects it kept while the held batch was still pending");
+    if (!result.drained) failures.push_back(what + ": the objects kept by the discarded batch outlived the held batch's finish and the deferred releases");
     if (result.waited) failures.push_back(what + ": creating another surface waited for the held batch");
 }
 
@@ -1055,6 +1066,8 @@ void DiscardAllocationFailureCase(AgcDriver::VulkanDevice& device, std::uint8_t*
             break;
         }
         if (result.waited) failures.push_back(at + ": the discard waited for the held batch");
+        if (!result.behindHeld) failures.push_back(at + ": no batch was in flight when the next one was discarded");
+        if (!result.drained) failures.push_back(at + ": the objects kept by the discarded batch outlived the held batch's finish and the deferred releases");
         if (!result.discarded) continue;
         ++discards;
         if (!result.parked) failures.push_back(at + ": the discarded batch destroyed the objects it kept while the held batch was still pending");
