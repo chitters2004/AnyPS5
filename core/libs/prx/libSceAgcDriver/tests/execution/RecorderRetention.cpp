@@ -129,6 +129,43 @@ Outcome HeldSubmit(const Graphics::Context& context, std::size_t failAfter, bool
     return outcome;
 }
 
+void LongParkedChain(const Graphics::Context& context) {
+    constexpr std::size_t Discards = 200000;
+    const std::string what = "a batch held on the GPU with " + std::to_string(Discards) + " failed submits parked behind it, each keeping a zero-byte object";
+    Hold hold(context);
+    std::size_t destroyed = 0;
+    std::size_t discarded = 0;
+    std::size_t destroyedWhileHeld = 0;
+    {
+        Graphics::Recorder recorder(context, true);
+        recorder.Keep(std::make_shared<int>(0));
+        recorder.HoldNextSubmit(hold.semaphore, 1);
+        recorder.Submit();
+        Require(recorder.InFlightBatches() == 1u, what + ": the held batch is not in flight");
+        for (std::size_t index = 0; index < Discards; ++index) {
+            recorder.Keep(std::shared_ptr<int>(new int(0), [&destroyed](int* object) {
+                delete object;
+                ++destroyed;
+            }));
+            Graphics::Recorder::FailNextSubmitsForTest(1);
+            try {
+                recorder.Submit();
+            } catch (const std::runtime_error& error) {
+                if (std::strstr(error.what(), "injected failure") != nullptr && !recorder.Recording()) ++discarded;
+            }
+        }
+        Graphics::Recorder::FailNextSubmitsForTest(0);
+        destroyedWhileHeld = destroyed;
+        hold.Release();
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+    }
+    if (discarded != Discards) failures.push_back(what + ": " + std::to_string(discarded) + " submits were discarded");
+    if (destroyedWhileHeld != 0u) failures.push_back(what + ": " + std::to_string(destroyedWhileHeld) + " kept objects were destroyed while the batch was held");
+    if (destroyed != Discards) failures.push_back(what + ": " + std::to_string(destroyed) + " kept objects were destroyed once the held batch finished");
+    std::printf("%s: %zu discarded, %zu destroyed while held, %zu destroyed after it finished\n", what.c_str(), discarded, destroyedWhileHeld, destroyed);
+}
+
 void Sweep(const Graphics::Context& context, bool failSync) {
     const std::string what = failSync ? "a sync finishing a batch held on the GPU" : "a submit of a batch held on the GPU";
 #ifdef APS5_AGC_ALLOCATION_COUNT
@@ -162,6 +199,7 @@ int main() {
         const auto context = device->graphicsContext();
         Sweep(context, false);
         Sweep(context, true);
+        LongParkedChain(context);
         for (const auto& failure : failures) std::cerr << failure << '\n';
         return failures.empty() ? 0 : 1;
     } catch (const std::exception& error) {

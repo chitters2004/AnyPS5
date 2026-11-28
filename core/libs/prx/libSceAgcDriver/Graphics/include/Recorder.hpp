@@ -797,6 +797,9 @@ private:
     };
     static_assert(std::is_nothrow_move_constructible_v<SampleSegment> && std::is_nothrow_move_assignable_v<SampleSegment>);
     struct Batch {
+        ~Batch() {
+            for (auto next = std::move(parked); next != nullptr;) next = std::move(next->parked);
+        }
         std::uint64_t sampleBatch = 0;
         std::vector<SampleSegment> foldedSamples;
         VkCommandBuffer commands = VK_NULL_HANDLE;
