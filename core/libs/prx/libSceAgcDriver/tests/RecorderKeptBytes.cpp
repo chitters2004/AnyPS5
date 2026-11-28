@@ -367,6 +367,7 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
     bool completed = false;
     bool earlierCompleted = false;
     bool earlierWrittenBack = false;
+    std::weak_ptr<int> released;
     {
         Recorder recorder(mockContext());
         recorder.Activate();
@@ -379,7 +380,7 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
             Expect(!mock.lostSubmissionPending, "kept resources were destroyed before the lost submission finished");
             delete object;
         });
-        std::weak_ptr<int> released = kept;
+        released = kept;
         if (budgetedKeep) {
             recorder.Keep(kept, Budget);
         } else {
@@ -403,9 +404,9 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
             failed = std::string_view(error.what()).find(operation) != std::string_view::npos;
         }
         Expect(failed, "submission did not report its Vulkan failure");
-        Expect(released.expired() && !completed, "a failed batch retained objects or ran its completions");
-        Expect(!recorder.Recording() && recorder.Submissions() == 1 && recorder.InFlightBatches() == 1 && recorder.InFlightKeptBytes() == 17,
-            "the failed batch changed the earlier in-flight submission");
+        Expect(!released.expired() && !completed, "a failed batch released its objects before the earlier submission completed, or ran its completions");
+        Expect(!recorder.Recording() && recorder.Submissions() == 1 && recorder.InFlightBatches() == 1 && recorder.InFlightKeptBytes() == 17 + Budget,
+            "the failed batch changed the earlier in-flight submission, or its objects were not counted in flight on it");
         Expect(recorder.PendingLabels() == 1 && recorder.PendingLabelIn(address, 4), "a failed batch retained labels or removed the earlier batch's label");
         Expect(!recorder.PendingLabelIn(address + 8, 4) && !recorder.PendingLabelIn(address + 16, Recorder::LabelTableBytes + 4),
             "a failed batch retained a narrow or wide label");
@@ -421,10 +422,12 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
         recorder.Sync();
         Expect(recorder.Idle() && !completed && earlierCompleted && earlierWrittenBack,
             "sync ran the failed batch's completions or lost the earlier batch's completions");
+        Expect(recorder.InFlightKeptBytes() == 0, "the failed batch's objects stayed counted in flight after the earlier batch's completion");
         Expect(Recorder::PendingCompletionLabels() == 0 && Recorder::PendingWriteBackCompletions() == 0,
             "sync left stale completion counts after submission failure");
     }
     Expect(mock.signaled.empty() && mock.allocatedCommands == mock.freedCommands, "a failed submission leaked its fence or command buffer");
+    Expect(released.expired(), "the failed batch's objects outlived its recorder");
 }
 
 }
