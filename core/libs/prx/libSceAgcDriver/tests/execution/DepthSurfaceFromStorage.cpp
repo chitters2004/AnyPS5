@@ -448,7 +448,7 @@ void AllocationFailureCase(AgcDriver::VulkanDevice& device, const DepthFastClear
 }
 
 void MultisampleAbortCase(AgcDriver::VulkanDevice& device, std::uint8_t* plane) {
-    const std::string what = "a new 4-sample D32 depth surface over uneven samples, imported by a draw, whose bind failed at its n-th allocation and every one after it, counted after a first bind, then bound again";
+    const std::string what = "a new 4-sample D32 depth surface over uneven samples, imported by a draw over a single-sample D32 owner of its plane, whose bind failed at its n-th allocation and every one after it, counted after a first bind, then bound again";
 #ifdef APS5_AGC_ALLOCATION_COUNT
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     if (!context.sampleRateShading || !context.storageImageMultisample || !context.storageImageWriteWithoutFormat) {
@@ -458,55 +458,92 @@ void MultisampleAbortCase(AgcDriver::VulkanDevice& device, std::uint8_t* plane) 
     constexpr VkExtent2D extent{64, 32};
     AgcDriver::Graphics::DepthTarget target{Address(plane), 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0, 0, false, 4};
     target.depthSwizzle = ZSwizzle();
+    auto previous = target;
+    previous.samples = 1;
     const auto bytes = static_cast<std::size_t>(AgcDriver::Graphics::MultisampledDepthBytes_nid_no_patch(extent, 4u, 4u));
     Require(bytes <= PlaneBytes, "the 4-sample D32 depth plane does not fit one plane");
     if (!AgcDriver::GuestMemory::Watched(target.address, bytes)) {
         skipped.push_back(what + ": the plane is not write-watched here, so its samples are not imported");
         return;
     }
+    std::vector<std::uint8_t> samples(bytes);
     for (std::size_t offset = 0; offset < bytes; offset += sizeof(float)) {
         const float depth = 0.25f + static_cast<float>(offset / sizeof(float) % 4u) / 8.0f;
-        std::memcpy(plane + offset, &depth, sizeof(depth));
+        std::memcpy(samples.data() + offset, &depth, sizeof(depth));
     }
+    std::memcpy(plane, samples.data(), bytes);
     std::size_t allocations = 0;
-    const auto bind = [&](std::optional<std::size_t> failAfter) {
-        bool bound = false;
+    const auto bind = [&](const AgcDriver::Graphics::DepthTarget& bound, std::optional<std::size_t> failAfter, bool count) {
+        bool viewed = false;
         {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             auto* recorder = AgcDriver::Graphics::Recorder::Active();
             if (recorder == nullptr || recorder->Device() != context.device) return std::optional<bool>{};
             if (failAfter) FailEveryAllocationAfter_nid_no_patch(*failAfter);
-            else BeginAllocationCount_nid_no_patch();
+            else if (count) BeginAllocationCount_nid_no_patch();
             try {
-                bound = AgcDriver::Graphics::DepthSurfaceView(context, target) != VK_NULL_HANDLE;
+                viewed = AgcDriver::Graphics::DepthSurfaceView(context, bound) != VK_NULL_HANDLE;
             } catch (const std::exception&) {
             }
             if (failAfter) StopAllocationFailures_nid_no_patch();
-            else allocations = EndAllocationCount_nid_no_patch();
+            else if (count) allocations = EndAllocationCount_nid_no_patch();
             recorder->Submit();
         }
         device.WaitIdle();
-        AgcDriver::Graphics::ClearDepthSurfaces(context.device);
-        return std::optional<bool>{bound};
+        return std::optional<bool>{viewed};
     };
-    device.WaitIdle();
-    AgcDriver::Graphics::ClearDepthSurfaces(context.device);
-    const auto clean = bind(std::nullopt);
+    const auto bindPrevious = [&] {
+        device.WaitIdle();
+        AgcDriver::Graphics::ClearDepthSurfaces(context.device);
+        return bind(previous, std::nullopt, false);
+    };
+    const auto requireBound = [&](const std::string& at) {
+        if (AgcDriver::Graphics::DepthSurfaceImageForTest(context.device, target) == VK_NULL_HANDLE) failures.push_back(at + ": the 4-sample surface is not the plane's owner");
+        if (AgcDriver::Graphics::DepthSurfaceImageForTest(context.device, previous) != VK_NULL_HANDLE) failures.push_back(at + ": the single-sample owner of the plane survived the 4-sample bind");
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            AgcDriver::Graphics::NoteDepthSurfaceWrite(context, target);
+        }
+        AgcDriver::Graphics::RequireNoResidentDepthRead_nid_no_patch(target.address, bytes);
+        device.WaitIdle();
+        if (std::memcmp(plane, samples.data(), bytes) != 0) failures.push_back(at + ": the 4-sample surface did not hold the guest plane's samples");
+    };
+    const auto requireAborted = [&](const std::string& at) {
+        if (AgcDriver::Graphics::DepthSurfaceImageForTest(context.device, target) != VK_NULL_HANDLE) failures.push_back(at + ": the failed bind left its candidate as the plane's owner");
+        if (AgcDriver::Graphics::ResidentDepthGuardOverlaps_nid_no_patch(target.address, bytes)) failures.push_back(at + ": the failed bind left a guard over the plane");
+        if (AgcDriver::Graphics::DepthSurfaceImageForTest(context.device, previous) == VK_NULL_HANDLE) failures.push_back(at + ": the failed bind retired the single-sample owner of the plane");
+        const auto owners = AgcDriver::Graphics::ResidentDepthOwnersOver(target.address, bytes, false);
+        if (owners != 1u) failures.push_back(at + ": the failed bind left " + std::to_string(owners) + " owners over the plane, not the single-sample one");
+    };
+    const auto clean = bindPrevious();
     if (!clean) {
         skipped.push_back(what + ": no active recorder holds the import draw");
         return;
     }
-    if (!*clean) failures.push_back(what + ": the bind failed with no allocation failure");
-    std::size_t aborted = 0;
+    if (!*clean || AgcDriver::Graphics::DepthSurfaceImageForTest(context.device, previous) == VK_NULL_HANDLE) failures.push_back(what + ": the single-sample owner of the plane was not bound");
+    if (*bind(target, std::nullopt, true)) requireBound(what + ", with no allocation failing");
+    else failures.push_back(what + ": the bind failed with no allocation failure");
     const auto counted = allocations;
+    std::size_t aborted = 0;
     for (std::size_t failAfter = 0; failAfter < counted; ++failAfter) {
-        if (*bind(failAfter)) continue;
+        const auto at = what + ", failing from allocation " + std::to_string(failAfter);
+        if (!*bindPrevious()) {
+            failures.push_back(at + ": the single-sample owner of the plane was not bound");
+            continue;
+        }
+        if (*bind(target, failAfter, false)) {
+            requireBound(at);
+            continue;
+        }
         ++aborted;
-        if (!*bind(std::nullopt)) failures.push_back(what + ": the bind after an abort at allocation " + std::to_string(failAfter) + " failed");
+        requireAborted(at);
+        if (*bind(target, std::nullopt, false)) requireBound(at + ", bound again");
+        else failures.push_back(at + ": the bind again failed");
     }
-    allocations = counted;
+    device.WaitIdle();
+    AgcDriver::Graphics::ClearDepthSurfaces(context.device);
     if (aborted == 0u) failures.push_back(what + ": no failed allocation left the bind");
-    std::printf("%s: %zu of %zu allocations aborted the bind when they failed\n", what.c_str(), aborted, allocations);
+    std::printf("%s: %zu of %zu allocations aborted the bind when they failed\n", what.c_str(), aborted, counted);
 #else
     static_cast<void>(device);
     static_cast<void>(plane);
