@@ -507,6 +507,33 @@ void FailedWait(Mode mode, VkResult result) {
     ExpectNoLeaks(mode);
 }
 
+void UnprovenAtTeardown(Mode mode) {
+    Begin(mode);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    {
+        const auto recorder = Make(mode);
+        Batch(*recorder, 0);
+        mock.waitResult = VK_ERROR_OUT_OF_HOST_MEMORY;
+        mock.idleResult = VK_ERROR_OUT_OF_HOST_MEMORY;
+        bool failed = false;
+        try {
+            recorder->Sync();
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        Expect(mode, failed && recorder->InFlightBatches() == 0, "a wait and an idle that both failed did not report the failure");
+        mock.waitResult = VK_SUCCESS;
+        mock.idleResult = VK_SUCCESS;
+    }
+    bool completed = true;
+    {
+        std::lock_guard lock(mockLock);
+        for (const auto& entry : mock.queue) completed = completed && entry.done;
+    }
+    Expect(mode, completed, "the recorder's teardown released a batch no wait proved complete without waiting for it");
+    ExpectNoLeaks(mode);
+}
+
 void FailedPoll(Mode mode) {
     Begin(mode);
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -621,6 +648,7 @@ int main() {
             SubmitFailure(mode);
             FailedWait(mode, VK_ERROR_DEVICE_LOST);
             FailedWait(mode, VK_ERROR_OUT_OF_HOST_MEMORY);
+            UnprovenAtTeardown(mode);
             FailedPoll(mode);
         }
         TimelineCreationFails();
