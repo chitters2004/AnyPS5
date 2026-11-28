@@ -2026,6 +2026,7 @@ bool Recorder::joinsRun(std::uint32_t queueKey, std::span<const void* const> own
 
 VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner, std::span<const RunAccess> accesses, bool& inRun, VkAccessFlags* coveredAccess) {
     GuestMemory::AssertGpuLockHeld("Recorder::RunCommands");
+    ++recordings;
     inRun = joinsRun(queueKey, std::span(&owner, 1), accesses);
     if (!inRun) return Commands(coveredAccess);
     if (coveredAccess != nullptr) *coveredAccess = 0;
@@ -2046,6 +2047,7 @@ bool Recorder::CloseRunOwing(const void* owner) {
 
 VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses, VkAccessFlags* coveredAccess, bool& overlapped) {
     GuestMemory::AssertGpuLockHeld("Recorder::OverlapCommands");
+    ++recordings;
     overlapped = joinsRun(queueKey, owners, accesses);
     if (!overlapped) return Commands(coveredAccess);
     if (coveredAccess != nullptr) *coveredAccess = 0;
@@ -2099,6 +2101,7 @@ std::uint64_t Recorder::ReapsWithWork() {
 }
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+    ++recordings;
     ensureOpen();
     flushDeferredDispatch();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
@@ -2116,6 +2119,7 @@ void Recorder::MarkCovered(VkAccessFlags access) {
 }
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, bool secondaryContents) {
+    ++recordings;
     ensureOpen();
     flushDeferredDispatch();
     auto& pass = open->renderPass;
@@ -2278,7 +2282,6 @@ void Recorder::recordKeyStores(bool forWriter) {
 
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
-    ++recordings;
     if (open == nullptr) {
         if (const auto failure = fatalFailure()) std::rethrow_exception(failure);
         ++passGeneration;
@@ -2344,6 +2347,7 @@ void Recorder::ensureOpen() {
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
+    ++recordings;
     ensureOpen();
     flushDeferredDispatch();
     auto& run = open->run;
