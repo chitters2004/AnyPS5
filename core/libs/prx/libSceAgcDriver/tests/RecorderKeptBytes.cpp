@@ -403,9 +403,9 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
             failed = std::string_view(error.what()).find(operation) != std::string_view::npos;
         }
         Expect(failed, "submission did not report its Vulkan failure");
-        Expect(released.expired() && !completed, "a failed batch retained objects or ran its completions");
-        Expect(!recorder.Recording() && recorder.Submissions() == 1 && recorder.InFlightBatches() == 1 && recorder.InFlightKeptBytes() == 17,
-            "the failed batch changed the earlier in-flight submission");
+        Expect(!released.expired() && !completed, "a failed batch released its objects before the earlier submission completed, or ran its completions");
+        Expect(!recorder.Recording() && recorder.Submissions() == 1 && recorder.InFlightBatches() == 1 && recorder.InFlightKeptBytes() == 17 + Budget,
+            "the failed batch changed the earlier in-flight submission, or its objects were not counted in flight on it");
         Expect(recorder.PendingLabels() == 1 && recorder.PendingLabelIn(address, 4), "a failed batch retained labels or removed the earlier batch's label");
         Expect(!recorder.PendingLabelIn(address + 8, 4) && !recorder.PendingLabelIn(address + 16, Recorder::LabelTableBytes + 4),
             "a failed batch retained a narrow or wide label");
@@ -419,8 +419,10 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
         mock.lostSubmissionPending = false;
         mock.endResult = mock.submitResult = VK_SUCCESS;
         recorder.Sync();
+        recorder.FlushDeferredReleases();
         Expect(recorder.Idle() && !completed && earlierCompleted && earlierWrittenBack,
             "sync ran the failed batch's completions or lost the earlier batch's completions");
+        Expect(released.expired() && recorder.InFlightKeptBytes() == 0, "the failed batch's objects outlived the earlier batch's completion");
         Expect(Recorder::PendingCompletionLabels() == 0 && Recorder::PendingWriteBackCompletions() == 0,
             "sync left stale completion counts after submission failure");
     }

@@ -371,9 +371,11 @@ HoldCounters holdCounters;
 // cannot grow behind a release thread that falls behind.
 // APS5_RELEASE_UNDER_LOCK=1 destroys them in finish() as before; APS5_RELEASE_ON_UNLOCK=1 destroys
 // them on the unlocking thread (no release thread).
+using ParkedBatches = std::unique_ptr<void, void (*)(void*)>;
 struct DeferredBatch {
     std::vector<std::shared_ptr<void>> kept;
     std::vector<std::function<void()>> completions;
+    ParkedBatches parked{nullptr, nullptr};
 };
 struct DeferredBatchesTag {};
 auto& DeferredBatches() { return HostThreadLocal<std::vector<DeferredBatch>, DeferredBatchesTag>(); }
@@ -423,6 +425,7 @@ void DestroyDeferred(std::vector<DeferredBatch> releasing, bool onThread) {
         // The completions first (their captures hold some of the objects), then the objects.
         batch.completions.clear();
         batch.kept.clear();
+        batch.parked.reset();
         deferredPending.fetch_sub(1, std::memory_order_acq_rel);
     }
     releasing.clear();
@@ -5476,7 +5479,7 @@ bool Recorder::Reap() {
 }
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
-    inFlightKeptBytes -= batch->keptBytes;
+    inFlightKeptBytes -= batch->keptBytes + batch->parkedBytes;
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;
@@ -5618,19 +5621,21 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     if (releaseNow || ReleaseUnderLock() || !GuestMemory::GpuMutex().HeldByThisThread()) {
         batch->completions.clear();
         batch->kept.clear();
+        batch->parked.reset();
     } else {
         // To this thread's unlock (see ReleaseDeferredKeeps); the completions go with the objects,
         // their captures hold the same ones. The push comes first: a failed one (the list's growth)
         // destroys the batch's objects here, under the mutex, counts nothing the destructor would
         // wait for and must not escape (the rest of finish() releases the fence and command buffer).
         try {
-            DeferredBatches().push_back({std::move(batch->kept), std::move(batch->completions)});
+            DeferredBatches().push_back({std::move(batch->kept), std::move(batch->completions), ParkedBatches{batch->parked.release(), [](void* parked) { delete static_cast<Batch*>(parked); }}});
             deferredPending.fetch_add(1, std::memory_order_acq_rel);
-            DeferredBytes() += batch->keptBytes;
+            DeferredBytes() += batch->keptBytes + batch->parkedBytes;
         } catch (...) {
         }
         batch->completions.clear();
         batch->kept.clear();
+        batch->parked.reset();
     }
     if (profile) {
         const auto now = std::chrono::steady_clock::now();
@@ -5670,6 +5675,28 @@ void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
     try {
         publishPendingWrites();
     } catch (...) {
+    }
+    park(std::move(batch));
+}
+
+void Recorder::park(std::unique_ptr<Batch> batch) noexcept {
+    if (inFlight.empty() || inFlight.back()->serial <= batch->serial) return;
+    auto& host = *inFlight.back();
+    const auto bytes = batch->keptBytes + batch->parkedBytes;
+    auto* tail = batch.get();
+    while (tail->parked != nullptr) tail = tail->parked.get();
+    tail->parked = std::move(host.parked);
+    host.parked = std::move(batch);
+    host.parkedBytes += bytes;
+    inFlightKeptBytes += bytes;
+}
+
+void Recorder::DestroyParkedChainForTest(std::size_t length) {
+    auto head = std::make_unique<Batch>();
+    for (std::size_t index = 1; index < length; ++index) {
+        auto next = std::make_unique<Batch>();
+        next->parked = std::move(head);
+        head = std::move(next);
     }
 }
 
