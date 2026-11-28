@@ -1075,6 +1075,8 @@ private:
     void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
     void discard(std::unique_ptr<Batch> batch) noexcept;
     void park(std::unique_ptr<Batch> batch) noexcept;
+    void parkUnfinished(std::unique_ptr<Batch> batch) noexcept;
+    void releaseParked(Batch& batch) noexcept;
     void removeLabels(Batch& batch);
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
@@ -1155,6 +1157,8 @@ private:
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;
+    std::unique_ptr<Batch> unfinished;
+    std::size_t unfinishedBytes = 0;
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     Batch* finishing = nullptr;
