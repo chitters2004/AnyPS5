@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "ShaderDiskCache.hpp"
@@ -455,6 +456,7 @@ void Driver::CheckFailure() {
 
 void Driver::ReportFailure(std::exception_ptr error) {
     require(error != nullptr, "null asynchronous failure");
+    Graphics::Recorder::FailAll(error);
     bool first = false;
     {
         std::lock_guard lock(mutex);

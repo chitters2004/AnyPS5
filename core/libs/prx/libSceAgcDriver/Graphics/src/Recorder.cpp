@@ -1395,7 +1395,16 @@ struct Recorder::ProgressWatcher {
     }
 };
 
+namespace {
+
+std::atomic<std::uint64_t> fatalFailures{0};
+std::mutex fatalFailureMutex;
+std::exception_ptr fatalFailureReason;
+
+}
+
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
+    fatalFailuresSeen = fatalFailures.load(std::memory_order_acquire);
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -1992,7 +2001,10 @@ void Recorder::flushDeferredDispatch() {
             if (failure == nullptr) failure = std::current_exception();
         }
     }
-    if (failure != nullptr) std::rethrow_exception(failure);
+    if (failure != nullptr) {
+        FailOpen();
+        std::rethrow_exception(failure);
+    }
 }
 
 bool Recorder::runConflict(std::span<const RunAccess> accesses) const {
@@ -2168,7 +2180,14 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
         recordBarrier(open->commands, PassEndBarrier.srcStage, PassEndBarrier.dstStage, PassEndBarrier.srcAccess, PassEndBarrier.dstAccess);
         CountBarriers(CommandClass::Draw);
     }
-    if (pass.afterPass) pass.afterPass(open->graphicsState);
+    if (pass.afterPass) {
+        try {
+            pass.afterPass(open->graphicsState);
+        } catch (...) {
+            FailOpen();
+            throw;
+        }
+    }
     EndGpuTiming(pass.timing);
     open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0;
     open->hostReadOwed = true;
@@ -2184,7 +2203,10 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
             if (failure == nullptr) failure = std::current_exception();
         }
     }
-    if (failure != nullptr) std::rethrow_exception(failure);
+    if (failure != nullptr) {
+        FailOpen();
+        std::rethrow_exception(failure);
+    }
 }
 
 void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end) {
@@ -2256,7 +2278,9 @@ void Recorder::recordKeyStores(bool forWriter) {
 
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
+    ++recordings;
     if (open == nullptr) {
+        if (const auto failure = fatalFailure()) std::rethrow_exception(failure);
         ++passGeneration;
         auto batch = std::make_unique<Batch>();
         batch->sampleBatch = ++sampleBatches;
@@ -4961,11 +4985,17 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
-    if (open->failure != nullptr) {
-        const auto reason = open->failure;
-        discard(std::move(open));
-        std::rethrow_exception(reason);
+    if (const auto failure = fatalFailure()) {
+        FailOpen();
+        std::rethrow_exception(failure);
     }
+    struct FailOpenOnThrow {
+        Recorder& recorder;
+        bool finalized = false;
+        ~FailOpenOnThrow() {
+            if (!finalized) recorder.FailOpen();
+        }
+    } failOpenOnThrow{*this};
     flushDeferredDispatch();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass(PassBreak::NewBatch);
@@ -4993,6 +5023,7 @@ void Recorder::Submit() {
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
         for (const auto& [begin, end] : notedReads(*open)) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, end - begin));
     }
+    failOpenOnThrow.finalized = true;
     auto batch = std::move(open);
     struct DiscardUnsubmitted {
         Recorder& recorder;
@@ -5079,8 +5110,22 @@ void Recorder::Submit() {
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
 }
 
-void Recorder::FailOpen(std::exception_ptr reason) noexcept {
-    if (open != nullptr && open->failure == nullptr) open->failure = std::move(reason);
+void Recorder::FailOpen() noexcept {
+    if (open != nullptr) discard(std::move(open));
+}
+
+void Recorder::FailAll(std::exception_ptr reason) noexcept {
+    {
+        std::lock_guard lock(fatalFailureMutex);
+        fatalFailureReason = std::move(reason);
+    }
+    fatalFailures.fetch_add(1, std::memory_order_release);
+}
+
+std::exception_ptr Recorder::fatalFailure() const {
+    if (fatalFailures.load(std::memory_order_acquire) == fatalFailuresSeen) return nullptr;
+    std::lock_guard lock(fatalFailureMutex);
+    return fatalFailureReason;
 }
 
 std::uint64_t Recorder::SubmitAndEpoch() {
@@ -5179,7 +5224,12 @@ void Recorder::Sync() {
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
-    Submit();
+    std::exception_ptr failure;
+    try {
+        Submit();
+    } catch (...) {
+        failure = std::current_exception();
+    }
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
     const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
@@ -5189,6 +5239,7 @@ void Recorder::Sync() {
         finish(std::move(batch), true, source);
     }
     activeSyncSite = previousSite;
+    if (failure != nullptr) std::rethrow_exception(failure);
 }
 
 void Recorder::FlushDeferredReleases() {

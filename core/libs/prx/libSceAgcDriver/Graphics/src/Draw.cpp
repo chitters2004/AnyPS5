@@ -5141,7 +5141,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 }
 
 void failOpenBatch(const Context& context) noexcept {
-    if (context.recorder != nullptr) context.recorder->FailOpen(std::current_exception());
+    if (context.recorder != nullptr) context.recorder->FailOpen();
 }
 
 }
