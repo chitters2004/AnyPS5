@@ -4226,16 +4226,7 @@ void CopyToGuestBytes(void* destination, const void* source, std::size_t bytes) 
 }
 
 bool GuestBytesEqual(const void* guest, const void* expected, std::size_t bytes) {
-    const auto* from = static_cast<const unsigned char*>(guest);
-    const auto* other = static_cast<const unsigned char*>(expected);
-    return WalkGuestBytes(
-        guest, bytes,
-        [&](std::size_t index) { return __atomic_load_n(from + index, __ATOMIC_RELAXED) == other[index]; },
-        [&](std::size_t index) {
-            std::uint64_t wanted = 0;
-            std::memcpy(&wanted, other + index, sizeof(wanted));
-            return __atomic_load_n(reinterpret_cast<const std::uint64_t*>(from + index), __ATOMIC_RELAXED) == wanted;
-        });
+    return std::memcmp(guest, expected, bytes) == 0;
 }
 #else
 void CopyGuestBytes(void* destination, const void* source, std::size_t bytes) {
