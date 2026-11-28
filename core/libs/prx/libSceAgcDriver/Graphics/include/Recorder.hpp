@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <array>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <functional>
 #include <list>
@@ -377,6 +378,10 @@ public:
     std::optional<PendingWriteInfo> DescribePendingWrite(std::uint64_t address, std::size_t bytes) const;
     // Ends and submits the open batch without waiting.
     void Submit();
+    void DiscardOpen() noexcept;
+    void ReportFailure(std::exception_ptr error) noexcept;
+    std::exception_ptr Failure() const;
+    std::uint64_t BatchChanges() const { return batchChanges; }
     void HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value);
     bool SubmitHeld() const;
     // Submits the open batch and returns the serial of the newest submitted batch (0 when nothing was
@@ -1042,6 +1047,11 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
+    Batch& keptBatch();
+    void awaitInFlight() noexcept;
+    void noteChange();
+    [[noreturn]] void refuseAfterFailure();
+    static void discardUnwound() noexcept;
     void flushDeferredDispatch();
     bool runConflict(std::span<const RunAccess> accesses) const;
     bool joinsRun(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses) const;
@@ -1103,6 +1113,7 @@ private:
     Context context;
     VkSemaphore timeline = VK_NULL_HANDLE;
     bool fenceless = false;
+    bool finishedOnGpu = false;
     mutable std::uint64_t reachedSerial = 0;
     VkSemaphore submitHold = VK_NULL_HANDLE;
     std::uint64_t submitHoldValue = 0;
@@ -1150,6 +1161,11 @@ private:
     Batch* finishing = nullptr;
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
+    std::uint64_t batchChanges = 0;
+    std::uint64_t changedHold = 0;
+    std::atomic<bool> failed{false};
+    mutable AgcDriver::Mutex failureMutex;
+    std::exception_ptr failure;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;
