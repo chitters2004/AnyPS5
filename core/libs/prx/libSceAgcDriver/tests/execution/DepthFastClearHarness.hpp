@@ -42,6 +42,7 @@ struct Surface {
     std::uint32_t slice = 0;
     std::uint8_t clearStencil = 0;
     std::uint32_t swizzle = 0;
+    std::uint32_t pipeBankXor = 0;
 };
 
 struct DrawOptions {
@@ -54,6 +55,7 @@ struct DrawOptions {
     float maxDepth = 1.0f;
     bool depthBias = false;
     float depthBiasConstant = 0.0f;
+    bool depthOnly = false;
 };
 
 inline std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t stride, std::uint32_t count) {
@@ -111,7 +113,7 @@ inline Shaders Compile(AgcDriver::VulkanDevice& device, const void* vertices = T
     return shaders;
 }
 
-inline std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& compiled, const Surface& surface, const DrawOptions& options, VkExtent2D extent = {Width, Height}, std::span<std::byte> pixels = Pixels) {
+inline void Record(AgcDriver::VulkanDevice& device, const Shaders& compiled, const Surface& surface, const DrawOptions& options, VkExtent2D extent = {Width, Height}, std::span<std::byte> pixels = Pixels) {
     std::fill(pixels.begin(), pixels.end(), std::byte{0});
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
         {ShaderStage::Vertex, &compiled.vertex, 0},
@@ -125,6 +127,7 @@ inline std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& compil
     state.depth = AgcDriver::Graphics::DepthTarget{surface.depth, surface.stencil, extent, surface.format, 1.0f, surface.clearStencil, surface.htile, surface.htileStencil};
     state.depth->firstSlice = surface.slice;
     state.depth->depthSwizzle = surface.swizzle;
+    state.depth->pipeBankXor = surface.pipeBankXor;
     state.depthTest = options.depthTest;
     state.depthWrite = options.depthWrite;
     state.depthCompare = options.depthCompare;
@@ -142,9 +145,18 @@ inline std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& compil
     state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
+    if (options.depthOnly) {
+        state.colors.clear();
+        state.blends.clear();
+        state.hasColorTarget = false;
+    }
     state.blendConstants = {};
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangles().size()), 0, 1, 0, false};
     device.Draw(state, draw, shaders);
+}
+
+inline std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& compiled, const Surface& surface, const DrawOptions& options, VkExtent2D extent = {Width, Height}, std::span<std::byte> pixels = Pixels) {
+    Record(device, compiled, surface, options, extent, pixels);
     device.WaitIdle();
     std::uint32_t covered = 0;
     for (std::size_t pixel = 0; pixel < pixels.size() / 4u; ++pixel) {
