@@ -1,7 +1,7 @@
 #include "AllocationCounter.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <dlfcn.h>
 #include <new>
 
@@ -9,9 +9,17 @@ namespace {
 
 thread_local std::size_t allocationsBeforeFailure = SIZE_MAX;
 
+const void* DriverModule() noexcept {
+    static const void* const base = [] {
+        Dl_info module{};
+        return dladdr(reinterpret_cast<const void*>(&AgcDriver::Graphics::Recorder::Active), &module) != 0 ? module.dli_fbase : nullptr;
+    }();
+    return base;
+}
+
 bool CalledFromDriver(const void* caller) noexcept {
     Dl_info module{};
-    return dladdr(caller, &module) != 0 && module.dli_fname != nullptr && std::strstr(module.dli_fname, "libSceAgcDriver") != nullptr;
+    return dladdr(caller, &module) != 0 && module.dli_fbase != nullptr && module.dli_fbase == DriverModule();
 }
 
 void* Allocate(std::size_t bytes, const void* caller) {

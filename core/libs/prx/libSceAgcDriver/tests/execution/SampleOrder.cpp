@@ -1441,54 +1441,59 @@ int RecipeDepthLocations(AgcDriver::VulkanDevice& device) {
 }
 
 #ifdef APS5_AGC_ALLOCATION_COUNT
-enum class InjectedFailure { Unreached, Thrown, Absorbed };
+enum class InjectedFailure { Unreached, Escaped, Absorbed };
 
-InjectedFailure DrawFailingAt(AgcDriver::VulkanDevice& device, const Context& context, Pass pass, std::size_t allocation, bool replay) {
+InjectedFailure DrawFailingAt(AgcDriver::VulkanDevice& device, const Context& context, Pass pass, std::size_t allocation, bool replay, std::string& reason) {
     const auto arm = [allocation] { FailAllocationsAfter_nid_no_patch(allocation); };
     if (replay) pass.beforeReplay = arm;
     else pass.beforeDraw = arm;
     try {
         Draw(device, context, pass);
-    } catch (const std::bad_alloc&) {
-        StopAllocationFailures_nid_no_patch();
-        return InjectedFailure::Thrown;
     } catch (...) {
         const bool fired = !AllocationFailurePending_nid_no_patch();
         StopAllocationFailures_nid_no_patch();
         if (!fired) throw;
-        return InjectedFailure::Absorbed;
+        try {
+            throw;
+        } catch (const std::exception& error) {
+            reason = error.what();
+        } catch (...) {
+            reason = "a non-standard exception";
+        }
+        return InjectedFailure::Escaped;
     }
     const bool fired = !AllocationFailurePending_nid_no_patch();
     StopAllocationFailures_nid_no_patch();
     return fired ? InjectedFailure::Absorbed : InjectedFailure::Unreached;
 }
 
-std::size_t FailEachAllocation(AgcDriver::VulkanDevice& device, const Context& context, const Pass& pass, bool replay, const std::string& what) {
+std::size_t SweepAllocationFailures(AgcDriver::VulkanDevice& device, const Context& context, const Pass& pass, bool replay, const std::string& what) {
     auto& recorder = *AgcDriver::Graphics::Recorder::Active();
     Draw(device, context, pass);
     Settle(device);
-    std::size_t thrown = 0;
+    std::size_t escaped = 0;
     for (std::size_t allocation = 0;; ++allocation) {
         Require(allocation < (std::size_t{1} << 16), what + ": the draw never ran out of allocations to fail");
-        const auto failure = DrawFailingAt(device, context, pass, allocation, replay);
+        std::string reason;
+        const auto failure = DrawFailingAt(device, context, pass, allocation, replay, reason);
         if (failure == InjectedFailure::Unreached) break;
-        if (failure == InjectedFailure::Thrown) {
-            ++thrown;
+        if (failure == InjectedFailure::Escaped) {
+            ++escaped;
             const auto submitted = recorder.Submissions();
             {
                 std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
                 try {
                     recorder.Sync();
-                } catch (const std::bad_alloc&) {
+                } catch (const std::exception&) {
                 }
             }
-            Require(recorder.Submissions() == submitted, what + ": the batch a draw was recording into when its allocation " + std::to_string(allocation) + " failed was submitted");
+            Require(recorder.Submissions() == submitted, what + ": the batch a draw was recording into when its allocation " + std::to_string(allocation) + " failed (" + reason + ") was submitted");
         }
         Settle(device);
     }
-    Require(thrown != 0, what + ": no failed allocation reached the caller");
-    std::printf("%s: %zu failed allocations threw out of the draw, and none of their batches was submitted\n", what.c_str(), thrown);
-    return thrown;
+    Require(escaped != 0, what + ": no failed allocation reached the caller");
+    std::printf("%s, stress sweep: %zu injected allocation failures escaped the draw, and none of their batches was submitted\n", what.c_str(), escaped);
+    return escaped;
 }
 
 int FailedDraws(AgcDriver::VulkanDevice& device) {
@@ -1521,7 +1526,7 @@ int FailedDraws(AgcDriver::VulkanDevice& device) {
     reordered.code = MaskCode(0u, 1u);
     reordered.shaderControl = 0x100u;
     reordered.order = order;
-    FailEachAllocation(device, context, reordered, false, std::to_string(*samples) + "x depth draw in the guest's sample order");
+    SweepAllocationFailures(device, context, reordered, false, std::to_string(*samples) + "x depth draw in the guest's sample order");
     if (std::getenv("APS5_DRAW_TRANSITIONS") != nullptr) {
         std::printf("a draw replayed from its recipe is not failed: draws recorded with APS5_DRAW_TRANSITIONS build no recipe\n");
         return 0;
@@ -1549,7 +1554,7 @@ int FailedDraws(AgcDriver::VulkanDevice& device) {
     slopes.vertexMemory = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(vertexBlock.Address()));
     slopes.beforeReplay = [] {};
     Draw(device, context, clearPass);
-    FailEachAllocation(device, context, slopes, true, "2x depth draw at custom sample locations replayed from its recipe");
+    SweepAllocationFailures(device, context, slopes, true, "2x depth draw at custom sample locations replayed from its recipe");
     return 0;
 }
 #else
