@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -67,6 +68,9 @@ struct MockDevice {
     VkResult waitResult = VK_SUCCESS;
     VkResult pollResult = VK_SUCCESS;
     VkResult idleResult = VK_SUCCESS;
+    std::string_view missingProc;
+    std::function<void()> onWait;
+    std::function<void()> onEndCommands;
 };
 
 MockDevice mock;
@@ -139,6 +143,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockGetFenceStatus(VkDevice, VkFence fence) {
 VKAPI_ATTR VkResult VKAPI_CALL mockWaitForFences(VkDevice, std::uint32_t, const VkFence* fences, VkBool32, std::uint64_t) {
     std::lock_guard lock(mockLock);
     ++mock.fenceWaits;
+    if (mock.onWait) mock.onWait();
     if (mock.waitResult != VK_SUCCESS) return mock.waitResult;
     const auto fence = fences[0];
     if (!mock.signaled.at(fence)) CompleteUntil([&](const Entry& entry) { return entry.fence == fence; });
@@ -183,6 +188,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockWaitSemaphores(VkDevice, const VkSemaphoreWai
     }
     std::lock_guard lock(mockLock);
     ++mock.semaphoreWaits;
+    if (mock.onWait) mock.onWait();
     if (mock.waitResult != VK_SUCCESS) return mock.waitResult;
     const auto target = info->pValues[0];
     if (mock.timelineValue < target) CompleteUntil([&](const Entry& entry) { return entry.signal >= target; });
@@ -194,6 +200,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockBeginCommandBuffer(VkCommandBuffer, const VkC
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockEndCommandBuffer(VkCommandBuffer) {
+    if (mock.onEndCommands) mock.onEndCommands();
     return VK_SUCCESS;
 }
 
@@ -255,6 +262,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
     };
+    if (!mock.missingProc.empty() && mock.missingProc == name) return nullptr;
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
 }
@@ -507,6 +515,68 @@ void FailedWait(Mode mode, VkResult result) {
     ExpectNoLeaks(mode);
 }
 
+void UnprovenAtTeardown(Mode mode) {
+    Begin(mode);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    {
+        const auto recorder = Make(mode);
+        Batch(*recorder, 0);
+        mock.waitResult = VK_ERROR_OUT_OF_HOST_MEMORY;
+        mock.idleResult = VK_ERROR_OUT_OF_HOST_MEMORY;
+        bool failed = false;
+        try {
+            recorder->Sync();
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        Expect(mode, failed && recorder->InFlightBatches() == 0, "a wait and an idle that both failed did not report the failure");
+        mock.waitResult = VK_SUCCESS;
+        mock.idleResult = VK_SUCCESS;
+    }
+    bool completed = true;
+    {
+        std::lock_guard lock(mockLock);
+        for (const auto& entry : mock.queue) completed = completed && entry.done;
+    }
+    Expect(mode, completed, "the recorder's teardown released a batch no wait proved complete without waiting for it");
+    ExpectNoLeaks(mode);
+}
+
+void HeldAtTeardown(Mode mode) {
+    Begin(mode);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    bool releasedEarly = false;
+    {
+        const auto recorder = Make(mode);
+        Batch(*recorder, 0);
+        recorder->Keep(std::shared_ptr<int>(new int(0), [&releasedEarly](int* kept) {
+            delete kept;
+            std::lock_guard lock(mockLock);
+            releasedEarly = mock.queue.size() < 2 || !mock.queue[1].done;
+        }));
+        Batch(*recorder, 1, true);
+        mock.onWait = [] {
+            for (auto& entry : mock.queue) entry.held = false;
+        };
+    }
+    mock.onWait = nullptr;
+    Expect(mode, !releasedEarly, "the recorder's teardown released a batch held on the GPU before a wait saw it complete");
+    ExpectNoLeaks(mode);
+}
+
+void FailedWaitAtTeardown(Mode mode) {
+    Begin(mode);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    {
+        const auto recorder = Make(mode);
+        Batch(*recorder, 0);
+        mock.waitResult = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    mock.waitResult = VK_SUCCESS;
+    Expect(mode, mock.idleWaits != 0, "a teardown whose wait failed did not fall back to a device idle wait");
+    ExpectNoLeaks(mode);
+}
+
 void FailedPoll(Mode mode) {
     Begin(mode);
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -521,6 +591,28 @@ void FailedPoll(Mode mode) {
         mock.pollResult = VK_SUCCESS;
         Expect(mode, Settled(*recorder, 1) && recorder->Reap() && recorder->Idle(), "the batches were not retired once their completion could be read");
     }
+    ExpectNoLeaks(mode);
+}
+
+void FailedConstruction() {
+    const auto mode = Mode::Fenceless;
+    Begin(mode);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    std::uint64_t next = 0;
+    {
+        const auto probe = Make(mode);
+        next = probe->Id() + 1;
+    }
+    mock.missingProc = "vkGetSemaphoreCounterValueKHR";
+    bool thrown = false;
+    try {
+        Recorder failed(mockContext(), true);
+    } catch (const std::runtime_error&) {
+        thrown = true;
+    }
+    mock.missingProc = {};
+    Expect(mode, thrown, "a recorder missing a timeline function was constructed");
+    Expect(mode, !Recorder::Alive(next), "a recorder whose construction failed stayed registered");
     ExpectNoLeaks(mode);
 }
 
@@ -621,8 +713,12 @@ int main() {
             SubmitFailure(mode);
             FailedWait(mode, VK_ERROR_DEVICE_LOST);
             FailedWait(mode, VK_ERROR_OUT_OF_HOST_MEMORY);
+            UnprovenAtTeardown(mode);
+            HeldAtTeardown(mode);
+            FailedWaitAtTeardown(mode);
             FailedPoll(mode);
         }
+        FailedConstruction();
         TimelineCreationFails();
         WalksAgree();
     } catch (const std::exception& error) {
