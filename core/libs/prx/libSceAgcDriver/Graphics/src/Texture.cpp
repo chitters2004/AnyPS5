@@ -65,6 +65,7 @@
 namespace AgcDriver::Graphics {
 
 OwnedImage::~OwnedImage() {
+    if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (allocation) allocation.Reset();
     else ReleaseImageMemory(context, memory, memoryBytes, memoryType);

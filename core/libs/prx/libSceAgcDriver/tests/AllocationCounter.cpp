@@ -11,6 +11,7 @@ struct AllocationHooks {
     bool counting = false;
     std::size_t counted = 0;
     std::size_t beforeFailure = SIZE_MAX;
+    bool persistent = false;
 };
 
 thread_local AllocationHooks hooks;
@@ -21,8 +22,10 @@ void rearm(AllocationHooks& state) noexcept {
 
 [[gnu::noinline]] void observe(AllocationHooks& state) {
     if (state.beforeFailure == 0) {
-        state.beforeFailure = SIZE_MAX;
-        rearm(state);
+        if (!state.persistent) {
+            state.beforeFailure = SIZE_MAX;
+            rearm(state);
+        }
         throw std::bad_alloc();
     }
     if (state.beforeFailure != SIZE_MAX) --state.beforeFailure;
@@ -51,11 +54,19 @@ extern "C" void AllocateForCount_nid_no_patch(std::size_t bytes) {
 
 extern "C" void FailAllocationsAfter_nid_no_patch(std::size_t allocations) noexcept {
     hooks.beforeFailure = allocations;
+    hooks.persistent = false;
+    rearm(hooks);
+}
+
+extern "C" void FailEveryAllocationAfter_nid_no_patch(std::size_t allocations) noexcept {
+    hooks.beforeFailure = allocations;
+    hooks.persistent = true;
     rearm(hooks);
 }
 
 extern "C" void StopAllocationFailures_nid_no_patch() noexcept {
     hooks.beforeFailure = SIZE_MAX;
+    hooks.persistent = false;
     rearm(hooks);
 }
 
