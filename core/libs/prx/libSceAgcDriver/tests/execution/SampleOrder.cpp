@@ -1532,6 +1532,7 @@ void RefusedDrawKeepsBatch(AgcDriver::VulkanDevice& device, const Context& conte
         recorder.Sync();
     }
     Require(recorder.Submissions() == submitted + 1, "the batch a refused draw left open was not submitted");
+    refused.beforeDraw = {};
     Draw(device, context, refused);
     Settle(device);
     std::puts("a draw refused before it records leaves the open batch, with the earlier draw, usable");
