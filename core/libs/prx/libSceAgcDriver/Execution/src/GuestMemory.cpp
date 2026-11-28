@@ -4209,20 +4209,7 @@ template <typename OnByte, typename OnWord>
 }
 
 void CopyToGuestBytes(void* destination, const void* source, std::size_t bytes) {
-    auto* to = static_cast<unsigned char*>(destination);
-    const auto* from = static_cast<const unsigned char*>(source);
-    WalkGuestBytes(
-        destination, bytes,
-        [&](std::size_t index) {
-            __atomic_store_n(to + index, from[index], __ATOMIC_RELAXED);
-            return true;
-        },
-        [&](std::size_t index) {
-            std::uint64_t word = 0;
-            std::memcpy(&word, from + index, sizeof(word));
-            __atomic_store_n(reinterpret_cast<std::uint64_t*>(to + index), word, __ATOMIC_RELAXED);
-            return true;
-        });
+    std::memcpy(destination, source, bytes);
 }
 
 bool GuestBytesEqual(const void* guest, const void* expected, std::size_t bytes) {
