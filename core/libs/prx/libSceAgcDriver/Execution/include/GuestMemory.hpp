@@ -246,6 +246,8 @@ public:
     // (Recorder::SyncThrough for the flush hook) gives up no caller's hold.
     std::uint32_t DepthOnThisThread() const;
     std::uint32_t Waiters() const { return waiters.load(std::memory_order_relaxed); }
+    std::uint64_t Hold() const { return hold; }
+    std::uint64_t NoteChange();
 
 private:
     void enter();
@@ -258,6 +260,9 @@ private:
     // reads the owner just to see that it is not itself.
     std::atomic<const void*> owner{nullptr};
     std::uint32_t depth = 0;
+    std::uint64_t hold = 0;
+    bool changed = false;
+    int unwindingAtChange = 0;
 };
 GpuMutexType& GpuMutex();
 std::function<bool()> YieldToGpuMutexWaiters(std::function<bool()> stop);
@@ -265,6 +270,7 @@ std::function<bool()> YieldToGpuMutexWaiters(std::function<bool()> stop);
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
+void SetGpuUnwindHook(void (*hook)());
 std::uint64_t GpuHoldSerial();
 // Debug aid (APS5_ASSERT_GPU_LOCK=1): aborts with a [lock] line naming `where` when the calling
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must

@@ -461,6 +461,7 @@ void Driver::ReportFailure(std::exception_ptr error) {
         first = !failure;
         if (first) failure = error;
         failed.store(true, std::memory_order_release);
+        device.ReportFailure(failure);
         {
             std::lock_guard tails(tailsMutex);
             unreadTails.clear();

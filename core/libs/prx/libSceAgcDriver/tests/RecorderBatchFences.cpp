@@ -577,6 +577,30 @@ void FailedWaitAtTeardown(Mode mode) {
     ExpectNoLeaks(mode);
 }
 
+void SubmitRace(Mode mode) {
+    Begin(mode);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    {
+        const auto recorder = Make(mode);
+        recorder->NotePendingWrite(Address(0), Length);
+        const auto submits = mock.submits;
+        mock.onEndCommands = [&recorder] {
+            std::thread reporter([&recorder] { recorder->ReportFailure(std::make_exception_ptr(std::runtime_error("injected driver failure"))); });
+            reporter.join();
+        };
+        std::string refusal;
+        try {
+            recorder->Submit();
+        } catch (const std::runtime_error& error) {
+            refusal = error.what();
+        }
+        mock.onEndCommands = nullptr;
+        Expect(mode, refusal == "injected driver failure", "a submit raced by a driver failure threw '" + refusal + "' instead of the failure");
+        Expect(mode, mock.submits == submits && !recorder->Recording(), "a submit raced by a driver failure reported from another thread reached the queue");
+    }
+    ExpectNoLeaks(mode);
+}
+
 void FailedPoll(Mode mode) {
     Begin(mode);
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -716,6 +740,7 @@ int main() {
             UnprovenAtTeardown(mode);
             HeldAtTeardown(mode);
             FailedWaitAtTeardown(mode);
+            SubmitRace(mode);
             FailedPoll(mode);
         }
         FailedConstruction();
