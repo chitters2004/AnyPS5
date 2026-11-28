@@ -22,6 +22,7 @@
 #include <exception>
 #include <iostream>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -148,6 +149,18 @@ Outcome RepeatsAreElidedUntilTheRangeChanges(AgcDriver::VulkanDevice& device, co
     Require(Fill(device, address, FillBytes, Zero, "a fill with another pattern") == Store::Recorded, "repeated fill elision: a fill with another pattern was elided");
     RequireFilled(guest, FillOffset, FillBytes, Zero, "the fill with another pattern");
     Require(Fill(device, address, FillBytes, Zero, "a repeat of the other pattern") == repeat, std::string("repeated fill elision: a repeat of the other pattern") + Unexpected(repeat));
+
+    bool discarded = false;
+    try {
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        Require(device.FillBuffer(address, FillBytes, Pattern), "repeated fill elision: the discarded fill was not stored on the GPU");
+        throw std::runtime_error("injected escape");
+    } catch (const std::runtime_error& error) {
+        discarded = std::string(error.what()) == "injected escape";
+    }
+    Require(discarded && !Graphics::Recorder::Active()->Recording(), "repeated fill elision: the fill an exception left the GPU mutex through was not discarded");
+    Require(Fill(device, address, FillBytes, Pattern, "the fill after a discarded one") == Store::Recorded, "repeated fill elision: the fill after a discarded fill of the same pattern was elided");
+    RequireFilled(guest, FillOffset, FillBytes, Pattern, "the fill after a discarded one");
 
     Require(Fill(device, address + 4096, 4096, Pattern, "a GPU store inside the range") == Store::Recorded, "repeated fill elision: a fill of another range was elided");
     Require(Fill(device, address, FillBytes, Zero, "the fill after a GPU store") == Store::Recorded, "repeated fill elision: the fill after a GPU store was elided");
