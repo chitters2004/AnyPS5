@@ -14,6 +14,7 @@
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include <cerrno>
+#include <exception>
 #include <unordered_set>
 #include <condition_variable>
 #include <mutex>
@@ -3738,7 +3739,8 @@ bool GpuMutexType::tryEnter() {
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
-        gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+        hold.store(gpuHoldSerial.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        changed.store(false, std::memory_order_relaxed);
         if (!proofThread) BreakProofs();
     }
 }
@@ -3765,10 +3767,23 @@ bool GpuMutexType::try_lock() {
 
 namespace {
 std::atomic<void (*)()> gpuUnlockHook{nullptr};
+std::atomic<void (*)()> gpuUnwindHook{nullptr};
 }
 
 void SetGpuUnlockHook(void (*hook)()) {
     gpuUnlockHook.store(hook, std::memory_order_release);
+}
+
+void SetGpuUnwindHook(void (*hook)()) {
+    gpuUnwindHook.store(hook, std::memory_order_release);
+}
+
+std::uint64_t GpuMutexType::NoteChange() {
+    if (!changed.load(std::memory_order_relaxed)) {
+        changed.store(true, std::memory_order_relaxed);
+        unwindingAtChange = std::uncaught_exceptions();
+    }
+    return hold.load(std::memory_order_relaxed);
 }
 
 std::uint64_t GpuHoldSerial() {
@@ -3776,6 +3791,12 @@ std::uint64_t GpuHoldSerial() {
 }
 
 void GpuMutexType::unlock() {
+    if (depth == 1 && changed.load(std::memory_order_relaxed)) {
+        changed.store(false, std::memory_order_relaxed);
+        if (std::uncaught_exceptions() > unwindingAtChange) {
+            if (auto* hook = gpuUnwindHook.load(std::memory_order_acquire); hook != nullptr) hook();
+        }
+    }
     const bool outermost = --depth == 0;
     if (outermost) {
         owner.store(nullptr, std::memory_order_relaxed);

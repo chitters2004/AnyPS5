@@ -114,6 +114,7 @@ public:
     // resize, device replacement, CPU fill fallback and APS5_DRAIN_ALL; the packet-loop drains use the
     // three-step form below so the GPU wait happens without the mutex.
     void WaitIdle();
+    void ReportFailure(std::exception_ptr error) noexcept;
     void PrepareForReplacement();
     void startJournalReplay();
     bool ImportGuestMemory(const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);

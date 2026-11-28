@@ -5,7 +5,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
 namespace AgcDriver::DriverDetail {
@@ -19,9 +21,12 @@ public:
     VulkanDevice* operator->() const;
     explicit operator bool() const;
     bool operator==(std::nullptr_t) const;
+    void ReportFailure(std::exception_ptr error) noexcept;
 
 private:
     AtomicSharedPtr<VulkanDevice> pointer;
+    AgcDriver::Mutex installMutex;
+    std::exception_ptr failure;
 };
 
 class DeviceUseGate {
