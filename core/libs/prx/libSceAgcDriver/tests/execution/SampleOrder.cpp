@@ -1441,10 +1441,15 @@ int RecipeDepthLocations(AgcDriver::VulkanDevice& device) {
 }
 
 #ifdef APS5_AGC_ALLOCATION_COUNT
-enum class InjectedFailure { Unreached, Escaped, Absorbed };
+enum class InjectedFailure { Unreached, EscapedBeforeRecording, EscapedAfterRecording, Absorbed };
 
 InjectedFailure DrawFailingAt(AgcDriver::VulkanDevice& device, const Context& context, Pass pass, std::size_t allocation, bool replay, std::string& reason) {
-    const auto arm = [allocation] { FailAllocationsAfter_nid_no_patch(allocation); };
+    auto& recorder = *AgcDriver::Graphics::Recorder::Active();
+    std::uint64_t recordings = 0;
+    const auto arm = [allocation, &recorder, &recordings] {
+        recordings = recorder.Recordings();
+        FailAllocationsAfter_nid_no_patch(allocation);
+    };
     if (replay) pass.beforeReplay = arm;
     else pass.beforeDraw = arm;
     try {
@@ -1460,7 +1465,7 @@ InjectedFailure DrawFailingAt(AgcDriver::VulkanDevice& device, const Context& co
         } catch (...) {
             reason = "a non-standard exception";
         }
-        return InjectedFailure::Escaped;
+        return recorder.Recordings() == recordings ? InjectedFailure::EscapedBeforeRecording : InjectedFailure::EscapedAfterRecording;
     }
     const bool fired = !AllocationFailurePending_nid_no_patch();
     StopAllocationFailures_nid_no_patch();
@@ -1471,14 +1476,15 @@ std::size_t SweepAllocationFailures(AgcDriver::VulkanDevice& device, const Conte
     auto& recorder = *AgcDriver::Graphics::Recorder::Active();
     Draw(device, context, pass);
     Settle(device);
-    std::size_t escaped = 0;
+    std::size_t afterRecording = 0;
+    std::size_t beforeRecording = 0;
     for (std::size_t allocation = 0;; ++allocation) {
         Require(allocation < (std::size_t{1} << 16), what + ": the draw never ran out of allocations to fail");
         std::string reason;
         const auto failure = DrawFailingAt(device, context, pass, allocation, replay, reason);
         if (failure == InjectedFailure::Unreached) break;
-        if (failure == InjectedFailure::Escaped) {
-            ++escaped;
+        if (failure == InjectedFailure::EscapedAfterRecording) {
+            ++afterRecording;
             const auto submitted = recorder.Submissions();
             {
                 std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -1488,12 +1494,47 @@ std::size_t SweepAllocationFailures(AgcDriver::VulkanDevice& device, const Conte
                 }
             }
             Require(recorder.Submissions() == submitted, what + ": the batch a draw was recording into when its allocation " + std::to_string(allocation) + " failed (" + reason + ") was submitted");
+        } else if (failure == InjectedFailure::EscapedBeforeRecording) {
+            ++beforeRecording;
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            recorder.Sync();
         }
         Settle(device);
     }
-    Require(escaped != 0, what + ": no failed allocation reached the caller");
-    std::printf("%s, stress sweep: %zu injected allocation failures escaped the draw, and none of their batches was submitted\n", what.c_str(), escaped);
-    return escaped;
+    Require(afterRecording != 0, what + ": no failed allocation reached the caller after the draw began recording");
+    std::printf("%s, stress sweep: %zu injected allocation failures escaped after the draw began recording, none of their batches submitted; %zu escaped before it recorded, their batches kept\n", what.c_str(), afterRecording, beforeRecording);
+    return afterRecording;
+}
+
+void RefusedDrawKeepsBatch(AgcDriver::VulkanDevice& device, const Context& context, const Pass& earlier, Pass refused) {
+    auto& recorder = *AgcDriver::Graphics::Recorder::Active();
+    Settle(device);
+    Draw(device, context, earlier);
+    Require(recorder.Recording(), "the earlier draw left no open batch");
+    const auto submitted = recorder.Submissions();
+    std::uint64_t recordings = 0;
+    refused.beforeDraw = [&recorder, &recordings] {
+        recordings = recorder.Recordings();
+        FailAllocationsAfter_nid_no_patch(0);
+    };
+    bool escaped = false;
+    try {
+        Draw(device, context, refused);
+    } catch (const std::bad_alloc&) {
+        escaped = true;
+    }
+    StopAllocationFailures_nid_no_patch();
+    Require(escaped, "a draw whose first allocation failed did not throw");
+    Require(recorder.Recordings() == recordings, "a draw whose first allocation failed had already begun recording");
+    Require(recorder.Recording(), "a draw refused before recording discarded the open batch");
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Sync();
+    }
+    Require(recorder.Submissions() == submitted + 1, "the batch a refused draw left open was not submitted");
+    Draw(device, context, refused);
+    Settle(device);
+    std::puts("a draw refused before it records leaves the open batch, with the earlier draw, usable");
 }
 
 int FailedDraws(AgcDriver::VulkanDevice& device) {
@@ -1526,6 +1567,7 @@ int FailedDraws(AgcDriver::VulkanDevice& device) {
     reordered.code = MaskCode(0u, 1u);
     reordered.shaderControl = 0x100u;
     reordered.order = order;
+    RefusedDrawKeepsBatch(device, context, reset, reordered);
     SweepAllocationFailures(device, context, reordered, false, std::to_string(*samples) + "x depth draw in the guest's sample order");
     if (std::getenv("APS5_DRAW_TRANSITIONS") != nullptr) {
         std::printf("a draw replayed from its recipe is not failed: draws recorded with APS5_DRAW_TRANSITIONS build no recipe\n");
