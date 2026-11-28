@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <array>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <functional>
 #include <list>
@@ -376,6 +377,7 @@ public:
     std::optional<PendingWriteInfo> DescribePendingWrite(std::uint64_t address, std::size_t bytes) const;
     // Ends and submits the open batch without waiting.
     void Submit();
+    void FailOpen(std::exception_ptr reason) noexcept;
     void HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value);
     bool SubmitHeld() const;
     // Submits the open batch and returns the serial of the newest submitted batch (0 when nothing was
@@ -807,6 +809,7 @@ private:
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::function<void()>> discards;
+        std::exception_ptr failure;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::uint64_t> stampedNotes;

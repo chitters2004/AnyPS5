@@ -4961,6 +4961,11 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    if (open->failure != nullptr) {
+        const auto reason = open->failure;
+        discard(std::move(open));
+        std::rethrow_exception(reason);
+    }
     flushDeferredDispatch();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass(PassBreak::NewBatch);
@@ -5072,6 +5077,10 @@ void Recorder::Submit() {
     inFlight.push_back(std::move(batch));
     inFlightKeptBytes += inFlight.back()->keptBytes;
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+}
+
+void Recorder::FailOpen(std::exception_ptr reason) noexcept {
+    if (open != nullptr && open->failure == nullptr) open->failure = std::move(reason);
 }
 
 std::uint64_t Recorder::SubmitAndEpoch() {
