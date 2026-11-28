@@ -246,6 +246,43 @@ void CheckHostStoresKeepCollectedPages() {
     VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+void CheckRefusedCollectPassesUncollectablePieces() {
+    auto& mappings = Mappings::Get();
+    const auto pages = Bytes / Small;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Bytes, nullptr);
+    HANDLE shared = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Bytes, nullptr);
+    auto* memory = static_cast<unsigned char*>(mappings.Reserve(nullptr, 2 * Bytes));
+    Require(section && shared && memory, "cannot allocate unwatched resident test memory");
+    mappings.ForgetSection(section);
+    mappings.ForgetSection(shared);
+    mappings.Map(memory, Bytes, section, 0, PAGE_READWRITE, false, true);
+    mappings.Map(memory + Bytes, Bytes, shared, 0, PAGE_READWRITE);
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    std::array<void*, 32> buffer{};
+    std::size_t count = buffer.size();
+    Require(!mappings.Collect(address, 2 * Bytes, buffer.data(), &count, true), "a collect over an unwatched resident run was not refused");
+    Require(CollectPages(address, 2 * pages, {.capacity = 32, .skipRefused = true}) == PageList(pages, 2 * pages), "a collect that skips refused pieces stopped at an unwatched resident run");
+    Require(CollectPages(address, 2 * pages, {.capacity = 32, .skipRefused = true}).empty(), "a collect that skips refused pieces reported a view twice");
+    mappings.Reset(memory, 2 * Bytes);
+    VirtualFree(memory, 2 * Bytes, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+    VirtualFree(memory, 0, MEM_RELEASE);
+    mappings.ForgetSection(section);
+    mappings.ForgetSection(shared);
+    CloseHandle(section);
+    CloseHandle(shared);
+    auto* owned = static_cast<unsigned char*>(mappings.Reserve(nullptr, Bytes));
+    Require(owned != nullptr, "private reservation failed");
+    mappings.Commit(owned, Bytes, PAGE_READWRITE, Bytes, true);
+    const auto start = reinterpret_cast<std::uintptr_t>(owned);
+    CollectPages(start, pages, {.capacity = 32});
+    static_cast<volatile unsigned char*>(owned)[4 * Small] = 4;
+    static_cast<volatile unsigned char*>(owned)[5 * Small] = 5;
+    Require(VirtualFree(owned, Small, MEM_DECOMMIT), "cannot decommit the first private page");
+    Require(CollectPages(start, pages, {.capacity = 32, .skipRefused = true}) == PageList(4, 6), "a collect that skips refused pieces stopped at a decommitted private page");
+    mappings.Reset(owned, Bytes);
+    VirtualFree(owned, 0, MEM_RELEASE);
+}
+
 void CheckHostStoreBesideComparedView() {
     HANDLE section = nullptr;
     {
@@ -1269,6 +1306,7 @@ int main(int argc, char** argv) {
         CheckKnownZeroFirstReads();
         CheckKnownZeroMarks();
         CheckResidentRunNoAccessTransitions();
+        CheckRefusedCollectPassesUncollectablePieces();
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
