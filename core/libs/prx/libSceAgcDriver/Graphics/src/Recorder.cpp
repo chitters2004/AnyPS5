@@ -5036,6 +5036,17 @@ void Recorder::Submit() {
     }
     if (hold != VK_NULL_HANDLE || timeline != VK_NULL_HANDLE) submission.pNext = &timelineInfo;
     DestroyDeferredAtIdle(context);
+    if (timeline != VK_NULL_HANDLE && !progressWatcher) {
+        progressWatcher = std::make_unique<ProgressWatcher>(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"),
+                                                            context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR"));
+    }
+    inFlight.emplace_back();
+    struct ReleaseUnfilledSlot {
+        std::deque<std::unique_ptr<Batch>>* inFlight;
+        ~ReleaseUnfilledSlot() {
+            if (inFlight != nullptr) inFlight->pop_back();
+        }
+    } releaseUnfilledSlot{&inFlight};
     const auto submitStart = std::chrono::steady_clock::now();
     batch->submitStarted.store(true, std::memory_order_release);
     const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
@@ -5044,34 +5055,30 @@ void Recorder::Submit() {
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
     }
     Check(result, "vkQueueSubmit recorder");
-    if (batch->guestWork) LibcRunReportMilestone_nid_no_patch(2);
     batch->submitted = true;
     batch->serial = ++submissions;
     if (hold != VK_NULL_HANDLE) heldSerial = batch->serial;
     batch->submittedAt = std::chrono::steady_clock::now();
-    CaptureTrace::Log("submit-confirmed batch=%llu tokens=%s", static_cast<unsigned long long>(batch->serial), tokensStr.c_str());
+    inFlightKeptBytes += batch->keptBytes;
+    inFlight.back() = std::move(batch);
+    releaseUnfilledSlot.inFlight = nullptr;
+    const auto& submitted = *inFlight.back();
+    {
+        std::lock_guard lock(completedMutex);
+        newestSubmitted = submitted.serial;
+        newestSubmittedAt = submitted.submittedAt;
+    }
+    if (progressWatcher) progressWatcher->Submitted(submitted.serial);
+    if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    if (submitted.guestWork) LibcRunReportMilestone_nid_no_patch(2);
+    CaptureTrace::Log("submit-confirmed batch=%llu tokens=%s", static_cast<unsigned long long>(submitted.serial), tokensStr.c_str());
     if (DrawProfiled()) {
-        const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
+        const auto us = std::chrono::duration<double, std::micro>(submitted.submittedAt - submitStart).count();
         ++submitCount;
         submitUs += us;
         submitMaxUs = std::max(submitMaxUs, us);
-        if (auto* frame = PerformanceContext::Current()) frame->Add(frame->Get("Recorder", "submit"), batch->submittedAt - submitStart);
+        if (auto* frame = PerformanceContext::Current()) frame->Add(frame->Get("Recorder", "submit"), submitted.submittedAt - submitStart);
     }
-    {
-        std::lock_guard lock(completedMutex);
-        newestSubmitted = batch->serial;
-        newestSubmittedAt = batch->submittedAt;
-    }
-    if (timeline != VK_NULL_HANDLE) {
-        if (!progressWatcher) {
-            progressWatcher = std::make_unique<ProgressWatcher>(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"),
-                                                                context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR"));
-        }
-        progressWatcher->Submitted(batch->serial);
-    }
-    inFlight.push_back(std::move(batch));
-    inFlightKeptBytes += inFlight.back()->keptBytes;
-    if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
 }
 
 std::uint64_t Recorder::SubmitAndEpoch() {
